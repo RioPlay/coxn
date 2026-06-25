@@ -28,6 +28,11 @@ const TICK: Duration = Duration::from_millis(100);
 /// Lines the transcript scrolls per Up/Down (a wheel notch in most terminals).
 const SCROLL_STEP: u16 = 3;
 
+/// How many times a transient model error is retried before giving up.
+const MAX_RETRIES: u32 = 3;
+/// Backoff before each retry, in seconds (exponential).
+const RETRY_BACKOFF_SECS: [u64; MAX_RETRIES as usize] = [2, 4, 8];
+
 /// Format the conversation into the output pane text. An assistant turn that
 /// only requested tools (no text) renders its calls so the line is not blank.
 fn transcript(messages: &[Message]) -> String {
@@ -424,6 +429,28 @@ fn parse_command(input: &str) -> Command {
     }
 }
 
+/// Wait before retrying a transient model error, showing a per-second countdown
+/// in the status line. Returns `true` if the user pressed Ctrl-C to give up.
+fn retry_wait(tui: &mut Tui, view: &mut View, attempt: u32, secs: u64) -> io::Result<bool> {
+    for remaining in (1..=secs).rev() {
+        view.set_status(format!(
+            "model error -- retrying {attempt}/{MAX_RETRIES} in {remaining}s (Ctrl-C to cancel)"
+        ));
+        tui.draw(view)?;
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < until {
+            if event::poll(Duration::from_millis(100))?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+                && matches!(map_input_key(key), Some(Action::Quit))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// The output pane's (width, height), for wrapping and PageUp/PageDown scroll
 /// amounts. Height excludes the status and input rows. Falls back to (80, 1) if
 /// the terminal size cannot be determined.
@@ -543,24 +570,42 @@ async fn drive(
                 let prior = transcript(pump.messages());
                 let mut cancelled = false;
                 view.pending = true;
-                let result = {
-                    let mut buf = String::new();
-                    let mut sink = |delta: &str| -> bool {
-                        buf.push_str(delta);
-                        view.output = format!("{prior}\ncoxn: {buf}");
-                        let _ = tui.draw(view);
-                        // Non-blocking cancel check: Ctrl-C aborts the turn.
-                        if let Ok(true) = event::poll(Duration::ZERO)
-                            && let Ok(Event::Key(key)) = event::read()
-                            && key.kind == KeyEventKind::Press
-                            && matches!(map_input_key(key), Some(Action::Quit))
-                        {
-                            cancelled = true;
-                            return false;
-                        }
-                        true
+                // Run the turn, retrying transient backend errors (rate limit,
+                // unavailable, dropped connection) with a cancellable countdown.
+                let mut attempt = 0u32;
+                let result = loop {
+                    let r = {
+                        let mut buf = String::new();
+                        let mut sink = |delta: &str| -> bool {
+                            buf.push_str(delta);
+                            view.output = format!("{prior}\ncoxn: {buf}");
+                            let _ = tui.draw(view);
+                            // Non-blocking cancel check: Ctrl-C aborts the turn.
+                            if let Ok(true) = event::poll(Duration::ZERO)
+                                && let Ok(Event::Key(key)) = event::read()
+                                && key.kind == KeyEventKind::Press
+                                && matches!(map_input_key(key), Some(Action::Quit))
+                            {
+                                cancelled = true;
+                                return false;
+                            }
+                            true
+                        };
+                        pump.run_turn_streaming(&mut sink).await
                     };
-                    pump.run_turn_streaming(&mut sink).await
+                    if let Err(e) = &r
+                        && e.is_transient()
+                        && attempt < MAX_RETRIES
+                        && !cancelled
+                    {
+                        attempt += 1;
+                        let secs = RETRY_BACKOFF_SECS[(attempt - 1) as usize];
+                        if retry_wait(tui, view, attempt, secs)? {
+                            break r; // user gave up; surface the error
+                        }
+                        continue;
+                    }
+                    break r;
                 };
                 view.pending = false;
                 match result {
