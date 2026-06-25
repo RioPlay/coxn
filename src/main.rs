@@ -65,37 +65,44 @@ async fn main() -> io::Result<()> {
     let mut tools = ToolRegistry::new();
     tools.register_latent(Box::new(AsmTool::new(dir.clone())));
     tools.register_latent(Box::new(UnderstandTool::new(dir.clone())));
-    // The action tools (the LLM acts: edit / write_file) are advertised only
-    // when a task scope is active: aden gates every edit against the scope
-    // manifest, and there is no gate without a scope, so editing is off by
-    // default (no ungated edits, no action surface the model cannot use).
-    if std::env::var("COXN_TASK_NAME").is_ok_and(|s| !s.trim().is_empty()) {
-        tools.register(Box::new(EditTool::new(dir.clone())));
-        tools.register(Box::new(WriteTool::new(dir.clone())));
-    }
+
     // Take over the terminal and paint a frame first, so the user sees coxn
     // start instead of a frozen blank while the aden subprocess calls below
-    // (model resolution, scope, asm context, savings) run -- which can take
-    // several seconds on a large repo.
+    // (model resolution, scope, asm context) run -- which can take several
+    // seconds on a large repo.
     let mut view = View::new();
     view.set_status("starting coxn...".to_string());
     let mut tui = Tui::new()?;
     tui.draw(&view)?;
 
     let (model, mut sel) = resolve_model(&dir);
-    let mut pump = Pump::new(model, tools);
     view.set_status(format!("{}  |  loading...", sel.label()));
     tui.draw(&view)?;
 
-    // A named task (COXN_TASK_NAME) makes aden define the scope: it sets the
-    // gate mandate and loads exactly the seeds' context. No task = bare prompt.
-    let task = load_task(&dir, &mut pump);
+    // A named task (COXN_TASK_NAME) makes aden define the scope: the gate
+    // mandate and exactly the seeds' context. No task = bare, ungated prompt.
+    let task = load_task(&dir);
+    // The action tools (the LLM acts: edit / write_file) are advertised only
+    // when the scope actually gated: aden gates every edit, and there is no
+    // gate without a scope, so editing is off by default (no ungated edits, no
+    // action surface the model cannot use).
+    if task.gate.is_some() {
+        tools.register(Box::new(EditTool::new(dir.clone())));
+        tools.register(Box::new(WriteTool::new(dir.clone())));
+    }
+    let mut pump = Pump::new(model, tools);
+    if let Some(gate) = task.gate {
+        pump.set_gate(gate);
+    }
+    if let Some(context) = task.context {
+        pump.set_context(context);
+    }
     // A savings-free status at boot: the `aden status` call it would make is the
     // slowest aden spawn and is purely cosmetic, so defer it to the first
     // post-turn refresh and let the user reach the prompt sooner.
-    view.set_status(boot_status(&sel.label(), &task));
+    view.set_status(boot_status(&sel.label(), &task.status));
 
-    let result = drive(&mut tui, &mut view, &mut pump, &dir, &mut sel, &task).await;
+    let result = drive(&mut tui, &mut view, &mut pump, &dir, &mut sel, &task.status).await;
     drop(tui); // restore the terminal before surfacing any error
     result
 }
@@ -263,17 +270,44 @@ fn switch_model(pump: &mut Pump<AnyModel>, sel: &mut ModelSel, target: &str) -> 
     format!("switched to {}", sel.name)
 }
 
+/// The minimal operating instruction prepended to the scope context in task
+/// mode. coxn's default prompt is empty (zero-default-context), which leaves a
+/// weak local model passive -- it will not reach for the action tools unprompted
+/// and answers "I can't edit files." DESIGN sanctions this single nudge: it is
+/// operating instruction, not repo context, and appears only when the scope has
+/// actually gated, so editing is governed.
+const AGENT_PREAMBLE: &str = "\
+You are coxn, a coding agent working within a task scope that aden defined. To \
+change code, call the `edit` or `write_file` tool with a file path -- do not \
+just print a patch for the user to apply. Every edit is gated by aden against \
+the scope and reverted if it escapes, so keep changes minimal and in scope. \
+Pull more context when you need it via aden_tools, aden_asm, and aden_understand.\n\n\
+=== task scope context ===\n\n";
+
+/// The result of resolving a task scope: the status-line text, the gate (when
+/// `aden scope` produced a mandate), and the context to load into the pump.
+struct Task {
+    status: String,
+    gate: Option<Box<dyn gate::Gate>>,
+    context: Option<String>,
+}
+
 /// If `COXN_TASK_NAME` is set, let aden define the scope: run `aden scope` for
-/// the task's seeds, persist the manifest for the gate, and load exactly the
-/// seeds' assembled context into the pump. Returns the status-line text. No
-/// task means the bare, ungated Phase 1 pump. coxn parses nothing — it gates on
-/// the manifest file and loads context from `aden asm` on its own seed inputs.
-fn load_task(dir: &Path, pump: &mut Pump<AnyModel>) -> String {
+/// the task's seeds, persist the manifest for the gate, and assemble exactly the
+/// seeds' context. No task means a bare, ungated prompt. coxn parses nothing --
+/// it gates on the manifest file and loads context from `aden asm` on its own
+/// seed inputs.
+fn load_task(dir: &Path) -> Task {
+    let bare = || Task {
+        status: String::new(),
+        gate: None,
+        context: None,
+    };
     let Some(name) = std::env::var("COXN_TASK_NAME")
         .ok()
         .filter(|s| !s.trim().is_empty())
     else {
-        return String::new();
+        return bare();
     };
     let seeds: Vec<String> = std::env::var("COXN_TASK_SEEDS")
         .unwrap_or_default()
@@ -287,34 +321,40 @@ fn load_task(dir: &Path, pump: &mut Pump<AnyModel>) -> String {
         .unwrap_or(8192);
 
     // Define the mandate: aden scope -> manifest file -> gate.
-    let mut gated = false;
+    let mut gate: Option<Box<dyn gate::Gate>> = None;
     if !seeds.is_empty()
         && let Ok(manifest_json) = aden::scope(dir, &name, &seeds, budget)
     {
         let manifest = std::env::temp_dir().join(format!("coxn-scope-{}.json", std::process::id()));
         if std::fs::write(&manifest, manifest_json).is_ok() {
-            pump.set_gate(Box::new(aden::AdenGate::new(dir.to_path_buf(), manifest)));
-            gated = true;
+            gate = Some(Box::new(aden::AdenGate::new(dir.to_path_buf(), manifest)));
         }
     }
+    let gated = gate.is_some();
 
-    // Load exactly the scope's context: the seeds' assembled neighborhoods.
+    // Assemble exactly the scope's context: the operating preamble (only when
+    // gated, so the model is told to act and edits are governed) plus the seeds'
+    // assembled neighborhoods.
     let mut context = String::new();
+    if gated {
+        context.push_str(AGENT_PREAMBLE);
+    }
     for s in &seeds {
         if let Ok(text) = aden::pull(dir, aden::Pull::Asm(s)) {
             context.push_str(&text);
             context.push('\n');
         }
     }
-    if !context.is_empty() {
-        pump.set_context(context);
-    }
 
-    format!(
-        "task '{name}' ({} seed(s){})",
-        seeds.len(),
-        if gated { ", gated" } else { "" }
-    )
+    Task {
+        status: format!(
+            "task '{name}' ({} seed(s){})",
+            seeds.len(),
+            if gated { ", gated" } else { "" }
+        ),
+        gate,
+        context: (!context.is_empty()).then_some(context),
+    }
 }
 
 /// Help shown by `/help`.
