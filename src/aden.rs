@@ -7,10 +7,6 @@
 //! exit-code contract and text output (see docs/contract.adoc) are shaped for
 //! exactly this.
 
-// gate (P2.3) and pull (P2.2) are wired; scope() is consumed by the
-// scope->context loader in P2.4. Allow until then.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -135,6 +131,30 @@ impl Gate for AdenGate {
     }
 }
 
+/// A compact savings summary for the status line, from `aden status`. `None`
+/// when aden cannot run, the command fails, or no savings are recorded.
+pub fn savings(dir: &Path) -> Option<String> {
+    let out = Command::new(aden_bin())
+        .arg("status")
+        .arg(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    extract_savings(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pull the all-time savings detail out of `aden status` text. Pure for testing.
+fn extract_savings(status: &str) -> Option<String> {
+    let line = status
+        .lines()
+        .find(|l| l.trim_start().starts_with("All-time"))?;
+    // "...All-time : N aden calls → est. ~X tool calls + ~Y tokens saved vs ..."
+    let detail = line.split('→').nth(1).unwrap_or(line).trim();
+    (!detail.is_empty()).then(|| format!("aden {detail}"))
+}
+
 /// Run a command expecting text on stdout; non-zero exit is an error.
 fn run_text(mut cmd: Command) -> Result<String, AdenError> {
     let out = cmd.output().map_err(|e| AdenError::Spawn(e.to_string()))?;
@@ -190,6 +210,20 @@ mod tests {
         let out = gate_with(ok.to_str().unwrap(), &dir, &manifest);
         assert_eq!(out.verdict, GateVerdict::InScope);
         assert!(out.verdict.proceed());
+    }
+
+    #[test]
+    fn extract_savings_pulls_the_all_time_detail() {
+        let status = "Aden Status: .\n\
+            Savings estimate (vs grep-and-read) [est.]:\n\
+            \x20 This session: 3 aden calls → est. ~8 tool calls + ~2k tokens saved vs grep-and-read\n\
+            \x20 All-time    : 40 aden calls → est. ~90 tool calls + ~30k tokens saved vs grep-and-read\n";
+        let got = extract_savings(status).expect("savings line present");
+        assert!(got.starts_with("aden est."), "{got}");
+        assert!(got.contains("~90 tool calls"));
+        assert!(got.contains("~30k tokens saved"));
+        // No all-time line -> None.
+        assert!(extract_savings("Aden Status: .\nno savings\n").is_none());
     }
 
     #[test]

@@ -55,15 +55,20 @@ async fn main() -> io::Result<()> {
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: it sets the
     // gate mandate and loads exactly the seeds' context. No task = bare prompt.
-    let status = load_task(&dir, &mut pump);
+    let base_status = load_task(&dir, &mut pump);
 
     let mut view = View::new();
-    view.set_status(status);
+    view.set_status(status_line(&dir, &base_status));
 
     let mut tui = Tui::new()?;
-    let result = drive(&mut tui, &mut view, &mut pump).await;
+    let result = drive(&mut tui, &mut view, &mut pump, &dir, &base_status).await;
     drop(tui); // restore the terminal before surfacing any error
     result
+}
+
+/// The status line: aden's savings estimate when available, else the base text.
+fn status_line(dir: &Path, base: &str) -> String {
+    aden::savings(dir).unwrap_or_else(|| base.to_string())
 }
 
 /// If `COXN_TASK_NAME` is set, let aden define the scope: run `aden scope` for
@@ -122,7 +127,13 @@ fn load_task(dir: &Path, pump: &mut Pump<StubModel>) -> String {
 
 /// The event loop: draw, read a key, route it by mode (modal vs input), and run
 /// a turn on submit. Carries no intelligence; it only paces and shuttles.
-async fn drive(tui: &mut Tui, view: &mut View, pump: &mut Pump<StubModel>) -> io::Result<()> {
+async fn drive(
+    tui: &mut Tui,
+    view: &mut View,
+    pump: &mut Pump<StubModel>,
+    dir: &Path,
+    base_status: &str,
+) -> io::Result<()> {
     loop {
         tui.draw(view)?;
 
@@ -158,6 +169,8 @@ async fn drive(tui: &mut Tui, view: &mut View, pump: &mut Pump<StubModel>) -> io
                     view.set_status(format!("error: {err}"));
                 }
                 view.output = transcript(pump.messages());
+                // Refresh aden's savings estimate after the turn.
+                view.set_status(status_line(dir, base_status));
                 // Surface a gate block from this turn as a confirm modal.
                 if let Some(block) = pump.take_block() {
                     view.confirm(block.message);
