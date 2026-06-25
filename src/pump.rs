@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::gate::{Gate, GateOutcome};
 use crate::model::{
-    DEFAULT_SYSTEM_PROMPT, Message, Model, ModelError, ModelRequest, Role, ToolCall, call_model,
+    DEFAULT_SYSTEM_PROMPT, Message, Model, ModelError, ModelRequest, Role, ToolCall,
 };
 use crate::tools::ToolRegistry;
 
@@ -145,9 +145,23 @@ impl<M: Model> Pump<M> {
     /// calls, feed their results back as tool messages, and repeat until the
     /// model returns no tool calls or the hop cap is reached. Every message is
     /// appended to the conversation. Returns the final assistant text.
+    /// A non-streaming turn (no delta sink). The live TUI uses
+    /// [`Pump::run_turn_streaming`]; this is the simple form for tests and any
+    /// non-interactive caller.
+    #[allow(dead_code)]
     pub async fn run_turn(&mut self) -> Result<String, ModelError> {
+        self.run_turn_streaming(&mut |_| {}).await
+    }
+
+    /// Drive one turn, streaming assistant text fragments through `on_delta` as
+    /// they arrive (for live rendering). Otherwise identical to [`Pump::run_turn`].
+    pub async fn run_turn_streaming(
+        &mut self,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String, ModelError> {
         for _ in 0..MAX_TOOL_HOPS {
-            let response = call_model(&self.model, self.request()).await?;
+            let request = self.request();
+            let response = self.model.stream(request, on_delta).await?;
             // The assistant message carries the tool calls it requested, so the
             // history threads correctly back to a function-calling provider.
             let content = response.message.content.clone();

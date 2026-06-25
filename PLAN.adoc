@@ -72,7 +72,8 @@ DONE. Deps approved (P3.0) and the path verified live against LM Studio.
 
 * [x] P3.2b Tool-calling over the wire: `Message` carries tool_calls/tool_call_id; `Tool` carries JSON schemas; `advertised_defs` -> OpenAI `function` tools; assistant tool_calls + `tool` results threaded; response tool_calls parsed back. Tools read JSON-or-bare args. 2 commits, hermetic tests. Network e2e VERIFIED live (LM Studio gpt-oss-20b).
 * [x] P3.8 Model enumeration + switching: `openai::list_models` lists every model the provider advertises (loaded or not; auth header for cloud); `/model` lists with active marked, `/model <name|#>` switches via `Pump::set_model`. An unlisted name is allowed (backend JIT-loads). Verified live.
-* [ ] Streaming + Ollama-native `/api/chat` profile (OpenAI-compat drops tool calls under streaming).
+* [x] P3.9 Streaming: `Model::stream` (default delegates to `call`; OpenAiCompat reads SSE, assembling text + tool-call deltas by index). `Pump::run_turn_streaming` threads a sink; `drive` repaints the reply per fragment. Verified live vs LM Studio gpt-oss-20b: text grows smoothly (56->1250 chars over ~5s) AND a streamed tool call drove a gated edit that persisted. Tool-calling-under-streaming works on LM Studio (the drop is Ollama-specific).
+* [ ] Ollama-native `/api/chat` profile -- DEFERRED: Ollama not installed/runnable here, so the protocol code cannot be live-validated (test-first). The OpenAI-compat path covers LM Studio/OpenAI/OpenRouter/vLLM; add the native profile when an Ollama instance is available to test against.
 * [ ] Optional Anthropic-direct profile (native prompt caching, exact billing).
 
 == Phase 4 (coxn-side): the harness -- gated editing  -- DONE

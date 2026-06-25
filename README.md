@@ -100,8 +100,11 @@ HTTP call). Minimalism is the product.
 ## Status
 
 Working and validated end to end against a real codebase + a local model:
-provider-neutral chat, tool-calling over the wire, model enumeration/switching,
-and scoped, gated editing (apply -> `impact-diff --scope` -> revert on escape).
+provider-neutral chat, **streaming** replies, tool-calling over the wire (incl.
+under streaming), model enumeration/switching, and scoped, gated editing
+(apply -> `impact-diff --scope` -> revert on escape).
 
-Not yet: streaming and Ollama's native `/api/chat` profile; an Anthropic-direct
-profile; multi-model sub-agents (`DESIGN.adoc` Phase 5).
+Not yet: Ollama's native `/api/chat` profile (its OpenAI-compat layer drops tool
+calls under streaming; the OpenAI-compat path here covers LM Studio, OpenAI,
+OpenRouter, vLLM); an Anthropic-direct profile; multi-model sub-agents
+(`DESIGN.adoc` Phase 5).

@@ -457,7 +457,21 @@ async fn drive(
                     continue;
                 }
                 pump.push_user(text);
-                match pump.run_turn().await {
+                // Stream the reply: render the transcript so far plus the
+                // assistant text as it arrives, repainting per fragment. The
+                // event loop is blocked during the call (single-threaded), but
+                // the reply now appears live instead of all at once.
+                let prior = transcript(pump.messages());
+                let result = {
+                    let mut buf = String::new();
+                    let mut sink = |delta: &str| {
+                        buf.push_str(delta);
+                        view.output = format!("{prior}\ncoxn: {buf}");
+                        let _ = tui.draw(view);
+                    };
+                    pump.run_turn_streaming(&mut sink).await
+                };
+                match result {
                     Ok(_) => {
                         view.output = transcript(pump.messages());
                         // Refresh the model + savings status after the turn.

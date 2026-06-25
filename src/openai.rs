@@ -5,12 +5,16 @@
 //! `POST {base_url}/chat/completions`. The provider is selected by data (a
 //! `{base_url, model, key}` spec), not a type. See DESIGN.adoc Phase 3.
 //!
-//! Text and tool turns, non-streaming. The advertised tool defs are sent as
-//! OpenAI `function` tools; assistant `tool_calls` and `tool` results thread
+//! Text and tool turns, streaming or buffered. The advertised tool defs are sent
+//! as OpenAI `function` tools; assistant `tool_calls` and `tool` results thread
 //! through the conversation, and tool calls are parsed back out of the response.
-//! Streaming (and Ollama's native `/api/chat`, whose OpenAI-compat layer drops
-//! tool calls under streaming) is a later profile.
+//! `call` buffers the whole reply; `stream` reads the SSE response and emits text
+//! fragments live (assembling tool-call deltas by index). Ollama's native
+//! `/api/chat` profile (its OpenAI-compat layer drops tool calls under streaming)
+//! is a later addition; the OpenAI-compat path here covers LM Studio, OpenAI,
+//! OpenRouter, and vLLM.
 
+use std::io::BufRead;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -190,7 +194,7 @@ fn wire_call(tc: &ToolCall) -> WireToolCall {
 /// prompt (when non-empty) leads as a `system` message; the rest map by role,
 /// carrying any tool calls (assistant) and answered id (tool). Advertised tool
 /// defs become OpenAI `function` tools.
-fn to_wire<'a>(model: &'a str, request: &ModelRequest) -> ChatRequest<'a> {
+fn to_wire<'a>(model: &'a str, request: &ModelRequest, stream: bool) -> ChatRequest<'a> {
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
     if !request.system.is_empty() {
         messages.push(WireMessage {
@@ -230,7 +234,7 @@ fn to_wire<'a>(model: &'a str, request: &ModelRequest) -> ChatRequest<'a> {
         model,
         messages,
         tools,
-        stream: false,
+        stream,
     }
 }
 
@@ -264,6 +268,120 @@ fn from_wire(response: ChatResponse) -> Result<ModelResponse, ModelError> {
     })
 }
 
+// --- streaming (Server-Sent Events) ---
+
+/// One streamed chunk: `{"choices":[{"delta":{...}}]}`.
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: Delta,
+}
+
+/// The incremental piece in a chunk: a text fragment and/or tool-call fragments.
+#[derive(Deserialize, Default)]
+struct Delta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCall>,
+}
+
+/// A tool-call fragment: identified by `index`, its fields arrive across chunks.
+#[derive(Deserialize)]
+struct StreamToolCall {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunction>,
+}
+
+#[derive(Deserialize)]
+struct StreamFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// Accumulates streamed chunks into a single response: text appended in order,
+/// tool calls assembled by index (id/name set once, arguments concatenated).
+#[derive(Default)]
+struct StreamState {
+    content: String,
+    calls: Vec<ToolCall>,
+}
+
+impl StreamState {
+    /// Fold one chunk in, emitting any text fragment through `on_delta`.
+    fn apply(&mut self, chunk: StreamChunk, on_delta: &mut dyn FnMut(&str)) {
+        for choice in chunk.choices {
+            if let Some(text) = choice.delta.content
+                && !text.is_empty()
+            {
+                on_delta(&text);
+                self.content.push_str(&text);
+            }
+            for tc in choice.delta.tool_calls {
+                while self.calls.len() <= tc.index {
+                    self.calls.push(ToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                }
+                let slot = &mut self.calls[tc.index];
+                if let Some(id) = tc.id {
+                    slot.id = id;
+                }
+                if let Some(f) = tc.function {
+                    if let Some(name) = f.name {
+                        slot.name = name;
+                    }
+                    if let Some(args) = f.arguments {
+                        slot.arguments.push_str(&args);
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> ModelResponse {
+        ModelResponse {
+            message: Message::new(Role::Assistant, self.content),
+            tool_calls: self
+                .calls
+                .into_iter()
+                .filter(|c| !c.name.is_empty())
+                .collect(),
+        }
+    }
+}
+
+/// Parse one SSE line into a chunk to fold. Returns `Ok(true)` at the `[DONE]`
+/// sentinel, `Ok(false)` for a line to skip (blank, comment, unparseable), and
+/// `Ok(false)` after applying a data chunk. Lenient by design: providers vary.
+fn fold_sse_line(line: &str, state: &mut StreamState, on_delta: &mut dyn FnMut(&str)) -> bool {
+    let Some(data) = line.strip_prefix("data:") else {
+        return false;
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return true;
+    }
+    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+        state.apply(chunk, on_delta);
+    }
+    false
+}
+
 /// Trim a body to a short, single-line snippet for an error message.
 fn snippet(body: &str) -> String {
     body.split_whitespace()
@@ -280,7 +398,7 @@ impl Model for OpenAiCompatModel {
         // for the single-threaded loop. (Revisit with an async client if the TUI
         // needs to stay live during a call.)
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = to_wire(&self.model, &request);
+        let body = to_wire(&self.model, &request, false);
 
         // Don't treat a non-2xx as a transport error: read the body so the
         // server's own message (bad model name, invalid request, ...) reaches
@@ -316,6 +434,60 @@ impl Model for OpenAiCompatModel {
         })?;
         from_wire(parsed)
     }
+
+    // Streaming turn: same request with `stream: true`, then read the SSE body
+    // line by line, emitting text fragments through `on_delta` as they arrive and
+    // assembling the full response (text + tool calls) to return. ureq is
+    // blocking, and coxn's loop is single-threaded, so the read loop drives the
+    // sink directly; the TUI repaints per fragment from within it.
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ModelResponse, ModelError> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let body = to_wire(&self.model, &request, true);
+
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut builder = agent.post(&url);
+        if let Some(key) = &self.api_key {
+            builder = builder.header("Authorization", &format!("Bearer {key}"));
+        }
+        let mut response = builder
+            .send_json(&body)
+            .map_err(|e| ModelError::Backend(format!("request to {url} failed: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            // On an error the body is JSON, not a stream: read it for the message.
+            let text = response.body_mut().read_to_string().unwrap_or_default();
+            return Err(ModelError::Backend(format!(
+                "{url} returned {status}: {}",
+                snippet(&text)
+            )));
+        }
+
+        let mut state = StreamState::default();
+        let reader = std::io::BufReader::new(response.body_mut().as_reader());
+        for line in reader.lines() {
+            let line =
+                line.map_err(|e| ModelError::Backend(format!("reading stream failed: {e}")))?;
+            if fold_sse_line(&line, &mut state, on_delta) {
+                break;
+            }
+        }
+
+        let response = state.finish();
+        if response.message.content.is_empty() && response.tool_calls.is_empty() {
+            return Err(ModelError::Backend(
+                "model returned an empty stream".to_string(),
+            ));
+        }
+        Ok(response)
+    }
 }
 
 #[cfg(test)]
@@ -337,7 +509,7 @@ mod tests {
     #[test]
     fn to_wire_leads_with_system_then_maps_roles() {
         let req = request("be terse", &[(Role::User, "hi"), (Role::Assistant, "yo")]);
-        let wire = to_wire("local", &req);
+        let wire = to_wire("local", &req, false);
         assert_eq!(wire.model, "local");
         assert!(!wire.stream);
         let roles: Vec<&str> = wire.messages.iter().map(|m| m.role).collect();
@@ -348,7 +520,7 @@ mod tests {
     #[test]
     fn to_wire_omits_empty_system() {
         let req = request("", &[(Role::User, "hi")]);
-        let wire = to_wire("local", &req);
+        let wire = to_wire("local", &req, false);
         assert_eq!(
             wire.messages.iter().map(|m| m.role).collect::<Vec<_>>(),
             vec!["user"]
@@ -358,7 +530,7 @@ mod tests {
     #[test]
     fn request_serializes_to_openai_shape() {
         let req = request("sys", &[(Role::User, "q")]);
-        let json = serde_json::to_value(to_wire("m", &req)).unwrap();
+        let json = serde_json::to_value(to_wire("m", &req, false)).unwrap();
         assert_eq!(json["model"], "m");
         assert_eq!(json["stream"], false);
         assert_eq!(json["messages"][0]["role"], "system");
@@ -399,7 +571,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        let json = serde_json::to_value(to_wire("m", &req)).unwrap();
+        let json = serde_json::to_value(to_wire("m", &req, false)).unwrap();
         // Tool defs become OpenAI function tools.
         assert_eq!(json["tools"][0]["type"], "function");
         assert_eq!(json["tools"][0]["function"]["name"], "aden_asm");
@@ -439,5 +611,49 @@ mod tests {
         assert_eq!(out.tool_calls[0].id, "c1");
         assert_eq!(out.tool_calls[0].name, "aden_asm");
         assert_eq!(out.tool_calls[0].arguments, r#"{"anchor":"foo"}"#);
+    }
+
+    /// Drive the SSE folder over a scripted stream and collect the deltas.
+    fn fold_stream(lines: &[&str]) -> (ModelResponse, Vec<String>) {
+        let mut state = StreamState::default();
+        let mut deltas = Vec::new();
+        for line in lines {
+            let mut sink = |d: &str| deltas.push(d.to_string());
+            if fold_sse_line(line, &mut state, &mut sink) {
+                break;
+            }
+        }
+        (state.finish(), deltas)
+    }
+
+    #[test]
+    fn streaming_assembles_text_deltas_in_order() {
+        let (resp, deltas) = fold_stream(&[
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}"#,
+            ": keep-alive comment is ignored",
+            "",
+            r#"data: {"choices":[{"delta":{"content":"lo"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":" world"}}]}"#,
+            "data: [DONE]",
+            r#"data: {"choices":[{"delta":{"content":"AFTER-DONE"}}]}"#,
+        ]);
+        assert_eq!(deltas, vec!["Hel", "lo", " world"]);
+        assert_eq!(resp.message.content, "Hello world");
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn streaming_assembles_tool_calls_across_chunks() {
+        let (resp, deltas) = fold_stream(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"edit","arguments":"{\"path\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+            "data: [DONE]",
+        ]);
+        // No text fragments emitted for a tool-only stream.
+        assert!(deltas.is_empty());
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "c1");
+        assert_eq!(resp.tool_calls[0].name, "edit");
+        assert_eq!(resp.tool_calls[0].arguments, r#"{"path":"a.rs"}"#);
     }
 }

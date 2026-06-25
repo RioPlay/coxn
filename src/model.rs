@@ -143,6 +143,25 @@ pub trait Model {
         &self,
         request: ModelRequest,
     ) -> impl Future<Output = Result<ModelResponse, ModelError>> + Send;
+
+    /// Stream a turn, invoking `on_delta` with each assistant text fragment as it
+    /// arrives, and returning the assembled response (full text + any tool calls)
+    /// at the end. The default is non-streaming: call [`Model::call`] and emit the
+    /// whole content once, so a backend opts into streaming by overriding this.
+    /// Not `Send` (the sink is a borrowed `&mut dyn FnMut`); coxn's loop is
+    /// single-threaded, which is also why the blocking read can drive the sink
+    /// directly.
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ModelResponse, ModelError> {
+        let response = self.call(request).await?;
+        if !response.message.content.is_empty() {
+            on_delta(&response.message.content);
+        }
+        Ok(response)
+    }
 }
 
 /// The named seam the pump drives. Thin wrapper over [`Model::call`] so the
@@ -192,6 +211,19 @@ impl Model for AnyModel {
         match self {
             AnyModel::Stub(model) => model.call(request).await,
             AnyModel::OpenAiCompat(model) => model.call(request).await,
+        }
+    }
+
+    // Delegate streaming to the active variant so the OpenAI-compatible backend's
+    // SSE streaming is used (the default would buffer the whole reply).
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ModelResponse, ModelError> {
+        match self {
+            AnyModel::Stub(model) => model.stream(request, on_delta).await,
+            AnyModel::OpenAiCompat(model) => model.stream(request, on_delta).await,
         }
     }
 }
