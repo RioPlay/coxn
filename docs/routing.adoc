@@ -60,34 +60,49 @@ seam):
   (scope/merge). Mixing a free local instance for scouting with a hosted instance
   for synthesis is the main cost lever.
 
-== 3. aden task partition (the prerequisite)
+== 3. aden task partition (IMPLEMENTED on aden feat/scope-agents)
 
-Today `aden scope <task>` emits one manifest. Sub-agents need aden to split a task
-into sub-scopes, each tagged with a role and ordering. Proposed command:
+`aden scope <task>` emits one manifest. `aden scope --agents <task> --seed ...`
+splits a task into sub-scopes, each tagged with a role and ordering:
 
-  aden scope --agents <task> --seed ...     (or: aden plan <task>)
+  aden scope --agents <task> --seed <s1> --seed <s2> --budget <n> <dir>
 
 === Encoding (keeps coxn serde-light)
 
-To honor minimal parsing, aden emits the partition as:
+aden emits the partition as:
 
-. One *manifest file per sub-scope* -- each is exactly today's `ScopeManifest`
-  (`{name, seeds, anchors, files, context{anchors,budget}, risk}`), which the gate
-  already consumes unchanged.
-. One *partition index* coxn reads line by line (no JSON parse), one record per
-  sub-scope:
+. One *manifest file per sub-scope* at `.aden/agents/<id>.json` -- each is exactly
+  today's `ScopeManifest` (`{name, seeds, anchors, files, context{anchors,budget},
+  risk}`), which the gate already consumes unchanged. (`name` is currently set to
+  the sub-scope id, not the human task name; coxn does not depend on `name`.)
+. One *partition index* on stdout, which coxn reads line by line (no JSON parse),
+  one record per sub-scope, ALWAYS four tab-separated columns:
 
   <id>\t<role>\t<manifest-path>\t<comma-separated depends_on ids>
 
-Example index:
+The fourth column is EMPTY for a leaf sub-scope (no dependencies); the trailing
+tab is still present, so a reader splits on tab into exactly four fields and treats
+an empty fourth field as no deps.
 
-  scout-auth      scout        .aden/agents/scout-auth.json
-  edit-handler    synth        .aden/agents/edit-handler.json    scout-auth
-  merge           orchestrate  .aden/agents/merge.json           edit-handler
+Real example (seeds `double`, `greet`; the leaf rows have an empty 4th field):
 
-coxn reads the index (id, role, manifest path, deps), maps role -> model via the
-route table, and gates each sub-agent against its own manifest file -- the same
-gate contract as the single-agent path.
+  partition-demo-0     scout        .aden/agents/partition-demo-0.json
+  partition-demo-1     synth        .aden/agents/partition-demo-1.json
+  partition-demo-merge orchestrate  .aden/agents/partition-demo-merge.json  partition-demo-0,partition-demo-1
+
+Shape aden produces: ids are `<task-slug>-<n>` for leaf scopes and `<task-slug>-merge`
+for the merge entry; roles are `scout` (first leaf), `synth` (later leaves),
+`orchestrate` (the merge entry, which depends on all leaves and carries an empty
+file mandate). coxn reads the index (id, role, manifest path, deps), maps role ->
+model via the route table, and gates each sub-agent against its own manifest file
+-- the same gate contract as the single-agent path.
+
+NOTE (heuristic limitation): the partition assigns each file to the first
+(alphabetical) seed whose blast radius covers it, so on a small or
+fully-connected graph one leaf can claim every file and later leaves come out
+empty. An empty-mandate leaf is a no-op for coxn (it can make no in-scope edit).
+This is an aden heuristic to refine (proximity-based assignment); the format and
+contract here are stable regardless.
 
 === Constraints aden must guarantee
 
