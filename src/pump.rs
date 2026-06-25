@@ -126,6 +126,12 @@ impl<M: Model> Pump<M> {
         self.messages.clear();
     }
 
+    /// Replace the conversation with a loaded one (for `/resume`). Keeps the
+    /// scope context and gate; the caller is responsible for the session file.
+    pub fn load_conversation(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+    }
+
     /// A human-readable listing of the aden tools the model can discover.
     pub fn tool_catalog(&self) -> String {
         self.tools.discover("")

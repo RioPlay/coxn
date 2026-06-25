@@ -17,6 +17,8 @@
 use std::fmt;
 use std::future::Future;
 
+use serde::{Deserialize, Serialize};
+
 /// The zero-default-context floor: coxn adds nothing to the model's own default
 /// system prompt. No task means a bare prompt; a named task is what adds
 /// context, and only aden's scope manifest defines what (the bloat arbiter).
@@ -27,7 +29,7 @@ use std::future::Future;
 pub const DEFAULT_SYSTEM_PROMPT: &str = "";
 
 /// A role in a conversation turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     System,
     User,
@@ -39,13 +41,15 @@ pub enum Role {
 /// the linkage a function-calling provider needs: an assistant message records
 /// the calls it requested, and a tool message records which call it answers.
 /// Both default empty, so a plain text turn is unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
     /// Tool calls the assistant requested in this message (assistant role).
+    #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     /// The id of the tool call this message answers (tool role).
+    #[serde(default)]
     pub tool_call_id: Option<String>,
 }
 
@@ -84,7 +88,7 @@ impl Message {
 /// A tool call the model wants the pump to run. `arguments` is the raw,
 /// provider-neutral payload (opaque to the seam; the tool dispatch interprets
 /// it).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
