@@ -35,6 +35,24 @@ const MAX_RETRIES: u32 = 3;
 /// Backoff before each retry, in seconds (exponential).
 const RETRY_BACKOFF_SECS: [u64; MAX_RETRIES as usize] = [2, 4, 8];
 
+/// A ship's wheel (the coxswain's helm): coxn steers, aden sets the heading.
+/// Shown in the output pane at startup and after `/clear`, until the first turn.
+const LOGO: &str = r#"
+              .    |    .
+          '.   \   |   /   .'
+        '-._  \  \ | /  /  _.-'
+      (==========( (o) )==========)
+        '-._  /  / | \  \  _.-'
+          .'   /   |   \   '.
+              '    |    '
+                   coxn
+"#;
+
+/// The startup splash: the logo plus a one-line hint.
+fn welcome() -> String {
+    format!("{LOGO}\n  you steer; aden sets the heading.  type a message, or /help")
+}
+
 /// Format the conversation into the output pane text. An assistant turn that
 /// only requested tools (no text) renders its calls so the line is not blank.
 fn transcript(messages: &[Message]) -> String {
@@ -91,6 +109,7 @@ async fn main() -> io::Result<()> {
     // (model resolution, scope, asm context) run -- which can take several
     // seconds on a large repo.
     let mut view = View::new();
+    view.output = welcome();
     view.set_status("starting coxn...".to_string());
     let mut tui = Tui::new()?;
     tui.draw(&view)?;
@@ -685,7 +704,7 @@ async fn drive(
                         }
                         Command::Clear => {
                             pump.clear_conversation();
-                            view.output.clear();
+                            view.output = welcome();
                             // A cleared conversation starts a fresh session file.
                             session = session::Session::create();
                             persisted = 0;
