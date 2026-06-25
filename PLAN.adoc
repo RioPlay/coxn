@@ -21,7 +21,7 @@ prerequisites are out of scope here and tracked under Phase 2 blockers.
 == Phase 1: the dumb pump MVP
 
 * [x] P1.1 `model`: `call_model()` seam over `Model` trait; `ModelRequest`/`ModelResponse`/`Message`/`Role`/`ToolCall`/`ModelError` + `StubModel`. 2 async tests green, no provider named.
-* [ ] P1.2 `model`: bare/near-empty system prompt (the zero-default-context floor), asserted minimal in a test
+* [x] P1.2 `model`: `DEFAULT_SYSTEM_PROMPT` empty (zero-default-context floor), guard test asserts it adds nothing by default.
 * [ ] P1.3 `tools`: thin tool-dispatch registry (`ToolCall` -> result), one trivial built-in tool, unit-tested
 * [ ] P1.4 `tui`: ratatui shell -- streaming output pane + status line, render loop, crossterm event wiring
 * [ ] P1.5 `tui`: confirm modal (block/proceed) surfaced from the pump

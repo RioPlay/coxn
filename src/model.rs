@@ -17,6 +17,15 @@
 use std::fmt;
 use std::future::Future;
 
+/// The zero-default-context floor: coxn adds nothing to the model's own default
+/// system prompt. No task means a bare prompt; a named task is what adds
+/// context, and only aden's scope manifest defines what (the bloat arbiter).
+///
+/// This is empty on purpose. The one sanctioned growth is the optional, opt-in
+/// nudge line ("aden tools available via search"), which is not MVP. Any other
+/// content here is a deliberate deviation from a stated law; flag it first.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "";
+
 /// A role in a conversation turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -138,6 +147,17 @@ mod tests {
             messages: vec![Message::new(Role::User, user)],
             tools: Vec::new(),
         }
+    }
+
+    /// Guards the zero-default-context floor: the default system prompt adds
+    /// nothing. If this fails, coxn grew context by default; that is a law
+    /// deviation and must be intentional.
+    #[test]
+    fn default_system_prompt_is_the_bare_floor() {
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.is_empty(),
+            "zero-default-context floor: coxn must add nothing by default"
+        );
     }
 
     #[tokio::test]
