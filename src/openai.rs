@@ -244,6 +244,16 @@ fn from_wire(response: ChatResponse) -> Result<ModelResponse, ModelError> {
     })
 }
 
+/// Trim a body to a short, single-line snippet for an error message.
+fn snippet(body: &str) -> String {
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(300)
+        .collect()
+}
+
 impl Model for OpenAiCompatModel {
     async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
         // ureq is blocking; the pump already blocks on a turn, so this is fine
@@ -252,17 +262,38 @@ impl Model for OpenAiCompatModel {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = to_wire(&self.model, &request);
 
-        let mut builder = ureq::post(&url);
+        // Don't treat a non-2xx as a transport error: read the body so the
+        // server's own message (bad model name, invalid request, ...) reaches
+        // the status line instead of an opaque failure.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut builder = agent.post(&url);
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", &format!("Bearer {key}"));
         }
         let mut response = builder
             .send_json(&body)
             .map_err(|e| ModelError::Backend(format!("request to {url} failed: {e}")))?;
-        let parsed: ChatResponse = response
+
+        let status = response.status();
+        let text = response
             .body_mut()
-            .read_json()
-            .map_err(|e| ModelError::Backend(format!("decoding response failed: {e}")))?;
+            .read_to_string()
+            .map_err(|e| ModelError::Backend(format!("reading response from {url} failed: {e}")))?;
+        if !status.is_success() {
+            return Err(ModelError::Backend(format!(
+                "{url} returned {status}: {}",
+                snippet(&text)
+            )));
+        }
+        let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+            ModelError::Backend(format!(
+                "decoding response failed: {e}; body: {}",
+                snippet(&text)
+            ))
+        })?;
         from_wire(parsed)
     }
 }
