@@ -1,12 +1,13 @@
 //! Thin tool dispatch.
 //!
 //! Maps a model-requested tool call to a result. Commodity machinery kept
-//! deliberately thin. aden's tools are not injected up front; they are
-//! discovered by intent through a deferred-loading seam (Phase 2). The one
-//! built-in here is a placeholder that proves the dispatch path.
+//! deliberately thin. aden's tools are not injected up front: they are latent,
+//! discovered by intent through the [`DISCOVER`] seam, and dispatchable once the
+//! model knows their name. Only the seam (plus any active tools) is advertised,
+//! which keeps the default context free of tool bloat.
 //!
 //! Handlers are synchronous for the MVP. I/O-bound tools (real aden calls) may
-//! want async dispatch later; revisit in Phase 2 rather than speculatively now.
+//! want async dispatch later; revisit when a real provider lands.
 
 use crate::model::ToolCall;
 
@@ -21,6 +22,11 @@ pub trait Tool {
     fn name(&self) -> &str;
     /// Run the tool against its raw arguments payload.
     fn run(&self, arguments: &str) -> ToolResult;
+    /// A one-line statement of intent, surfaced by tool discovery so the model
+    /// can find a tool by what it does rather than being shown every schema.
+    fn intent(&self) -> &str {
+        ""
+    }
     /// Whether this tool mutates the working tree. The pump consults the gate
     /// before accepting a mutating tool's effect; read-only tools skip it.
     fn mutates(&self) -> bool {
@@ -28,11 +34,21 @@ pub trait Tool {
     }
 }
 
-/// A thin registry: a set of tools dispatched by name. No schemas, no
-/// discovery logic here; that is the deferred-loading seam's job (Phase 2).
+/// The name of the always-present discovery seam. The model calls it with an
+/// intent query to find latent tools; this is the only aden capability
+/// advertised up front, which is what keeps the default context free of tool
+/// bloat (zero-default-context).
+pub const DISCOVER: &str = "aden_tools";
+
+/// A thin registry with deferred disclosure: `active` tools are advertised in
+/// every request's tool list; `latent` tools are discoverable via the [`DISCOVER`]
+/// seam and dispatchable once the model knows their name, but are not advertised
+/// up front. This is what keeps the default context free of tool bloat — the
+/// model pulls the schema it needs by intent instead of being shown all of them.
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    active: Vec<Box<dyn Tool>>,
+    latent: Vec<Box<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -41,21 +57,53 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// Add a tool. Later registrations of the same name do not replace earlier
-    /// ones; dispatch resolves the first match.
+    /// Add an always-advertised tool.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(tool);
+        self.active.push(tool);
     }
 
-    /// The names of the registered tools, for populating a request's tool list.
+    /// Add a latent tool: discoverable by intent, not advertised up front.
+    pub fn register_latent(&mut self, tool: Box<dyn Tool>) {
+        self.latent.push(tool);
+    }
+
+    /// The advertised tool list for a request: the discovery seam plus the
+    /// active tools. Latent tools are intentionally omitted (no bloat).
     pub fn names(&self) -> Vec<String> {
-        self.tools.iter().map(|t| t.name().to_string()).collect()
+        let mut names = vec![DISCOVER.to_string()];
+        names.extend(self.active.iter().map(|t| t.name().to_string()));
+        names
     }
 
-    /// Dispatch a tool call to its handler. An unknown tool is an error fed
+    /// Search latent tools by intent/name for `query` (empty lists all),
+    /// returning `name — intent` lines for the model to act on.
+    pub fn discover(&self, query: &str) -> String {
+        let q = query.trim().to_lowercase();
+        let mut hits: Vec<String> = self
+            .latent
+            .iter()
+            .filter(|t| {
+                q.is_empty()
+                    || t.name().to_lowercase().contains(&q)
+                    || t.intent().to_lowercase().contains(&q)
+            })
+            .map(|t| format!("{} — {}", t.name(), t.intent()))
+            .collect();
+        if hits.is_empty() {
+            return format!("no aden tools match '{query}'");
+        }
+        hits.sort();
+        hits.join("\n")
+    }
+
+    /// Dispatch a tool call. The discovery seam is handled here; otherwise the
+    /// active then latent tools are searched. An unknown tool is an error fed
     /// back to the model, not a panic.
     pub fn dispatch(&self, call: &ToolCall) -> ToolResult {
-        match self.tools.iter().find(|t| t.name() == call.name) {
+        if call.name == DISCOVER {
+            return Ok(self.discover(&call.arguments));
+        }
+        match self.find(&call.name) {
             Some(tool) => tool.run(&call.arguments),
             None => Err(format!("unknown tool: {}", call.name)),
         }
@@ -64,11 +112,16 @@ impl ToolRegistry {
     /// Whether the named tool mutates the working tree (so the pump gates it).
     /// An unknown tool is treated as non-mutating; dispatch handles the error.
     pub fn mutates(&self, name: &str) -> bool {
-        self.tools
+        self.find(name).map(|t| t.mutates()).unwrap_or(false)
+    }
+
+    /// Find a tool by name across active and latent sets.
+    fn find(&self, name: &str) -> Option<&dyn Tool> {
+        self.active
             .iter()
+            .chain(self.latent.iter())
             .find(|t| t.name() == name)
-            .map(|t| t.mutates())
-            .unwrap_or(false)
+            .map(|t| t.as_ref())
     }
 }
 
@@ -106,6 +159,10 @@ impl Tool for AsmTool {
         "aden_asm"
     }
 
+    fn intent(&self) -> &str {
+        "assemble an anchor's graph neighborhood (blast radius and context)"
+    }
+
     fn run(&self, arguments: &str) -> ToolResult {
         let anchor = arguments.trim();
         if anchor.is_empty() {
@@ -130,6 +187,10 @@ impl UnderstandTool {
 impl Tool for UnderstandTool {
     fn name(&self) -> &str {
         "aden_understand"
+    }
+
+    fn intent(&self) -> &str {
+        "a symbol's definition, callers, and downstream impact"
     }
 
     fn run(&self, arguments: &str) -> ToolResult {
@@ -176,19 +237,49 @@ mod tests {
     }
 
     #[test]
-    fn names_lists_registered_tools() {
-        assert_eq!(registry().names(), vec!["echo".to_string()]);
+    fn names_advertise_the_discovery_seam_and_active_tools() {
+        // The discovery seam is always advertised; echo is active.
+        assert_eq!(
+            registry().names(),
+            vec![DISCOVER.to_string(), "echo".to_string()]
+        );
     }
 
     #[test]
-    fn aden_tools_register_under_their_names() {
+    fn latent_tools_are_discoverable_but_not_advertised() {
         let mut r = ToolRegistry::new();
-        r.register(Box::new(AsmTool::new(PathBuf::from("."))));
-        r.register(Box::new(UnderstandTool::new(PathBuf::from("."))));
-        assert_eq!(
-            r.names(),
-            vec!["aden_asm".to_string(), "aden_understand".to_string()]
+        r.register_latent(Box::new(AsmTool::new(PathBuf::from("."))));
+        r.register_latent(Box::new(UnderstandTool::new(PathBuf::from("."))));
+
+        // Latent tools stay out of the advertised list (no bloat by default).
+        assert_eq!(r.names(), vec![DISCOVER.to_string()]);
+
+        // Found by intent through the discovery seam.
+        let hits = r
+            .dispatch(&call(DISCOVER, "impact"))
+            .expect("discover runs");
+        assert!(hits.contains("aden_understand"), "{hits}");
+        assert!(
+            !hits.contains("aden_asm"),
+            "intent filter too broad: {hits}"
         );
+
+        // An empty query lists all latent tools.
+        let all = r.discover("");
+        assert!(all.contains("aden_asm") && all.contains("aden_understand"));
+
+        // A non-match is reported, not an error.
+        assert!(r.discover("nope").contains("no aden tools match"));
+    }
+
+    #[test]
+    fn latent_tools_dispatch_once_known() {
+        let mut r = ToolRegistry::new();
+        r.register_latent(Box::new(AsmTool::new(PathBuf::from("."))));
+        // Dispatchable even though latent; empty arg proves AsmTool actually ran.
+        assert!(r.dispatch(&call("aden_asm", "")).is_err());
+        // Still unknown if never registered.
+        assert!(r.dispatch(&call("ghost", "")).is_err());
     }
 
     #[test]

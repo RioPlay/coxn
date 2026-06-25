@@ -53,7 +53,7 @@ latter). Tested against the offline aden branch via `COXN_ADEN_BIN`.
 * [x] P2.3 Gate enforcement: `Gate` trait + `AdenGate` (wraps the seam); pump gates mutating tools (`Tool::mutates`), blocks non-in-scope edits + feeds the verdict back to the model + records the block; main raises the confirm modal. 3 pump tests (block/allow/non-mutating). Live LLM-driven edit awaits Phase 3.
 * [x] P2.4 Scope->context loader: `COXN_TASK_NAME`/`SEEDS`/`BUDGET` -> `aden scope` defines the mandate (manifest persisted -> gate) and `Pump::set_context` loads exactly the seeds' `aden asm` context. NO serde -- coxn loads from its own seed inputs + the manifest file, parses nothing.
 * [x] P2.5 Savings: `aden::savings` lifts the all-time figure from `aden status` (pure `extract_savings`, tested); status line shows it, refreshed after each turn. Falls back to base text when aden is absent.
-* [ ] P2.6 Deferred tool discovery: one discovery seam; aden tool schemas register on demand (append, do not swap).
+* [x] P2.6 Deferred tool discovery: `aden_tools` seam searches a latent catalog by intent; `names()` advertises only the seam + active tools (no bloat), latent tools dispatchable once known. main registers the aden tools latent. 3 tests. (Full schema-into-next-turn registration is a Phase 3 refinement with a real provider's tool list.)
 
 == Notes / decisions
 
