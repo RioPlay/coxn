@@ -8,6 +8,7 @@ mod gate;
 mod model;
 mod openai;
 mod pump;
+mod session;
 mod tools;
 mod tui;
 
@@ -408,6 +409,8 @@ const HELP: &str = "commands:\n  \
 /model <name|#>  switch the active model\n  \
 /model @<role>   switch to the model mapped for a role (route.<role> config)\n  \
 /tools           list the aden tools the model can discover\n  \
+/session         list saved sessions\n  \
+/resume <slug>   load a saved session\n  \
 /clear           clear the conversation (keeps the task scope)\n  \
 /quit            leave coxn\n\
 keys:\n  \
@@ -426,6 +429,10 @@ enum Command {
     /// `/model` lists; `/model <name|#>` switches.
     Model(Option<String>),
     Tools,
+    /// `/session` lists saved sessions.
+    Session,
+    /// `/resume <slug>` loads a saved session.
+    Resume(Option<String>),
     Unknown(String),
 }
 
@@ -440,6 +447,8 @@ fn parse_command(input: &str) -> Command {
         "clear" => Command::Clear,
         "model" => Command::Model(arg),
         "tools" => Command::Tools,
+        "session" | "sessions" => Command::Session,
+        "resume" => Command::Resume(arg),
         other => Command::Unknown(other.to_string()),
     }
 }
@@ -485,6 +494,10 @@ async fn drive(
     sel: &mut ModelSel,
     task: &str,
 ) -> io::Result<()> {
+    // Append-only session persistence: every message not yet written is flushed
+    // after each turn. `persisted` tracks how many of pump.messages() are on disk.
+    let mut session = session::Session::create();
+    let mut persisted = 0usize;
     loop {
         tui.draw(view)?;
 
@@ -569,9 +582,37 @@ async fn drive(
                             }
                         }
                         Command::Tools => view.output = pump.tool_catalog(),
+                        Command::Session => view.output = session_listing(&session.slug()),
+                        Command::Resume(slug) => {
+                            view.output = match slug {
+                                Some(slug) => {
+                                    let messages = session::load(&slug);
+                                    if messages.is_empty() {
+                                        format!("no session '{slug}' (try /session)")
+                                    } else {
+                                        let n = messages.len();
+                                        pump.load_conversation(messages);
+                                        session = session::Session::open(&slug);
+                                        persisted = n;
+                                        let out = transcript(pump.messages());
+                                        view.set_status(status_line(
+                                            dir,
+                                            &sel.label(),
+                                            task,
+                                            pump.last_usage(),
+                                        ));
+                                        out
+                                    }
+                                }
+                                None => "usage: /resume <slug>  (see /session)".to_string(),
+                            };
+                        }
                         Command::Clear => {
                             pump.clear_conversation();
                             view.output.clear();
+                            // A cleared conversation starts a fresh session file.
+                            session = session::Session::create();
+                            persisted = 0;
                             view.set_status(status_line(
                                 dir,
                                 &sel.label(),
@@ -655,10 +696,37 @@ async fn drive(
                 if let Some(block) = pump.take_block() {
                     view.confirm(block.message);
                 }
+                // Persist any messages this turn added (user + assistant + tools).
+                let messages = pump.messages();
+                for message in &messages[persisted.min(messages.len())..] {
+                    session.append(message);
+                }
+                persisted = messages.len();
             }
             _ => {}
         }
     }
+}
+
+/// Render the `/session` listing: saved sessions, newest first, with a relative
+/// age and a preview of the first user line. The active session is marked `*`.
+fn session_listing(active: &str) -> String {
+    let sessions = session::list();
+    if sessions.is_empty() {
+        return "no saved sessions yet".to_string();
+    }
+    let mut out = String::from("saved sessions (/resume <slug>):\n");
+    for s in &sessions {
+        let mark = if s.slug == active { '*' } else { ' ' };
+        out.push_str(&format!(
+            "  {mark} {:>4}  {}  {}\n",
+            session::relative_age(s.age_secs),
+            s.slug,
+            s.preview
+        ));
+    }
+    out.push_str("(* = active, newest first)");
+    out
 }
 
 #[cfg(test)]
