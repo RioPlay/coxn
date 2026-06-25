@@ -58,6 +58,9 @@ pub struct View {
     pub hist_draft: String,
     /// True while a model turn is in progress; drives the activity indicator.
     pub pending: bool,
+    /// Kill ring: text cut by Ctrl-K / Ctrl-U, newest last; Ctrl-Y yanks the
+    /// most recent. A simple stack (no yank-pop) -- enough to reuse cut text.
+    pub kill_ring: Vec<String>,
 }
 
 impl View {
@@ -170,6 +173,33 @@ impl View {
             let len = prev.len_utf8();
             self.input.drain(self.cursor - len..self.cursor);
             self.cursor -= len;
+        }
+    }
+
+    /// Cut from the cursor to the end of the line onto the kill ring (Ctrl-K).
+    pub fn kill_to_end(&mut self) {
+        if self.cursor < self.input.len() {
+            let cut = self.input.split_off(self.cursor);
+            self.kill_ring.push(cut);
+        }
+    }
+
+    /// Cut from the start of the line to the cursor onto the kill ring (Ctrl-U).
+    pub fn kill_to_start(&mut self) {
+        if self.cursor > 0 {
+            let cut: String = self.input[..self.cursor].to_string();
+            self.input.replace_range(..self.cursor, "");
+            self.cursor = 0;
+            self.kill_ring.push(cut);
+        }
+    }
+
+    /// Yank (insert) the most recently killed text at the cursor (Ctrl-Y).
+    pub fn yank(&mut self) {
+        if let Some(text) = self.kill_ring.last() {
+            let text = text.clone();
+            self.input.insert_str(self.cursor, &text);
+            self.cursor += text.len();
         }
     }
 
@@ -441,6 +471,12 @@ pub enum Action {
     CursorEnd,
     /// Delete the word before the cursor (Ctrl-W).
     WordDelete,
+    /// Cut from the cursor to end of line onto the kill ring (Ctrl-K).
+    KillToEnd,
+    /// Cut from start of line to the cursor onto the kill ring (Ctrl-U).
+    KillToStart,
+    /// Yank the most recently killed text at the cursor (Ctrl-Y).
+    Yank,
     /// Recall the previous input-history entry (Ctrl-P).
     HistoryPrev,
     /// Navigate forward in input history (Ctrl-N).
@@ -472,6 +508,9 @@ pub fn map_input_key(key: KeyEvent) -> Option<Action> {
         (KeyCode::Home, _) => Some(Action::CursorHome),
         (KeyCode::End, _) => Some(Action::CursorEnd),
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => Some(Action::WordDelete),
+        (KeyCode::Char('k'), KeyModifiers::CONTROL) => Some(Action::KillToEnd),
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => Some(Action::KillToStart),
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => Some(Action::Yank),
         // Input history lives on Ctrl-P / Ctrl-N so the arrows can scroll.
         (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(Action::HistoryPrev),
         (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(Action::HistoryNext),
@@ -610,6 +649,35 @@ mod tests {
         v.input_push('b');
         assert_eq!(v.input, "abc");
         assert_eq!(v.cursor, 2);
+    }
+
+    #[test]
+    fn kill_ring_cut_and_yank() {
+        let mut v = View::new();
+        for c in "hello world".chars() {
+            v.input_push(c);
+        }
+        // Kill to start cuts "hello world" (cursor at end -> nothing after).
+        v.cursor_home();
+        v.kill_to_end(); // cut "hello world"
+        assert_eq!(v.input, "");
+        assert_eq!(v.kill_ring.last().map(String::as_str), Some("hello world"));
+        // Yank it back.
+        v.yank();
+        assert_eq!(v.input, "hello world");
+        assert_eq!(v.cursor, "hello world".len());
+        // Kill from cursor (end) does nothing; kill to start cuts everything.
+        v.kill_to_start();
+        assert_eq!(v.input, "");
+        assert_eq!(v.kill_ring.len(), 2);
+    }
+
+    #[test]
+    fn kill_keys_map_to_actions() {
+        let ck = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert_eq!(map_input_key(ck('k')), Some(Action::KillToEnd));
+        assert_eq!(map_input_key(ck('u')), Some(Action::KillToStart));
+        assert_eq!(map_input_key(ck('y')), Some(Action::Yank));
     }
 
     #[test]
