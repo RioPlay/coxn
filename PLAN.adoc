@@ -16,7 +16,7 @@ prerequisites are out of scope here and tracked under Phase 2 blockers.
 * [x] P0.2 Cargo skeleton: `Cargo.toml` (ratatui, crossterm, tokio), `src/main.rs`, compiles. fmt/clippy clean.
 * [x] P0.3 Module stubs: `pump`, `model`, `tools`, `gate`, `tui` (documented, wired into `main`). Builds, clippy/fmt clean.
 * [x] P0.4 Contract spec `docs/contract.adoc`: manifest `{name, seeds, anchors, files, context:{anchors,budget}, risk}` + gate verdicts in-scope/scope-escape/blast-leak. Grounded in aden research; exit-code mapping marked provisional.
-* [ ] P0.5 Contract types in `gate`: `ScopeManifest`, `GateVerdict` deserialized from the spec, unit-tested against fixtures
+* [x] P0.5 Contract types in `gate`: `ScopeManifest`, `Context`, `RiskClass`, `GateVerdict` + exit-code mapping, 4 unit tests green. serde/JSON deferred to Phase 2 (no new dep).
 
 == Phase 1: the dumb pump MVP
 
