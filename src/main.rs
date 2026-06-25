@@ -531,7 +531,10 @@ struct DriveIo<'a> {
     view: &'a mut View,
     prior: &'a str,
     buf: String,
+    /// Set when the stream was cancelled (Ctrl-C mid-reply).
     cancelled: bool,
+    /// Set when an approval prompt returned cancel-turn.
+    cancel_turn: bool,
     approvals: &'a mut HashSet<String>,
 }
 
@@ -560,7 +563,8 @@ impl TurnIo for DriveIo<'_> {
         let summary = approval_summary(call);
         loop {
             self.view.set_status(format!(
-                "approve {summary}?  [o]nce  [s]ession  [d]ecline  [x] cancel turn"
+                "approve {summary}?  [o]nce  [s]ession (all {} calls)  [d]ecline  [x] cancel turn",
+                call.name
             ));
             let _ = self.tui.draw(self.view);
             if event::poll(TICK).unwrap_or(false)
@@ -569,6 +573,7 @@ impl TurnIo for DriveIo<'_> {
             {
                 // Ctrl-C cancels the turn here too, not just x/Esc.
                 if matches!(map_input_key(key), Some(Action::Quit)) {
+                    self.cancel_turn = true;
                     return Approval::CancelTurn;
                 }
                 match key.code {
@@ -578,7 +583,10 @@ impl TurnIo for DriveIo<'_> {
                         return Approval::Allow;
                     }
                     KeyCode::Char('d' | 'D') => return Approval::Decline,
-                    KeyCode::Char('x' | 'X') | KeyCode::Esc => return Approval::CancelTurn,
+                    KeyCode::Char('x' | 'X') | KeyCode::Esc => {
+                        self.cancel_turn = true;
+                        return Approval::CancelTurn;
+                    }
                     _ => {}
                 }
             }
@@ -750,9 +758,11 @@ async fn drive(
                         Command::Clear => {
                             pump.clear_conversation();
                             view.output = welcome();
-                            // A cleared conversation starts a fresh session file.
+                            // A cleared conversation starts a fresh session file
+                            // and forgets session-level tool approvals.
                             session = session::Session::create();
                             persisted = 0;
+                            approvals.clear();
                             view.set_status(status_line(
                                 dir,
                                 &sel.label(),
@@ -787,10 +797,11 @@ async fn drive(
                         prior: &prior,
                         buf: String::new(),
                         cancelled: false,
+                        cancel_turn: false,
                         approvals: &mut approvals,
                     };
                     let r = pump.run_turn_streaming(&mut io).await;
-                    cancelled = io.cancelled;
+                    cancelled = io.cancelled || io.cancel_turn;
                     if let Err(e) = &r
                         && e.is_transient()
                         && attempt < MAX_RETRIES
