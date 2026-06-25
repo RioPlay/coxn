@@ -23,7 +23,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
 use pump::{Approval, Pump, TurnIo};
 use tools::{AdenTool, EditTool, ReadFileTool, ToolRegistry, WriteTool};
-use tui::{Action, Tui, View, map_input_key, map_modal_key};
+use tui::{
+    Action, Menu, MenuItem, MenuKind, Tui, View, map_input_key, map_menu_key, map_modal_key,
+};
 
 /// How long the event loop waits for a key before redrawing.
 const TICK: Duration = Duration::from_millis(100);
@@ -332,6 +334,128 @@ fn resolve_role(dir: &Path, role: &str) -> Option<String> {
     aden::config_get(dir, &format!("route.{role}"))
 }
 
+/// Slash command verbs, for Tab completion.
+const COMMANDS: &[&str] = &[
+    "help", "model", "think", "tools", "agents", "session", "resume", "edit", "clear", "quit",
+];
+
+/// The longest common prefix of `items` (empty if they share none).
+fn longest_common_prefix(items: &[&str]) -> String {
+    let Some(first) = items.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for s in &items[1..] {
+        end = end.min(s.len());
+        while !s.is_char_boundary(end) || first[..end] != s[..end] {
+            end -= 1;
+        }
+    }
+    first[..end].to_string()
+}
+
+/// Tab-complete a slash-command input: the command verb, or a `/resume` slug.
+/// Returns the completed line, or `None` when there is nothing to add. Model
+/// names are completed via the `/model` picker, not here.
+fn complete_input(input: &str) -> Option<String> {
+    let rest = input.strip_prefix('/')?;
+    match rest.split_once(' ') {
+        // Completing the command verb.
+        None => {
+            let cands: Vec<&str> = COMMANDS
+                .iter()
+                .copied()
+                .filter(|c| c.starts_with(rest))
+                .collect();
+            match cands.as_slice() {
+                [] => None,
+                [only] => Some(format!("/{only} ")),
+                many => {
+                    let lcp = longest_common_prefix(many);
+                    (lcp.len() > rest.len()).then(|| format!("/{lcp}"))
+                }
+            }
+        }
+        // Completing a `/resume <slug>` argument from saved sessions.
+        Some(("resume", arg)) => {
+            let slugs: Vec<String> = session::list()
+                .into_iter()
+                .map(|s| s.slug)
+                .filter(|s| s.starts_with(arg))
+                .collect();
+            let refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
+            match refs.as_slice() {
+                [] => None,
+                [only] => Some(format!("/resume {only}")),
+                many => {
+                    let lcp = longest_common_prefix(many);
+                    (lcp.len() > arg.len()).then(|| format!("/resume {lcp}"))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Build the `/model` picker (every advertised model, hot ones marked, the
+/// active one starred). `None` for the offline stub or an unreachable endpoint.
+fn model_menu(sel: &ModelSel) -> Option<Menu> {
+    let e = sel.endpoint.as_ref()?;
+    let models = openai::list_models(&e.base_url, e.key.as_deref())?;
+    if models.is_empty() {
+        return None;
+    }
+    let loaded = openai::loaded_models(&e.base_url, e.key.as_deref()).unwrap_or_default();
+    let selected = models.iter().position(|m| *m == sel.name).unwrap_or(0);
+    let items = models
+        .into_iter()
+        .map(|m| {
+            let hot = if loaded.contains(&m) {
+                "  [loaded]"
+            } else {
+                ""
+            };
+            let active = if m == sel.name { "  *" } else { "" };
+            MenuItem {
+                label: format!("{m}{hot}{active}"),
+                value: m,
+            }
+        })
+        .collect();
+    Some(Menu {
+        kind: MenuKind::Model,
+        title: "models".to_string(),
+        items,
+        selected,
+    })
+}
+
+/// Build the `/session` picker (saved sessions, newest first). `None` if none.
+fn session_menu() -> Option<Menu> {
+    let sessions = session::list();
+    if sessions.is_empty() {
+        return None;
+    }
+    let items = sessions
+        .into_iter()
+        .map(|s| MenuItem {
+            label: format!(
+                "{:>4}  {}  {}",
+                session::relative_age(s.age_secs),
+                s.slug,
+                s.preview
+            ),
+            value: s.slug,
+        })
+        .collect();
+    Some(Menu {
+        kind: MenuKind::Session,
+        title: "sessions".to_string(),
+        items,
+        selected: 0,
+    })
+}
+
 /// Read the task config from the environment: `(name, seeds, budget)`. `None`
 /// when no task is set. Shared by the boot path and `/agents`.
 fn task_config() -> Option<(String, Vec<String>, u64)> {
@@ -486,8 +610,10 @@ const HELP: &str = "commands:\n  \
 /edit [path]     open the last-edited file (or path) in $EDITOR\n  \
 /clear           clear the conversation (keeps the task scope)\n  \
 /quit            leave coxn\n\
+/model and /session open an arrow-navigable picker (Up/Down, Enter, Esc).\n\
 keys:\n  \
 Enter            send         Ctrl-C   cancel a turn / quit when idle\n  \
+Tab              complete a command or /resume slug\n  \
 Up/Down          scroll chat  PgUp/Dn  scroll a page\n  \
 Ctrl-P/Ctrl-N    input history             Ctrl-W   delete word\n  \
 Ctrl-K/Ctrl-U    cut to end/start          Ctrl-Y   yank (paste)\n  \
@@ -687,8 +813,62 @@ async fn drive(
             continue;
         }
 
+        // A picker grabs input until selected or cancelled.
+        if view.menu.is_some() {
+            match map_menu_key(key) {
+                Some(Action::MenuUp) => view.menu_move(-1),
+                Some(Action::MenuDown) => view.menu_move(1),
+                Some(Action::MenuCancel) => view.close_menu(),
+                Some(Action::MenuSelect) => {
+                    let pick = view
+                        .menu
+                        .as_ref()
+                        .and_then(|m| m.items.get(m.selected).map(|it| (m.kind, it.value.clone())));
+                    view.close_menu();
+                    if let Some((kind, value)) = pick {
+                        match kind {
+                            MenuKind::Model => {
+                                view.output = switch_model(pump, sel, &value);
+                                view.set_status(status_line(
+                                    dir,
+                                    &sel.label(),
+                                    task,
+                                    pump.last_usage(),
+                                ));
+                            }
+                            MenuKind::Session => {
+                                let messages = session::load(&value);
+                                if messages.is_empty() {
+                                    view.output = format!("no session '{value}'");
+                                } else {
+                                    persisted = messages.len();
+                                    pump.load_conversation(messages);
+                                    session = session::Session::open(&value);
+                                    view.output = transcript(pump.messages());
+                                    view.set_status(status_line(
+                                        dir,
+                                        &sel.label(),
+                                        task,
+                                        pump.last_usage(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match map_input_key(key) {
             Some(Action::Quit) => return Ok(()),
+            Some(Action::Complete) => {
+                if let Some(completed) = complete_input(&view.input) {
+                    view.input = completed;
+                    view.cursor_end();
+                }
+            }
             Some(Action::Append(c)) => view.input_push(c),
             Some(Action::Backspace) => view.input_backspace(),
             Some(Action::CursorLeft) => view.cursor_left(),
@@ -726,7 +906,10 @@ async fn drive(
                     match parse_command(text.trim()) {
                         Command::Quit => return Ok(()),
                         Command::Help => view.output = HELP.to_string(),
-                        Command::Model(None) => view.output = model_listing(sel),
+                        Command::Model(None) => match model_menu(sel) {
+                            Some(menu) => view.open_menu(menu),
+                            None => view.output = model_listing(sel),
+                        },
                         Command::Model(Some(target)) => {
                             // `@role` resolves through the [route] table; anything
                             // else is a model name or index.
@@ -787,7 +970,10 @@ async fn drive(
                                 }
                             };
                         }
-                        Command::Session => view.output = session_listing(&session.slug()),
+                        Command::Session => match session_menu() {
+                            Some(menu) => view.open_menu(menu),
+                            None => view.output = session_listing(&session.slug()),
+                        },
                         Command::Resume(slug) => {
                             view.output = match slug {
                                 Some(slug) => {
@@ -963,6 +1149,28 @@ mod tests {
             transcript(&messages),
             "you: go\ncoxn: → aden_asm({})\ntool: result"
         );
+    }
+
+    #[test]
+    fn longest_common_prefix_of_candidates() {
+        assert_eq!(longest_common_prefix(&["think", "tools"]), "t");
+        assert_eq!(longest_common_prefix(&["model"]), "model");
+        assert_eq!(longest_common_prefix(&["abc", "abd", "abe"]), "ab");
+        assert_eq!(longest_common_prefix(&["x", "y"]), "");
+        assert_eq!(longest_common_prefix(&[]), "");
+    }
+
+    #[test]
+    fn tab_completes_command_verbs() {
+        // A unique prefix completes with a trailing space.
+        assert_eq!(complete_input("/mod").as_deref(), Some("/model "));
+        assert_eq!(complete_input("/he").as_deref(), Some("/help "));
+        // An ambiguous prefix that cannot be extended yields nothing
+        // (think/tools share only the typed "t").
+        assert_eq!(complete_input("/t"), None);
+        // No match, and non-command input, complete to nothing.
+        assert_eq!(complete_input("/zzz"), None);
+        assert_eq!(complete_input("hello"), None);
     }
 
     #[test]
