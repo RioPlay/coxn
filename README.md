@@ -49,38 +49,72 @@ COXN_MODEL_BASE_URL=http://localhost:1234/v1 COXN_MODEL_NAME=openai/gpt-oss-20b 
 At runtime, `/model` lists every model the provider advertises (loaded or not)
 and `/model <name|#>` switches the active one mid-session.
 
-## Task mode: scoped, gated editing
+## Editing: approval, and an optional scope gate
 
-A *task* is what turns coxn from a grounded chat into a harness. Set a task name
-and seed symbols, and aden defines the scope:
+The model can edit via the `edit` (replace an exact unique string) and
+`write_file` tools, plus `read_file` to fetch the exact text first. Every
+mutating call is **approved at the prompt** before it runs:
+
+```
+approve edit src/lib.rs?  [o]nce  [s]ession (all edit calls)  [d]ecline  [x] cancel turn
+```
+
+`[s]ession` stops prompting for that tool until `/clear`. Edits are confined to
+the project root.
+
+A **task** adds aden's blast-radius gate on top. Set a task name and seed
+symbols and aden defines the scope:
 
 ```sh
 COXN_TASK_NAME=tune-worker COXN_TASK_SEEDS=makeDrainableWorker cargo run
 ```
 
-- `aden scope` resolves the seeds into a file mandate and a token-budgeted
-  context, which coxn loads into the prompt (and nothing more).
-- The **action tools** `edit` and `write_file` are advertised only in task mode.
-- Every edit is gated: coxn applies it, runs `aden impact-diff --scope`, and if
-  the change escapes the scope (scope-escape / blast-leak) it **reverts that one
-  file** and feeds the verdict back to the model. In-scope edits persist.
-
-Without a task there is no gate, so editing is off (no ungated edits).
+- `aden scope` resolves the seeds into a file mandate + token-budgeted context,
+  loaded into the prompt (and nothing more), and a one-line operating preamble
+  is added so the model knows to act via the tools.
+- An approved edit is then gated: coxn applies it, runs `aden impact-diff
+  --scope`, and if it escapes the scope it **reverts that one file** and feeds
+  the verdict back to the model. In-scope edits persist.
 
 Env vars: `COXN_TASK_NAME`, `COXN_TASK_SEEDS` (comma-separated),
 `COXN_TASK_BUDGET` (tokens, default 8192).
+
+## Resilience and feedback
+
+- **Streaming** replies render token-by-token; `Ctrl-C` cancels a turn (or quits
+  when idle).
+- **Auto-retry**: transient backend errors (rate limit, unavailable, dropped
+  connection) retry with a backoff and a cancellable countdown.
+- **Context meter**: the status line shows `~Nk ctx` (last turn's token usage),
+  so you can `/clear` before it grows unwieldy.
+- **Hot models**: auto-detect prefers a model already loaded in memory, and
+  `/model` marks `[loaded]` ones (where the server reports state).
+
+## Sessions
+
+Every message is appended to a JSONL session under
+`$XDG_DATA_HOME/coxn/sessions/` (or `~/.local/share/...`), so a crash loses
+nothing. `/session` lists saved sessions; `/resume <slug>` continues one.
 
 ## Slash commands
 
 ```
 /help            show help
-/model           list available models (* = active)
+/model           list models (* = active, [loaded] = hot in memory)
 /model <name|#>  switch the active model
 /model @<role>   switch to the model mapped for a role (see Roles below)
+/think <level>   reasoning effort: off | low | med | high
 /tools           list the aden tools the model can discover
+/session         list saved sessions
+/resume <slug>   load a saved session
+/edit [path]     open the last-edited file (or path) in $EDITOR
 /clear           clear the conversation (keeps the task scope)
 /quit            leave coxn
 ```
+
+Keys: Up/Down scroll the transcript (PgUp/PgDn by a page); Ctrl-P/Ctrl-N recall
+input history; Ctrl-W word-delete; Ctrl-K/Ctrl-U cut, Ctrl-Y yank; arrows/Home/
+End move the cursor.
 
 ## Roles (model routing)
 
@@ -117,11 +151,12 @@ HTTP call). Minimalism is the product.
 ## Status
 
 Working and validated end to end against a real codebase + a local model:
-provider-neutral chat, **streaming** replies, tool-calling over the wire (incl.
-under streaming), model enumeration/switching, and scoped, gated editing
-(apply -> `impact-diff --scope` -> revert on escape).
+provider-neutral chat, streaming replies, tool-calling (incl. under streaming),
+model enumeration/switching + hot-model detection + per-role routing, the read
+-> edit workflow with per-edit approval and the optional aden scope gate,
+auto-retry, the context meter, and JSONL session persistence (`/resume`).
 
-Not yet: Ollama's native `/api/chat` profile (its OpenAI-compat layer drops tool
-calls under streaming; the OpenAI-compat path here covers LM Studio, OpenAI,
-OpenRouter, vLLM); an Anthropic-direct profile; multi-model sub-agents
-(`DESIGN.adoc` Phase 5).
+Not yet: multi-model **sub-agents** (`DESIGN.adoc` Phase 5; the aden partition
+contract is in `docs/routing.adoc`); a native streaming profile for a local
+server whose chat-completions layer drops tool calls under streaming; an
+optional direct-provider profile (native caching / exact billing).
