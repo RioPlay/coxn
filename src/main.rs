@@ -19,7 +19,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 
 use model::{AnyModel, Message, Role, StubModel};
 use pump::Pump;
-use tools::{AsmTool, ToolRegistry, UnderstandTool};
+use tools::{AsmTool, EditTool, ToolRegistry, UnderstandTool, WriteTool};
 use tui::{Action, Tui, View, map_input_key, map_modal_key};
 
 /// How long the event loop waits for a key before redrawing.
@@ -65,6 +65,14 @@ async fn main() -> io::Result<()> {
     let mut tools = ToolRegistry::new();
     tools.register_latent(Box::new(AsmTool::new(dir.clone())));
     tools.register_latent(Box::new(UnderstandTool::new(dir.clone())));
+    // The action tools (the LLM acts: edit / write_file) are advertised only
+    // when a task scope is active: aden gates every edit against the scope
+    // manifest, and there is no gate without a scope, so editing is off by
+    // default (no ungated edits, no action surface the model cannot use).
+    if std::env::var("COXN_TASK_NAME").is_ok_and(|s| !s.trim().is_empty()) {
+        tools.register(Box::new(EditTool::new(dir.clone())));
+        tools.register(Box::new(WriteTool::new(dir.clone())));
+    }
     // Take over the terminal and paint a frame first, so the user sees coxn
     // start instead of a frozen blank while the aden subprocess calls below
     // (model resolution, scope, asm context, savings) run -- which can take

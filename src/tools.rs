@@ -9,6 +9,8 @@
 //! Handlers are synchronous for the MVP. I/O-bound tools (real aden calls) may
 //! want async dispatch later; revisit when a real provider lands.
 
+use std::path::{Path, PathBuf};
+
 use crate::model::{ToolCall, ToolDef};
 
 /// Read a string argument from a tool-call payload. If `arguments` is a JSON
@@ -63,6 +65,12 @@ pub trait Tool {
     fn mutates(&self) -> bool {
         false
     }
+    /// The file this call will write, for a mutating tool, so the pump can
+    /// snapshot it before applying and restore it if the gate blocks the edit.
+    /// `None` for tools that touch no single file (the default).
+    fn target_path(&self, _arguments: &str) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// The name of the always-present discovery seam. The model calls it with an
@@ -88,9 +96,9 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// Add an always-advertised tool. Kept for harness extension; today only the
-    /// built-in discovery seam is always-on, so the binary registers none.
-    #[allow(dead_code)]
+    /// Add an always-advertised tool (the discovery seam is always present on
+    /// top of these). The action tools (edit / write_file) register here when a
+    /// task scope is active.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.active.push(tool);
     }
@@ -158,6 +166,13 @@ impl ToolRegistry {
         self.find(name).map(|t| t.mutates()).unwrap_or(false)
     }
 
+    /// The file a call will write, if its tool declares one. Lets the pump
+    /// snapshot-and-restore around the gate check.
+    pub fn target_path(&self, call: &ToolCall) -> Option<PathBuf> {
+        self.find(&call.name)
+            .and_then(|t| t.target_path(&call.arguments))
+    }
+
     /// Find a tool by name across active and latent sets.
     fn find(&self, name: &str) -> Option<&dyn Tool> {
         self.active
@@ -184,8 +199,6 @@ impl Tool for EchoTool {
         Ok(arguments.to_string())
     }
 }
-
-use std::path::PathBuf;
 
 /// Pull-context tool: assemble an anchor's neighborhood via `aden asm`. The
 /// model calls this to pull blast-radius / context on demand (pull, not push);
@@ -254,6 +267,137 @@ impl Tool for UnderstandTool {
         }
         crate::aden::pull(&self.dir, crate::aden::Pull::Understand(&symbol))
             .map_err(|e| e.to_string())
+    }
+}
+
+/// Resolve a tool's `path` argument under the project root. Returns `None` for an
+/// empty path so the pump skips snapshotting.
+fn rooted_path(dir: &Path, arguments: &str) -> Option<PathBuf> {
+    let path = arg(arguments, "path");
+    (!path.is_empty()).then(|| dir.join(path))
+}
+
+/// Action tool: replace an exact string in a file. Surgical and token-light --
+/// the model sends only the slice that changes, which also keeps aden's
+/// blast-radius diff tight. The pump gates the result via `impact-diff --scope`
+/// and reverts the file if the edit escapes scope; the tool itself only applies.
+pub struct EditTool {
+    dir: PathBuf,
+}
+
+impl EditTool {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+impl Tool for EditTool {
+    fn name(&self) -> &str {
+        "edit"
+    }
+
+    fn intent(&self) -> &str {
+        "replace an exact string in a file with another (the change is gated by aden)"
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "file path relative to the project root" },
+                "old_string": { "type": "string", "description": "exact text to replace; must occur exactly once" },
+                "new_string": { "type": "string", "description": "replacement text" },
+            },
+            "required": ["path", "old_string", "new_string"],
+        })
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    fn target_path(&self, arguments: &str) -> Option<PathBuf> {
+        rooted_path(&self.dir, arguments)
+    }
+
+    fn run(&self, arguments: &str) -> ToolResult {
+        let path = arg(arguments, "path");
+        let old = arg(arguments, "old_string");
+        let new = arg(arguments, "new_string");
+        if path.is_empty() || old.is_empty() {
+            return Err("edit needs path and old_string".to_string());
+        }
+        let full = self.dir.join(&path);
+        let text =
+            std::fs::read_to_string(&full).map_err(|e| format!("cannot read {path}: {e}"))?;
+        match text.matches(&old).count() {
+            0 => return Err(format!("old_string not found in {path}")),
+            1 => {}
+            n => {
+                return Err(format!(
+                    "old_string occurs {n} times in {path}; make it unique"
+                ));
+            }
+        }
+        let updated = text.replacen(&old, &new, 1);
+        std::fs::write(&full, updated).map_err(|e| format!("cannot write {path}: {e}"))?;
+        Ok(format!("edited {path}"))
+    }
+}
+
+/// Action tool: create or overwrite a whole file. The pump gates the result and
+/// reverts the file (or removes a newly created one) if the write escapes scope.
+pub struct WriteTool {
+    dir: PathBuf,
+}
+
+impl WriteTool {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+impl Tool for WriteTool {
+    fn name(&self) -> &str {
+        "write_file"
+    }
+
+    fn intent(&self) -> &str {
+        "create or overwrite a file with the given content (the change is gated by aden)"
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "file path relative to the project root" },
+                "content": { "type": "string", "description": "the full new file content" },
+            },
+            "required": ["path", "content"],
+        })
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    fn target_path(&self, arguments: &str) -> Option<PathBuf> {
+        rooted_path(&self.dir, arguments)
+    }
+
+    fn run(&self, arguments: &str) -> ToolResult {
+        let path = arg(arguments, "path");
+        let content = arg(arguments, "content");
+        if path.is_empty() {
+            return Err("write_file needs a path".to_string());
+        }
+        let full = self.dir.join(&path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create directories for {path}: {e}"))?;
+        }
+        std::fs::write(&full, &content).map_err(|e| format!("cannot write {path}: {e}"))?;
+        Ok(format!("wrote {} bytes to {path}", content.len()))
     }
 }
 
@@ -362,5 +506,60 @@ mod tests {
         assert_eq!(arg("  foo  ", "anchor"), "foo");
         // Missing field -> empty.
         assert_eq!(arg(r#"{"other":"x"}"#, "anchor"), "");
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("coxn-tools-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("create temp dir");
+        d
+    }
+
+    #[test]
+    fn edit_replaces_a_unique_string() {
+        let dir = temp_dir("edit-ok");
+        std::fs::write(dir.join("f.txt"), "foo bar baz").unwrap();
+        let tool = EditTool::new(dir.clone());
+        assert!(tool.mutates());
+        let args = r#"{"path":"f.txt","old_string":"bar","new_string":"BAR"}"#;
+        assert_eq!(tool.run(args), Ok("edited f.txt".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "foo BAR baz"
+        );
+        // It declares the file it writes, so the pump can snapshot it.
+        assert_eq!(tool.target_path(args), Some(dir.join("f.txt")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_rejects_missing_or_ambiguous_old_string() {
+        let dir = temp_dir("edit-bad");
+        std::fs::write(dir.join("f.txt"), "a a a").unwrap();
+        let tool = EditTool::new(dir.clone());
+        let missing = tool.run(r#"{"path":"f.txt","old_string":"z","new_string":"Z"}"#);
+        assert!(missing.unwrap_err().contains("not found"));
+        let ambiguous = tool.run(r#"{"path":"f.txt","old_string":"a","new_string":"b"}"#);
+        assert!(ambiguous.unwrap_err().contains("occurs 3 times"));
+        // The file is untouched when the edit is rejected.
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "a a a");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_file_creates_the_file_and_parent_dirs() {
+        let dir = temp_dir("write");
+        let tool = WriteTool::new(dir.clone());
+        assert!(tool.mutates());
+        let args = r#"{"path":"sub/new.txt","content":"hi there"}"#;
+        assert_eq!(
+            tool.run(args),
+            Ok("wrote 8 bytes to sub/new.txt".to_string())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/new.txt")).unwrap(),
+            "hi there"
+        );
+        assert_eq!(tool.target_path(args), Some(dir.join("sub/new.txt")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
