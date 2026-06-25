@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::gate::{Gate, GateOutcome};
 use crate::model::{
-    DEFAULT_SYSTEM_PROMPT, Message, Model, ModelError, ModelRequest, Role, ToolCall,
+    DEFAULT_SYSTEM_PROMPT, Message, Model, ModelError, ModelRequest, Role, ToolCall, Usage,
 };
 use crate::tools::ToolRegistry;
 
@@ -70,6 +70,8 @@ pub struct Pump<M: Model> {
     gate: Option<Box<dyn Gate>>,
     /// The most recent gate block, for the TUI to surface as a modal.
     last_block: Option<GateOutcome>,
+    /// Token usage from the last turn that reported it, for the context meter.
+    last_usage: Option<Usage>,
 }
 
 impl<M: Model> Pump<M> {
@@ -83,7 +85,14 @@ impl<M: Model> Pump<M> {
             messages: Vec::new(),
             gate: None,
             last_block: None,
+            last_usage: None,
         }
+    }
+
+    /// Token usage from the most recent turn that reported it (the context
+    /// meter). `None` until a backend reports usage.
+    pub fn last_usage(&self) -> Option<Usage> {
+        self.last_usage
     }
 
     /// Install the blast-radius gate; a mutating tool's edit is then judged
@@ -171,6 +180,10 @@ impl<M: Model> Pump<M> {
                 };
                 self.model.stream(request, &mut sink).await?
             };
+            // Track context size: the latest hop that reports usage wins.
+            if response.usage.is_some() {
+                self.last_usage = response.usage;
+            }
             if cancelled {
                 // User aborted: record the partial text, drop partial tool calls,
                 // and end the turn.
@@ -284,6 +297,7 @@ mod tests {
         ModelResponse {
             message: Message::new(Role::Assistant, text),
             tool_calls: Vec::new(),
+            usage: None,
         }
     }
 
@@ -295,6 +309,7 @@ mod tests {
                 name: "echo".to_string(),
                 arguments: arguments.to_string(),
             }],
+            usage: None,
         }
     }
 
@@ -370,6 +385,7 @@ mod tests {
                 name: "missing".to_string(),
                 arguments: String::new(),
             }],
+            usage: None,
         };
         let model = ScriptedModel::new(vec![bad_call, assistant("recovered")]);
         let mut pump = Pump::new(model, echo_registry());
@@ -436,6 +452,7 @@ mod tests {
                 name: "edit".to_string(),
                 arguments: "lib.rs".to_string(),
             }],
+            usage: None,
         }
     }
 
@@ -521,6 +538,7 @@ mod tests {
                 name: name.to_string(),
                 arguments: arguments.to_string(),
             }],
+            usage: None,
         }
     }
 
