@@ -51,7 +51,7 @@ latter). Tested against the offline aden branch via `COXN_ADEN_BIN`.
 * [x] P2.1 `aden` seam: `std::process` shell-out -- `gate` (exit-code -> `GateVerdict` + message), `scope` (manifest JSON), `pull` (asm/understand). `COXN_ADEN_BIN` override. 3 fake-aden tests (verdict decode, closed-gate-on-spawn-fail, text/error).
 * [x] P2.2 Pull-context tools: `AsmTool`/`UnderstandTool` (aden_asm/aden_understand) registered in main's registry, rooted at the working dir; model pulls on demand. Tests for names + empty-arg rejection.
 * [x] P2.3 Gate enforcement: `Gate` trait + `AdenGate` (wraps the seam); pump gates mutating tools (`Tool::mutates`), blocks non-in-scope edits + feeds the verdict back to the model + records the block; main raises the confirm modal. 3 pump tests (block/allow/non-mutating). Live LLM-driven edit awaits Phase 3.
-* [ ] P2.4 Scope->context loader: `aden scope <task>` defines what loads; coxn loads exactly that (serde decision lands here -- may need to flag a dep).
+* [x] P2.4 Scope->context loader: `COXN_TASK_NAME`/`SEEDS`/`BUDGET` -> `aden scope` defines the mandate (manifest persisted -> gate) and `Pump::set_context` loads exactly the seeds' `aden asm` context. NO serde -- coxn loads from its own seed inputs + the manifest file, parses nothing.
 * [ ] P2.5 Savings: surface `aden status` savings (tokens/tool-calls saved) in the status line.
 * [ ] P2.6 Deferred tool discovery: one discovery seam; aden tool schemas register on demand (append, do not swap).
 

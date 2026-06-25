@@ -11,6 +11,7 @@ mod tools;
 mod tui;
 
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
@@ -52,23 +53,71 @@ async fn main() -> io::Result<()> {
     tools.register(Box::new(UnderstandTool::new(dir.clone())));
     let mut pump = Pump::new(StubModel, tools);
 
-    // If a scope manifest is configured, gate edits against it (aden directs).
-    let gated = std::env::var_os("COXN_SCOPE_MANIFEST").map(std::path::PathBuf::from);
-    if let Some(manifest) = &gated {
-        pump.set_gate(Box::new(aden::AdenGate::new(dir, manifest.clone())));
-    }
+    // A named task (COXN_TASK_NAME) makes aden define the scope: it sets the
+    // gate mandate and loads exactly the seeds' context. No task = bare prompt.
+    let status = load_task(&dir, &mut pump);
 
     let mut view = View::new();
-    view.set_status(if gated.is_some() {
-        "coxn  (stub backend, gated)  Ctrl-C to quit"
-    } else {
-        "coxn  (stub backend)  Ctrl-C to quit"
-    });
+    view.set_status(status);
 
     let mut tui = Tui::new()?;
     let result = drive(&mut tui, &mut view, &mut pump).await;
     drop(tui); // restore the terminal before surfacing any error
     result
+}
+
+/// If `COXN_TASK_NAME` is set, let aden define the scope: run `aden scope` for
+/// the task's seeds, persist the manifest for the gate, and load exactly the
+/// seeds' assembled context into the pump. Returns the status-line text. No
+/// task means the bare, ungated Phase 1 pump. coxn parses nothing — it gates on
+/// the manifest file and loads context from `aden asm` on its own seed inputs.
+fn load_task(dir: &Path, pump: &mut Pump<StubModel>) -> String {
+    let Some(name) = std::env::var("COXN_TASK_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return "coxn  (stub backend)  Ctrl-C to quit".to_string();
+    };
+    let seeds: Vec<String> = std::env::var("COXN_TASK_SEEDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let budget: u64 = std::env::var("COXN_TASK_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192);
+
+    // Define the mandate: aden scope -> manifest file -> gate.
+    let mut gated = false;
+    if !seeds.is_empty()
+        && let Ok(manifest_json) = aden::scope(dir, &name, &seeds, budget)
+    {
+        let manifest = std::env::temp_dir().join(format!("coxn-scope-{}.json", std::process::id()));
+        if std::fs::write(&manifest, manifest_json).is_ok() {
+            pump.set_gate(Box::new(aden::AdenGate::new(dir.to_path_buf(), manifest)));
+            gated = true;
+        }
+    }
+
+    // Load exactly the scope's context: the seeds' assembled neighborhoods.
+    let mut context = String::new();
+    for s in &seeds {
+        if let Ok(text) = aden::pull(dir, aden::Pull::Asm(s)) {
+            context.push_str(&text);
+            context.push('\n');
+        }
+    }
+    if !context.is_empty() {
+        pump.set_context(context);
+    }
+
+    format!(
+        "coxn  task '{name}' ({} seed(s){})  Ctrl-C to quit",
+        seeds.len(),
+        if gated { ", gated" } else { "" }
+    )
 }
 
 /// The event loop: draw, read a key, route it by mode (modal vs input), and run

@@ -64,6 +64,14 @@ impl<M: Model> Pump<M> {
         self.gate = Some(gate);
     }
 
+    /// Load the scope-defined context for a named task into the system prompt.
+    /// This is the one sanctioned departure from the zero-default-context floor:
+    /// no task means a bare prompt; a named task means aden's scope defines the
+    /// exact context, and coxn loads exactly that and nothing more.
+    pub fn set_context(&mut self, context: impl Into<String>) {
+        self.system = context.into();
+    }
+
     /// Take the most recent gate block (clears it), for the TUI to surface.
     pub fn take_block(&mut self) -> Option<GateOutcome> {
         self.last_block.take()
@@ -346,6 +354,30 @@ mod tests {
             .expect("a tool message was fed back");
         assert_eq!(tool_msg.content, "edited");
         assert!(pump.take_block().is_none());
+    }
+
+    /// Records the system prompt it was called with.
+    struct CapturingModel {
+        seen: Mutex<Option<String>>,
+    }
+    impl Model for CapturingModel {
+        async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+            *self.seen.lock().expect("lock") = Some(request.system.clone());
+            Ok(assistant("ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn set_context_replaces_the_bare_system_prompt() {
+        let model = CapturingModel {
+            seen: Mutex::new(None),
+        };
+        let mut pump = Pump::new(model, ToolRegistry::new());
+        pump.set_context("SCOPE CONTEXT");
+        pump.push_user("go");
+        pump.run_turn().await.expect("turn completes");
+        let seen = pump.model.seen.lock().expect("lock").clone();
+        assert_eq!(seen.as_deref(), Some("SCOPE CONTEXT"));
     }
 
     #[tokio::test]
