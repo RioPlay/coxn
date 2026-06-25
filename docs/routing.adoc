@@ -1,0 +1,135 @@
+= coxn routing and sub-agent contract
+:revdate: 2026-06-25
+:status: design note (pre-implementation)
+
+Pins the data shapes for runtime model selection, per-role model routing, and the
+aden task partition that sub-agents consume -- so the coxn side (routing seam,
+sub-agents) and the aden side (partition emission) are built against one contract
+and the seam is not built twice.
+
+== Laws (unchanged)
+
+* *Selection is data, not pump intelligence.* coxn never infers which model a task
+  needs from the prompt. aden directs (owns the partition and the role
+  assignment); a config table maps role -> model; coxn looks up and executes.
+* *aden is the bloat arbiter.* The partition, budgets, and file mandates come from
+  aden. coxn carries no planner.
+* *Minimal parsing.* coxn keeps reading aden output the cheap way (exit codes,
+  manifest files, line-oriented indexes), not by pulling a large JSON schema into
+  the pump. See the partition encoding below.
+
+== 1. Selection unit: {instance, model}
+
+An *instance* is a configured provider connection (coxn already has this shape as
+`Endpoint`):
+
+  Instance { base_url, key (env-only), source }   // source = env | config | auto
+
+A *selection* is an instance plus a model id:
+
+  ModelSel { instance, model }
+
+Notes:
+
+* Multiple instances may share a driver/wire format (e.g. two chat-completions
+  endpoints: one local model server, one hosted). The instance, not the kind, is
+  the unit.
+* The key never lives in committed config; it comes from the environment
+  (`COXN_MODEL_KEY`, or per-instance env later).
+* This generalizes today's single active `ModelSel` to a set of named instances
+  the router can pick from.
+
+== 2. Role -> model routing table
+
+Declarative, in `.aden/config.toml`, read by coxn (the existing `aden config`
+seam):
+
+  [route]
+  scout       = "local:qwen2.5-coder"      # "<instance>:<model>"
+  synth       = "main:<a capable model>"
+  orchestrate = "main:<the strongest model>"
+
+* Roles are an *open vocabulary* of opaque string keys; coxn does not interpret
+  them, it only looks them up. aden (or the user) assigns a role to each unit of
+  work; coxn maps role -> `ModelSel`.
+* `resolve_role(role)` returns the mapped selection, or the active default when a
+  role is unmapped (so a partial table still works).
+* Recommended default policy (guidance, not enforced): cheap/local for *scout*
+  (gather/grep -- aden equalizes tiers on retrieval, so spending a top model here
+  is waste), mid for *synth* (verify/write), strongest for *orchestrate*
+  (scope/merge). Mixing a free local instance for scouting with a hosted instance
+  for synthesis is the main cost lever.
+
+== 3. aden task partition (the prerequisite)
+
+Today `aden scope <task>` emits one manifest. Sub-agents need aden to split a task
+into sub-scopes, each tagged with a role and ordering. Proposed command:
+
+  aden scope --agents <task> --seed ...     (or: aden plan <task>)
+
+=== Encoding (keeps coxn serde-light)
+
+To honor minimal parsing, aden emits the partition as:
+
+. One *manifest file per sub-scope* -- each is exactly today's `ScopeManifest`
+  (`{name, seeds, anchors, files, context{anchors,budget}, risk}`), which the gate
+  already consumes unchanged.
+. One *partition index* coxn reads line by line (no JSON parse), one record per
+  sub-scope:
+
+  <id>\t<role>\t<manifest-path>\t<comma-separated depends_on ids>
+
+Example index:
+
+  scout-auth      scout        .aden/agents/scout-auth.json
+  edit-handler    synth        .aden/agents/edit-handler.json    scout-auth
+  merge           orchestrate  .aden/agents/merge.json           edit-handler
+
+coxn reads the index (id, role, manifest path, deps), maps role -> model via the
+route table, and gates each sub-agent against its own manifest file -- the same
+gate contract as the single-agent path.
+
+=== Constraints aden must guarantee
+
+* *Disjoint file mandates* across sub-scopes that run in parallel. The gate judges
+  the whole working-tree diff, so two agents editing overlapping files would each
+  see the other's changes as scope-escape. Independent agents => disjoint files.
+* *Store-write safety* under concurrency: covered by the existing dependency-free
+  advisory lockfile (G4). coxn relies on it; aden must keep taking it.
+
+== 4. coxn consumption: pump-instance-per-scope
+
+For each sub-scope (in `depends_on` order; independent ones may run in parallel):
+
+. `model = resolve_role(subscope.role)` from the route table.
+. Build a `Pump` instance with: that model, the sub-scope's `aden asm` context, the
+  gate bound to the sub-scope manifest, the tool subset, and a budget.
+. Run to a *dense result* (the answer/edit summary), not a transcript.
+. Merge: coxn concatenates dense results and feeds them forward per `depends_on`
+  (a downstream agent's context includes upstream dense results). No reasoning in
+  the merge -- it is concatenation + ordering.
+
+Token discipline (from DESIGN Phase 5): disjoint scopes, pull + dense-merge,
+cheap/local fan-out, one-model-per-subtask for cache reuse, per-agent budgets, and
+adaptive stopping. Parallelism buys wall-clock, not tokens.
+
+== 5. Open decisions (resolve before B3/B4)
+
+* *Merge ownership:* coxn concatenates dense results (recommended, keeps coxn
+  dumb) vs aden gains a merge step. Recommend coxn-side concatenation.
+* *Role vocabulary:* open strings, config-defined (recommended) vs a fixed enum.
+  Open strings keep aden and coxn decoupled.
+* *Parallel execution model:* coxn is single-threaded today. Parallel sub-agents
+  need either sequential execution first (simplest; correct, slower) or a worker
+  model. Recommend *sequential first* (respect `depends_on`, ignore parallelism)
+  and add concurrency only once the sequential path is proven.
+* *Per-instance keys:* one `COXN_MODEL_KEY` today vs per-instance env keys (needed
+  once multiple hosted instances are routed). Add per-instance env keys with the
+  multi-instance work.
+
+== Build order against this contract
+
+. B2 -- coxn routing seam: `{instance, model}` + `[route]` table + `resolve_role`,
+  usable single-agent immediately.
+. B3 -- aden `--agents` partition emission (manifests + index) per section 3.
+. B4 -- coxn sub-agents: read the index, pump-per-scope, dense-merge, sequential.
