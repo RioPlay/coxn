@@ -125,6 +125,32 @@ pub enum ModelError {
     Backend(String),
 }
 
+impl ModelError {
+    /// Whether the error looks transient and worth retrying (rate limit, server
+    /// unavailable, a dropped or timed-out connection). A bad request (400, a bad
+    /// model name, a model that will not load) is NOT transient -- retrying it
+    /// just fails the same way. Heuristic over the provider-neutral message.
+    pub fn is_transient(&self) -> bool {
+        let ModelError::Backend(msg) = self;
+        let m = msg.to_lowercase();
+        const TRANSIENT: [&str; 7] = [
+            "429",
+            "503",
+            "502",
+            "connection reset",
+            "connection refused",
+            "timed out",
+            "timeout",
+        ];
+        // "failed to load" (a model that will not load) is a 400-class error here,
+        // not a transient one; do not retry it.
+        if m.contains("failed to load") || m.contains("400") {
+            return false;
+        }
+        TRANSIENT.iter().any(|s| m.contains(s))
+    }
+}
+
 impl fmt::Display for ModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -277,6 +303,21 @@ mod tests {
             .await
             .expect("stub never errors");
         assert_eq!(resp.message.content, "stub: second");
+    }
+
+    #[test]
+    fn transient_errors_are_classified_for_retry() {
+        let t = |s: &str| ModelError::Backend(s.to_string()).is_transient();
+        assert!(t(
+            "http://x/chat/completions returned 503 Service Unavailable"
+        ));
+        assert!(t("returned 429 Too Many Requests"));
+        assert!(t("request to x failed: connection reset by peer"));
+        assert!(t("reading response failed: timed out"));
+        // Not transient: bad requests and unloadable models.
+        assert!(!t("returned 400 Bad Request: invalid model"));
+        assert!(!t(r#"returned 400: { "error": "Failed to load model" }"#));
+        assert!(!t("model returned an empty message"));
     }
 
     #[tokio::test]
