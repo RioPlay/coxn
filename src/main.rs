@@ -405,6 +405,15 @@ fn parse_command(input: &str) -> Command {
     }
 }
 
+/// The output pane's (width, height), for wrapping and PageUp/PageDown scroll
+/// amounts. Height excludes the status and input rows. Falls back to (80, 1) if
+/// the terminal size cannot be determined.
+fn pane_dims(tui: &Tui) -> (u16, u16) {
+    tui.size()
+        .map(|s| (s.width.max(1), s.height.saturating_sub(2).max(1)))
+        .unwrap_or((80, 1))
+}
+
 /// The event loop: draw, read a key, route it by mode (modal vs input), and run
 /// a turn on submit. Carries no intelligence; it only paces and shuttles.
 async fn drive(
@@ -440,11 +449,28 @@ async fn drive(
             Some(Action::Quit) => return Ok(()),
             Some(Action::Append(c)) => view.input_push(c),
             Some(Action::Backspace) => view.input_backspace(),
+            Some(Action::CursorLeft) => view.cursor_left(),
+            Some(Action::CursorRight) => view.cursor_right(),
+            Some(Action::CursorHome) => view.cursor_home(),
+            Some(Action::CursorEnd) => view.cursor_end(),
+            Some(Action::WordDelete) => view.word_delete(),
+            Some(Action::HistoryPrev) => view.history_prev(),
+            Some(Action::HistoryNext) => view.history_next(),
+            Some(Action::ScrollUp) => {
+                let (w, h) = pane_dims(tui);
+                view.scroll_up(h, view.max_scroll(w, h));
+            }
+            Some(Action::ScrollDown) => {
+                let (_, h) = pane_dims(tui);
+                view.scroll_down(h);
+            }
             Some(Action::Submit) => {
                 let text = view.take_input();
                 if text.trim().is_empty() {
                     continue;
                 }
+                // Snap the output pane to the bottom on every submit.
+                view.snap_to_bottom();
                 // A leading slash is a local command, not a model turn.
                 if text.trim_start().starts_with('/') {
                     match parse_command(text.trim()) {
@@ -483,6 +509,8 @@ async fn drive(
                     }
                     continue;
                 }
+                // Record in history before submitting.
+                view.push_history(text.clone());
                 pump.push_user(text);
                 // Stream the reply: render the transcript so far plus the
                 // assistant text as it arrives, repainting per fragment. The
@@ -490,6 +518,7 @@ async fn drive(
                 // fragments cancels the turn (kept partial) rather than quitting.
                 let prior = transcript(pump.messages());
                 let mut cancelled = false;
+                view.pending = true;
                 let result = {
                     let mut buf = String::new();
                     let mut sink = |delta: &str| -> bool {
@@ -509,6 +538,7 @@ async fn drive(
                     };
                     pump.run_turn_streaming(&mut sink).await
                 };
+                view.pending = false;
                 match result {
                     Ok(_) => {
                         view.output = transcript(pump.messages());

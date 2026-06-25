@@ -11,3 +11,6 @@
 
 # Local env, not committed
 /.env
+
+# Agent worktrees and session scratch
+/.claude/
