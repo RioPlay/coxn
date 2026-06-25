@@ -33,14 +33,27 @@ next and starts at the blockers below.
 * [x] P1.6 `pump`: `Pump<M>` manual loop -- `run_turn` calls model, dispatches tools, feeds results back, repeats to a no-tool reply; tool-hop cap paces it; bare system prompt. Gate hook marked Phase 2. 4 tests.
 * [x] P1.7 Wired end to end: `main` drives `Pump<StubModel>` through the TUI (mode-aware input/modal keys, one-line input prompt). Verified under a PTY: type -> stub echo transcript -> Ctrl-C quits clean; no-TTY exits gracefully. `map_key`/`poll_action` superseded by `map_input_key`; tokio current_thread flavor.
 
-== Phase 2 blockers (aden-side, OUT OF SCOPE in this repo)
+== Phase 2 blockers (aden-side) -- DONE on aden branch feat/coxn-directional-prereqs
 
-Tracked here so they are not lost; implement in the aden repo, not coxn.
+Implemented in the aden repo (not coxn), all tests green, atomic commits.
 
-* [ ] G4 multi-writer safety: advisory flock on store dir + race-free session-log append
-* [ ] Gate enforcement: promote `impact-diff --scope` to a hard exit-code gate (non-zero on violation)
-* [ ] `aden scope` (G1): read-only command emitting partition/order/per-agent token-budgeted manifest JSON
-* [ ] ADR-005 config: `.aden/config.toml` backing store, readable via `aden config get/set`
+* [x] G4 multi-writer safety: dependency-free advisory lockfile (`aden-core::lock`); store write-phase lock in `gen`; serialized + race-free session-log append
+* [x] Gate enforcement: `impact-diff --scope <manifest>` hard exit-code gate (0 in-scope / 1 scope-escape / 2 blast-leak / 3 gate-error); verified e2e against coxn's `gate.rs` codes
+* [x] `aden scope`: read-only command emitting the token-budgeted manifest coxn's `ScopeManifest` consumes (seeds -> anchors -> repo-relative file mandate, risk)
+* [x] config: `aden config get/set` backed by `.aden/config.toml` (dotted keys, typed values)
+
+== Phase 2 (coxn-side): aden wiring
+
+coxn drives aden as a subprocess via `std::process` (no new deps; DESIGN
+allowed linking aden-core OR shelling out, and the 3-dep rule forces the
+latter). Tested against the offline aden branch via `COXN_ADEN_BIN`.
+
+* [x] P2.1 `aden` seam: `std::process` shell-out -- `gate` (exit-code -> `GateVerdict` + message), `scope` (manifest JSON), `pull` (asm/understand). `COXN_ADEN_BIN` override. 3 fake-aden tests (verdict decode, closed-gate-on-spawn-fail, text/error).
+* [ ] P2.2 Pull-context tools: register aden-backed `asm`/`understand` tools in the registry so the model can pull blast-radius/neighborhoods on demand.
+* [ ] P2.3 Gate enforcement: run `impact-diff --scope` before accepting an edit; block + raise the confirm modal on a non-in-scope verdict.
+* [ ] P2.4 Scope->context loader: `aden scope <task>` defines what loads; coxn loads exactly that (serde decision lands here -- may need to flag a dep).
+* [ ] P2.5 Savings: surface `aden status` savings (tokens/tool-calls saved) in the status line.
+* [ ] P2.6 Deferred tool discovery: one discovery seam; aden tool schemas register on demand (append, do not swap).
 
 == Notes / decisions
 

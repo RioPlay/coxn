@@ -3,6 +3,7 @@
 //! coxn is a "dumb pump": it steers and sets pace, and carries no intelligence.
 //! aden directs and gates; the LLM acts; coxn steers. See DESIGN.adoc.
 
+mod aden;
 mod gate;
 mod model;
 mod pump;
