@@ -22,7 +22,7 @@ prerequisites are out of scope here and tracked under Phase 2 blockers.
 
 * [x] P1.1 `model`: `call_model()` seam over `Model` trait; `ModelRequest`/`ModelResponse`/`Message`/`Role`/`ToolCall`/`ModelError` + `StubModel`. 2 async tests green, no provider named.
 * [x] P1.2 `model`: `DEFAULT_SYSTEM_PROMPT` empty (zero-default-context floor), guard test asserts it adds nothing by default.
-* [ ] P1.3 `tools`: thin tool-dispatch registry (`ToolCall` -> result), one trivial built-in tool, unit-tested
+* [x] P1.3 `tools`: `ToolRegistry` (register/names/dispatch) over a `Tool` trait, `EchoTool` built-in, unknown-tool is an error. 3 tests green.
 * [ ] P1.4 `tui`: ratatui shell -- streaming output pane + status line, render loop, crossterm event wiring
 * [ ] P1.5 `tui`: confirm modal (block/proceed) surfaced from the pump
 * [ ] P1.6 `pump`: manual agent loop -- call model, dispatch tools, feed results, repeat; paces turns, carries no intelligence
