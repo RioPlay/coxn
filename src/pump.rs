@@ -105,6 +105,8 @@ pub struct Pump<M: Model> {
     last_block: Option<GateOutcome>,
     /// Token usage from the last turn that reported it, for the context meter.
     last_usage: Option<Usage>,
+    /// The file the last accepted edit touched, for `/edit` to open.
+    last_edited: Option<std::path::PathBuf>,
 }
 
 impl<M: Model> Pump<M> {
@@ -119,6 +121,7 @@ impl<M: Model> Pump<M> {
             gate: None,
             last_block: None,
             last_usage: None,
+            last_edited: None,
         }
     }
 
@@ -126,6 +129,12 @@ impl<M: Model> Pump<M> {
     /// meter). `None` until a backend reports usage.
     pub fn last_usage(&self) -> Option<Usage> {
         self.last_usage
+    }
+
+    /// The file the last accepted edit touched, for `/edit` to open. `None`
+    /// until an edit lands.
+    pub fn last_edited(&self) -> Option<std::path::PathBuf> {
+        self.last_edited.clone()
     }
 
     /// Install the blast-radius gate; a mutating tool's edit is then judged
@@ -289,10 +298,12 @@ impl<M: Model> Pump<M> {
         // With no task scope, the user's approval is the only gate and the edit
         // stands. With a scope, aden also judges the resulting working-tree diff.
         let Some(gate) = self.gate.as_ref() else {
+            self.last_edited = path;
             return applied;
         };
         let outcome = gate.check();
         if outcome.proceed() {
+            self.last_edited = path;
             return applied;
         }
         // Out of scope: revert the file and feed the verdict back to the model.
