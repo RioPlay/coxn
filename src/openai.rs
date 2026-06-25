@@ -24,6 +24,32 @@ use crate::model::{Message, Model, ModelError, ModelRequest, ModelResponse, Role
 /// Well-known local providers, probed in order for zero-config startup.
 const LOCAL_CANDIDATES: [&str; 2] = ["http://localhost:11434/v1", "http://localhost:1234/v1"];
 
+/// How long to wait to establish a connection before giving up (an unreachable
+/// or down server fails here instead of hanging the TUI).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for the server to start responding (time to first byte).
+/// Generous, because a cold local model may need to load before the first token;
+/// it bounds a server that accepts the connection but then stalls.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Total receive budget for a non-streaming reply. Not applied to streaming,
+/// where a long reply legitimately takes a while and only a stall should fail.
+const BODY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// An HTTP agent for a model call: never treat a non-2xx as a transport error
+/// (so the server's own message reaches the status line), and bound connect and
+/// time-to-first-byte so a dead or stalled server cannot hang the loop. A total
+/// body timeout is applied only to non-streaming calls.
+fn model_agent(streaming: bool) -> ureq::Agent {
+    let mut config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT));
+    if !streaming {
+        config = config.timeout_recv_body(Some(BODY_TIMEOUT));
+    }
+    config.build().into()
+}
+
 /// Probe the well-known local providers (Ollama, LM Studio) and return the
 /// `(base_url, model)` of the first that responds with at least one model.
 /// `None` when nothing is running. This is the local-first, zero-config path.
@@ -400,13 +426,7 @@ impl Model for OpenAiCompatModel {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = to_wire(&self.model, &request, false);
 
-        // Don't treat a non-2xx as a transport error: read the body so the
-        // server's own message (bad model name, invalid request, ...) reaches
-        // the status line instead of an opaque failure.
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .into();
+        let agent = model_agent(false);
         let mut builder = agent.post(&url);
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", &format!("Bearer {key}"));
@@ -448,10 +468,7 @@ impl Model for OpenAiCompatModel {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = to_wire(&self.model, &request, true);
 
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .into();
+        let agent = model_agent(true);
         let mut builder = agent.post(&url);
         if let Some(key) = &self.api_key {
             builder = builder.header("Authorization", &format!("Bearer {key}"));
