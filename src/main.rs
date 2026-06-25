@@ -4,6 +4,7 @@
 //! aden directs and gates; the LLM acts; coxn steers. See DESIGN.adoc.
 
 mod aden;
+mod agents;
 mod gate;
 mod model;
 mod openai;
@@ -331,6 +332,57 @@ fn resolve_role(dir: &Path, role: &str) -> Option<String> {
     aden::config_get(dir, &format!("route.{role}"))
 }
 
+/// Read the task config from the environment: `(name, seeds, budget)`. `None`
+/// when no task is set. Shared by the boot path and `/agents`.
+fn task_config() -> Option<(String, Vec<String>, u64)> {
+    let name = std::env::var("COXN_TASK_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let seeds = std::env::var("COXN_TASK_SEEDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let budget = std::env::var("COXN_TASK_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192);
+    Some((name, seeds, budget))
+}
+
+/// Render `/agents`: run aden's partition for the current task and show each
+/// sub-scope, the model its role routes to, and its dependencies. Inspection
+/// only -- the autonomous runner (one pump per sub-scope) is a later step.
+fn agents_listing(dir: &Path) -> String {
+    let Some((name, seeds, budget)) = task_config() else {
+        return "set COXN_TASK_NAME + COXN_TASK_SEEDS to partition a task".to_string();
+    };
+    if seeds.is_empty() {
+        return "the task has no seeds to partition".to_string();
+    }
+    let index = match aden::scope_agents(dir, &name, &seeds, budget) {
+        Ok(index) => index,
+        Err(e) => return format!("aden scope --agents failed: {e}"),
+    };
+    let scopes = agents::parse_index(&index);
+    if scopes.is_empty() {
+        return "aden returned no sub-scopes".to_string();
+    }
+    let mut out = format!("partition of '{name}' (dependency order):\n");
+    for s in agents::dependency_order(&scopes) {
+        let model = resolve_role(dir, &s.role).unwrap_or_else(|| "(default model)".to_string());
+        let after = if s.depends_on.is_empty() {
+            String::new()
+        } else {
+            format!("  after {}", s.depends_on.join(", "))
+        };
+        out.push_str(&format!("  {} [{}] -> {model}{after}\n", s.id, s.role));
+    }
+    out.push_str("(plan only; the sub-agent runner is not yet wired)");
+    out
+}
+
 /// The minimal operating instruction prepended to the scope context in task
 /// mode. coxn's default prompt is empty (zero-default-context), which leaves a
 /// weak local model passive -- it will not reach for the action tools unprompted
@@ -428,6 +480,7 @@ const HELP: &str = "commands:\n  \
 /model @<role>   switch to the model mapped for a role (route.<role> config)\n  \
 /tools           list the aden tools the model can discover\n  \
 /think <level>   reasoning effort: off | low | med | high\n  \
+/agents          show the task partition (sub-scopes + routed models)\n  \
 /session         list saved sessions\n  \
 /resume <slug>   load a saved session\n  \
 /edit [path]     open the last-edited file (or path) in $EDITOR\n  \
@@ -458,6 +511,8 @@ enum Command {
     OpenEditor(Option<String>),
     /// `/think [off|low|med|high]` sets the reasoning-effort level.
     Think(Option<String>),
+    /// `/agents` shows the task partition (sub-scopes + routed models).
+    Agents,
     Unknown(String),
 }
 
@@ -476,6 +531,7 @@ fn parse_command(input: &str) -> Command {
         "resume" => Command::Resume(arg),
         "edit" => Command::OpenEditor(arg),
         "think" => Command::Think(arg),
+        "agents" => Command::Agents,
         other => Command::Unknown(other.to_string()),
     }
 }
@@ -697,6 +753,7 @@ async fn drive(
                             }
                         }
                         Command::Tools => view.output = pump.tool_catalog(),
+                        Command::Agents => view.output = agents_listing(dir),
                         Command::Think(arg) => {
                             view.output = match arg.as_deref().map(ThinkingLevel::parse) {
                                 Some(Some(level)) => {
