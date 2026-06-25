@@ -13,7 +13,7 @@ prerequisites are out of scope here and tracked under Phase 2 blockers.
 == Phase 0: skeleton and contract
 
 * [ ] P0.1 Init git repo, `.gitignore`, feature branch `feat/tui-pump`
-* [ ] P0.2 Cargo skeleton: `Cargo.toml` (ratatui, crossterm, tokio), `src/main.rs`, compiles
+* [x] P0.2 Cargo skeleton: `Cargo.toml` (ratatui, crossterm, tokio), `src/main.rs`, compiles. fmt/clippy clean.
 * [ ] P0.3 Module stubs: `pump`, `model`, `tools`, `gate`, `tui` (empty, documented, wired into `main`)
 * [ ] P0.4 Contract spec `docs/contract.adoc` (AsciiDoc, aden-ingestible, `==` section anchors): scope-manifest shape (name, seeds, anchors, files, context, risk) + `impact-diff --scope` exit-code protocol (in-scope / scope-escape / blast-leak)
 * [ ] P0.5 Contract types in `gate`: `ScopeManifest`, `GateVerdict` deserialized from the spec, unit-tested against fixtures
