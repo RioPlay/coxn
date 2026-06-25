@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
-use model::{AnyModel, Message, Role, StubModel, ToolCall, Usage};
+use model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
 use pump::{Approval, Pump, TurnIo};
 use tools::{AdenTool, EditTool, ReadFileTool, ToolRegistry, WriteTool};
 use tui::{Action, Tui, View, map_input_key, map_modal_key};
@@ -427,6 +427,7 @@ const HELP: &str = "commands:\n  \
 /model <name|#>  switch the active model\n  \
 /model @<role>   switch to the model mapped for a role (route.<role> config)\n  \
 /tools           list the aden tools the model can discover\n  \
+/think <level>   reasoning effort: off | low | med | high\n  \
 /session         list saved sessions\n  \
 /resume <slug>   load a saved session\n  \
 /edit [path]     open the last-edited file (or path) in $EDITOR\n  \
@@ -455,6 +456,8 @@ enum Command {
     Resume(Option<String>),
     /// `/edit [path]` opens the last-edited file (or `path`) in `$EDITOR`.
     OpenEditor(Option<String>),
+    /// `/think [off|low|med|high]` sets the reasoning-effort level.
+    Think(Option<String>),
     Unknown(String),
 }
 
@@ -472,6 +475,7 @@ fn parse_command(input: &str) -> Command {
         "session" | "sessions" => Command::Session,
         "resume" => Command::Resume(arg),
         "edit" => Command::OpenEditor(arg),
+        "think" => Command::Think(arg),
         other => Command::Unknown(other.to_string()),
     }
 }
@@ -685,6 +689,15 @@ async fn drive(
                             }
                         }
                         Command::Tools => view.output = pump.tool_catalog(),
+                        Command::Think(arg) => {
+                            view.output = match arg.as_deref().map(ThinkingLevel::parse) {
+                                Some(Some(level)) => {
+                                    pump.set_thinking(level);
+                                    format!("reasoning effort: {}", level.label())
+                                }
+                                _ => "usage: /think [off|low|med|high]".to_string(),
+                            };
+                        }
                         Command::OpenEditor(arg) => {
                             let full = match arg {
                                 Some(a) => Some(dir.join(a)),
