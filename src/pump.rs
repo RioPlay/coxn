@@ -14,7 +14,8 @@ use std::path::Path;
 
 use crate::gate::{Gate, GateOutcome};
 use crate::model::{
-    DEFAULT_SYSTEM_PROMPT, Message, Model, ModelError, ModelRequest, Role, ToolCall, Usage,
+    DEFAULT_SYSTEM_PROMPT, Message, Model, ModelError, ModelRequest, Role, ThinkingLevel, ToolCall,
+    Usage,
 };
 use crate::tools::ToolRegistry;
 
@@ -107,6 +108,9 @@ pub struct Pump<M: Model> {
     last_usage: Option<Usage>,
     /// The file the last accepted edit touched, for `/edit` to open.
     last_edited: Option<std::path::PathBuf>,
+    /// Reasoning-effort level sent with each request (None = unset / provider
+    /// default), set via `/think`.
+    thinking: Option<ThinkingLevel>,
 }
 
 impl<M: Model> Pump<M> {
@@ -122,7 +126,13 @@ impl<M: Model> Pump<M> {
             last_block: None,
             last_usage: None,
             last_edited: None,
+            thinking: None,
         }
+    }
+
+    /// Set the reasoning-effort level sent with each request (`/think`).
+    pub fn set_thinking(&mut self, level: ThinkingLevel) {
+        self.thinking = Some(level);
     }
 
     /// Token usage from the most recent turn that reported it (the context
@@ -195,6 +205,7 @@ impl<M: Model> Pump<M> {
             system: self.system.clone(),
             messages: self.messages.clone(),
             tools: self.tools.advertised_defs(),
+            thinking: self.thinking,
         }
     }
 

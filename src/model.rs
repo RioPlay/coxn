@@ -105,14 +105,58 @@ pub struct ToolDef {
     pub parameters: serde_json::Value,
 }
 
-/// A request to a model: the bare system prompt, the conversation so far, and
-/// the tool definitions exposed this turn (the advertised set; deferred
-/// discovery decides which are advertised).
+/// A reasoning-effort level, sent to providers that support it (mapped to the
+/// `reasoning_effort` field). `Off` omits the field, so providers that ignore
+/// it are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingLevel {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl ThinkingLevel {
+    /// Parse a `/think` argument, accepting common spellings.
+    pub fn parse(s: &str) -> Option<ThinkingLevel> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "none" => Some(ThinkingLevel::Off),
+            "low" => Some(ThinkingLevel::Low),
+            "med" | "medium" => Some(ThinkingLevel::Medium),
+            "high" => Some(ThinkingLevel::High),
+            _ => None,
+        }
+    }
+
+    /// The wire `reasoning_effort` value, or `None` for `Off` (omit the field).
+    pub fn effort(self) -> Option<&'static str> {
+        match self {
+            ThinkingLevel::Off => None,
+            ThinkingLevel::Low => Some("low"),
+            ThinkingLevel::Medium => Some("medium"),
+            ThinkingLevel::High => Some("high"),
+        }
+    }
+
+    /// A short label for the status line / confirmations.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThinkingLevel::Off => "off",
+            ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+        }
+    }
+}
+
+/// A request to a model: the bare system prompt, the conversation so far, the
+/// tool definitions exposed this turn, and the reasoning-effort level (when set).
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
+    pub thinking: Option<ThinkingLevel>,
 }
 
 /// Token usage a backend reports for a turn (provider-neutral). Drives the
@@ -280,6 +324,7 @@ mod tests {
             system: String::new(),
             messages: vec![Message::new(Role::User, user)],
             tools: Vec::new(),
+            thinking: None,
         }
     }
 
@@ -314,11 +359,23 @@ mod tests {
                 Message::new(Role::User, "second"),
             ],
             tools: Vec::new(),
+            thinking: None,
         };
         let resp = call_model(&StubModel, req)
             .await
             .expect("stub never errors");
         assert_eq!(resp.message.content, "stub: second");
+    }
+
+    #[test]
+    fn thinking_level_parses_and_maps_to_effort() {
+        assert_eq!(ThinkingLevel::parse("HIGH"), Some(ThinkingLevel::High));
+        assert_eq!(ThinkingLevel::parse("med"), Some(ThinkingLevel::Medium));
+        assert_eq!(ThinkingLevel::parse("off"), Some(ThinkingLevel::Off));
+        assert_eq!(ThinkingLevel::parse("nonsense"), None);
+        // Off omits the wire field; the rest map to a level string.
+        assert_eq!(ThinkingLevel::Off.effort(), None);
+        assert_eq!(ThinkingLevel::High.effort(), Some("high"));
     }
 
     #[test]

@@ -193,6 +193,9 @@ struct ChatRequest<'a> {
     /// Ask for a final usage chunk when streaming; omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    /// Reasoning effort for models that support it; omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -347,6 +350,7 @@ fn to_wire<'a>(model: &'a str, request: &ModelRequest, stream: bool) -> ChatRequ
         stream_options: stream.then_some(StreamOptions {
             include_usage: true,
         }),
+        reasoning_effort: request.thinking.and_then(|t| t.effort()),
     }
 }
 
@@ -626,6 +630,7 @@ mod tests {
                 .map(|(role, text)| Message::new(*role, *text))
                 .collect(),
             tools: Vec::new(),
+            thinking: None,
         }
     }
 
