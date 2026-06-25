@@ -1,0 +1,42 @@
+= coxn PLAN
+:revdate: 2026-06-24
+:status: active task ledger
+
+Derived from DESIGN.adoc. Source of truth is DESIGN.adoc; this is the task ledger.
+
+Laws (non-negotiable): provider-agnostic, zero-default-context, aden is the bloat
+arbiter, the pump stays minimal. Stop and flag before deviating.
+
+Scope of this ledger: the coxn TUI pump only (Phase 0 + Phase 1). aden-side
+prerequisites are out of scope here and tracked under Phase 2 blockers.
+
+== Phase 0: skeleton and contract
+
+* [ ] P0.1 Init git repo, `.gitignore`, feature branch `feat/tui-pump`
+* [ ] P0.2 Cargo skeleton: `Cargo.toml` (ratatui, crossterm, tokio), `src/main.rs`, compiles
+* [ ] P0.3 Module stubs: `pump`, `model`, `tools`, `gate`, `tui` (empty, documented, wired into `main`)
+* [ ] P0.4 Contract spec `docs/contract.adoc` (AsciiDoc, aden-ingestible, `==` section anchors): scope-manifest shape (name, seeds, anchors, files, context, risk) + `impact-diff --scope` exit-code protocol (in-scope / scope-escape / blast-leak)
+* [ ] P0.5 Contract types in `gate`: `ScopeManifest`, `GateVerdict` deserialized from the spec, unit-tested against fixtures
+
+== Phase 1: the dumb pump MVP
+
+* [ ] P1.1 `model`: provider-neutral `call_model()` seam -- types (`ModelRequest`, `ModelResponse`, `Message`, `ToolCall`) + trait, one stub backend, no provider lock-in
+* [ ] P1.2 `model`: bare/near-empty system prompt (the zero-default-context floor), asserted minimal in a test
+* [ ] P1.3 `tools`: thin tool-dispatch registry (`ToolCall` -> result), one trivial built-in tool, unit-tested
+* [ ] P1.4 `tui`: ratatui shell -- streaming output pane + status line, render loop, crossterm event wiring
+* [ ] P1.5 `tui`: confirm modal (block/proceed) surfaced from the pump
+* [ ] P1.6 `pump`: manual agent loop -- call model, dispatch tools, feed results, repeat; paces turns, carries no intelligence
+* [ ] P1.7 Wire pump + tui + model + tools end to end; `coxn` runs the loop against the stub backend (MVP exit criterion)
+
+== Phase 2 blockers (aden-side, OUT OF SCOPE in this repo)
+
+Tracked here so they are not lost; implement in the aden repo, not coxn.
+
+* [ ] G4 multi-writer safety: advisory flock on store dir + race-free session-log append
+* [ ] Gate enforcement: promote `impact-diff --scope` to a hard exit-code gate (non-zero on violation)
+* [ ] `aden scope` (G1): read-only command emitting partition/order/per-agent token-budgeted manifest JSON
+* [ ] ADR-005 config: `.aden/config.toml` backing store, readable via `aden config get/set`
+
+== Notes / decisions
+
+(append one-line notes as tasks complete)

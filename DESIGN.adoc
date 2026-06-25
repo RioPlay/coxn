@@ -1,0 +1,170 @@
+= coxn: a lean directional harness for aden
+:author: Ernest Hamblen
+:revdate: 2026-06-24
+:toc: left
+:toclevels: 3
+:icons: font
+:status: DESIGN (pre-implementation); derived from design conversation 2026-06-24
+:sectnums:
+
+[.lead]
+coxn is a deliberately minimal, provider-agnostic terminal harness that drives an LLM, which in turn drives `aden`. It is a "dumb pump": it steers and sets pace, and carries no intelligence of its own. All durable judgement lives in aden (the offline graph director) and in the model (the actor). coxn is the thin seam that connects them.
+
+The name is the naval shorthand for *coxswain* (`cox'n`): the person who steers the boat and calls the stroke cadence, and never pulls an oar. That role is the architecture in one word.
+
+== What coxn is (and is not)
+
+coxn IS:
+
+* A small Rust + `ratatui` terminal driver (single binary, terminal-native: SSH, CI, containers, remote dev).
+* A loop that calls a model, dispatches tools, enforces aden's gate, and records savings.
+* Provider-agnostic by construction: one `call_model()` seam, no provider lock-in.
+* Zero-default-context: the model runs on its own bare system prompt, and nothing about aden enters the context window until it is explicitly pulled in or defined by an aden scope manifest.
+
+coxn IS NOT:
+
+* An agent runtime that reasons about code. That is aden's job, and aden never calls a model or touches the network.
+* A graph viewer. aden already ships that as `aden view` (browser-native force-graph). coxn does not re-render the graph.
+* A from-scratch multi-provider platform. The provider abstraction is the commodity, high-maintenance part; coxn keeps it to a single seam and reuses existing loops where it can.
+* A TUI that competes feature-for-feature with Claude Code / opencode / Codex. It competes on one axis only: the aden-directed context step.
+
+== First principles (non-negotiable)
+
+. *aden directs and gates; the LLM acts; coxn steers.* This line is inherited from aden's own design law (`research/topics/aden-roadmap/aden-as-directional-harness.adoc`). aden is deterministic, offline, side-effect-free: it emits manifests, orderings, and gate verdicts. coxn must never push intelligence down into the pump or up into aden.
+. *Provider-agnostic.* aden is not Claude-centric and neither is coxn. The model is swappable behind `call_model()`. Anthropic-specific features (prompt caching, task budgets, effort) are one provider profile, not the design center.
+. *Minimalism is the product.* The pump should add no more to the model's context than the model's own default system prompt, unless something is specifically defined. A bare loop is ~150 to 600 lines; the engineering value is in keeping it that small, not in growing it.
+. *aden is the bloat arbiter.* "Unless specifically defined" resolves to "unless aden's scope manifest defines it." No task means a bare prompt; a named task means `aden scope <task>` deterministically defines the exact token-budgeted context and tools to load. coxn never guesses what is worth its tokens.
+. *The differentiator is the context step, not the loop.* The loop, tool dispatch, permissions, session, provider glue, and TUI chrome are all commodity. Context assembly (aden graph + blast-radius gate replacing naive file-read / RAG) is the only part worth owning, and aden already owns it.
+
+== Architecture
+
+=== Three layers
+
+----
+coxn (pump / TUI)        steers + sets pace, zero intelligence
+   |
+   v  drives
+the LLM                  acts: reads, writes, reasons
+   |
+   v  consults (offline, deterministic)
+aden                     directs + gates: graph, scope, blast-radius, savings
+----
+
+coxn is Rust, same language as aden, so it can link `aden-core` crates directly rather than shelling out to the `aden` binary. That lets the gate verdict and scope manifest render inline (for example, a blast-radius warning in the status line) with no IPC.
+
+=== Zero-default-context via progressive disclosure
+
+The default context is the model's own system prompt plus essentially nothing. Three mechanisms keep it that way:
+
+* *Deferred tool loading.* aden's MCP tools are not injected up front. coxn exposes one discovery seam; the model searches for the tool it needs by intent, and only that schema loads. On Anthropic this is native (`tool_search`, which appends rather than swaps, preserving the prompt cache); to stay provider-neutral, coxn implements the same thing harness-side (a `list/search aden tools` function plus dynamic registration into the next turn). This is the one piece of loop logic worth owning, because it is what makes "no bloat by default" possible.
+* *Pull, do not push.* `asm` / `understand` / `scope` are invoked by the model when it decides it needs blast radius or a neighborhood, never auto-prepended.
+* *Silent gate.* The blast-radius check fires only when an edit is about to happen, and emits only when there is something to say.
+
+=== The gate as a hard contract
+
+Before coxn accepts an edit, it runs `aden impact-diff --scope <manifest>` and obeys the exit code: in-scope (proceed), scope-escape or blast-leak (block, surface the verdict). Today this gate is advisory (it lives in aden's MCP server instructions and `AGENTS.md` as a workflow norm). For coxn to actually *drive* a model rather than *suggest to* one, the gate must be promoted to a hard, parseable exit-code contract. See <<prereqs>>.
+
+== Surfaces: two products, opposite answers
+
+There are two UI surfaces, and the right choice differs:
+
+[cols="1,3a"]
+|===
+| Surface | Decision
+
+| The driver (the pump you live in)
+| *TUI.* Fastest to MVP, leanest, terminal-native, single binary, same language as aden. This is what coxn builds. The agent-driver chat surface is uncharted in aden's existing research, so there is nothing to contradict.
+
+| The inspector (graph, blast-radius, communities)
+| *Already a GUI, keep it browser-native.* `aden view` is a self-contained offline force-graph viewer, substantially built on aden's `feat/viz-export` branch. A terminal cannot do force-directed / 3D / community drill-down, and it does not need to: the browser viewer already exists and is standalone. coxn does not rebuild it.
+|===
+
+Later (not MVP): a live agent-activity overlay (graph nodes pulse as the model touches them) can bridge the TUI driver and the browser viewer through `aden view --watch` (a localhost server plus SSE). Clean to add once both surfaces exist; skip for v1.
+
+== Build vs reuse: the component map
+
+Eight component categories. Six are commodity (every harness rebuilds them identically); two are differentiating, and only one is aden's.
+
+[cols="2,1,3"]
+|===
+| Component | Class | coxn stance
+
+| Agent loop (model call, retry, stream) | commodity | own it, but keep it tiny (~150 LOC)
+| Tool / function dispatch | commodity | own it, thin
+| Permissions / sandboxing | commodity | minimal allow-list; lean on the OS
+| Session / state / compaction | commodity | file-backed, minimal
+| Provider abstraction | commodity | one `call_model()` seam only; do not build a platform
+| TUI chrome | commodity | `ratatui` + `crossterm`, minimal
+| Planning / orchestration | partly differentiating | defer to aden `plan` (6 to 12 month aden horizon)
+| *Context assembly* | *the differentiator* | *delegate entirely to aden (scope, asm, impact-diff)*
+|===
+
+What coxn deliberately does NOT build: a provider platform, a graph viewer, a session-management product, a from-scratch loop that chases parity with existing harnesses.
+
+== Reference implementations
+
+* *pi* (earendil-works) is the form-factor blueprint: a ~600-LOC TUI core, sub-1000-token system prompt, no to-do lists, no MCP bloat, `PLAN.md` file-based planning instead of an in-agent plan mode. coxn is, in spirit, a Rust `ratatui` port of pi's shape where aden is the director. pi proves the pump can be ~600 lines; aden-as-director is what lets coxn stay that small, because the pump carries no intelligence.
+* Production Rust + `ratatui` AI agents already exist as proof the stack is right: `bosun`, `claudectl`, `Crustly`.
+* `ratatui` 0.30 + `crossterm`: pure Rust, no C dependencies, immediate-mode rendering that handles token streaming cleanly (append to a buffer, redraw next frame).
+
+== Implementation plan
+
+[[prereqs]]
+=== Prerequisites (aden-side, gating)
+
+These are changes in the aden repo, not coxn, and they gate a trustworthy harness:
+
+* *G4 multi-writer safety.* Add an advisory flock on the store directory during the write phase, and race-free session-log append (O_APPEND single-write line records, or per-agent shard files merged on read). This is the one real correctness bug, and parallel-agent driving multiplies write concurrency, so it lands first.
+* *Gate enforcement.* Promote the blast-radius gate from advisory to a hard exit-code contract: `aden impact-diff --scope <manifest>` returning in-scope / scope-escape / blast-leak with a non-zero exit on violation. (The pre-commit / gate work exists, unpushed, on `feat/vocab-mismatch-evals`.)
+* *`aden scope` (G1).* A read-only command emitting the partition, order, and per-agent token-budgeted manifest (JSON: name, seeds, anchors, files, context, risk). No new graph code required; it reads the existing graph.
+* *ADR-005 config.* `.aden/config.toml` backing store, so coxn can read runtime preferences through `aden config get/set`.
+
+=== Phase 0: skeleton and contract
+
+* Create the crate: `Cargo.toml`, `src/` with module stubs (`pump`, `model`, `tools`, `gate`, `tui`).
+* Write the coxn <-> aden *contract*: the scope-manifest shape coxn consumes, and the `impact-diff --scope` exit-code protocol coxn obeys. This is the spec that keeps the pump a few hundred lines.
+
+=== Phase 1: the dumb pump MVP
+
+* `ratatui` shell: a streaming output pane, a status line, and a confirm modal. ~50 to 150 LOC for the render loop.
+* One `call_model()` seam (start with a single provider; provider-neutral signature from day one).
+* Bare / near-empty system prompt (the zero-default-context floor).
+* Manual agentic loop: call model, dispatch tools, feed results, repeat.
+
+=== Phase 2: aden wiring
+
+* Progressive disclosure: the deferred tool-discovery seam plus dynamic registration (append, do not swap, to preserve cache).
+* Pull-context: let the model invoke `asm` / `understand` on demand.
+* The scope-to-context loader: `aden scope <task>` defines what loads; coxn loads exactly that and nothing more.
+* The hard gate: run `impact-diff --scope` before accepting any edit; block on violation.
+* Surface `aden status` savings (tokens saved, tool calls saved) in the status line.
+
+=== Phase 3: provider neutrality (only if needed)
+
+* Additional `call_model()` backends (Anthropic, OpenAI, Gemini, local). Each provider's caching / token-counting / budget profile is abstracted behind the seam. Do not build this speculatively; add a provider when there is a real second target.
+
+=== Phase 4 (optional, later): live graph bridge
+
+* `aden view --watch` localhost server plus SSE so the browser inspector can pulse nodes as coxn drives the model. Not MVP.
+
+== Honest caveats and open risks
+
+* *Gate is advisory until promoted.* Driving (not suggesting) requires the hard exit-code contract; until then coxn can only advise.
+* *Blast-radius recall is ~0.61 on OO / method-dispatch code* (method-call resolution gap; free-function Rust is ~0.99). The gate has false-negative risk on object-oriented codebases: gate conservatively there, or flag the gap, until method-call resolution improves in aden.
+* *Prose anchor mismatch* (index vs graph anchor namespaces) degrades `ask` on prose-heavy repos. For doc-heavy targets, prefer `grep` / structural queries over `ask` until fixed.
+* *Discoverability vs leanness.* Zero default context means the model will not reach for aden unprompted (it cannot call what it does not know exists). The gate is the backstop (it fires at edit time regardless). The minimum-viable nudge, if wanted, is a single context line: "aden tools available via search."
+* *Alt-screen vs scrollback.* A full-screen `ratatui` app loses native terminal scrollback; raw-append preserves scrollback but loses layout. `ratatui` supports both; pick per taste, this is the one real TUI tradeoff.
+
+== Naming rationale
+
+`coxn` = coxswain shorthand (`cox'n`), the role that steers and calls cadence but never rows. The mapping is exact: cox steers the boat (coxn drives the loop), cox calls the cadence (coxn sets pace and gates turns), cox never rows (the pump carries no intelligence), the crew rows (the LLM acts), the headings come from elsewhere (aden). It pairs with Aden, a historic port on the Gulf of Aden. It is four characters, trivially typeable (`coxn run`, `coxn scope`, `coxn gate`), and came back clean on crates.io / npm / GitHub. The obvious nautical picks were taken or wrong: `helm` (Kubernetes), `rudder` (RudderStack), `steer` (an existing AI-agent crate), and ship-part words like `rudder` name the part, not the director.
+
+== Provenance and related research
+
+Derived from a design conversation on 2026-06-24. Builds directly on existing aden research (in `~/Projects/research/topics/aden-roadmap/`):
+
+* `aden-as-directional-harness.adoc`: the "aden directs and gates; the LLM acts" law, the four questions (Partition, Order, Provision, Gate-and-record), scope manifests, gate verdicts.
+* `config-runner-tui.adoc`: the `ratatui` preference-TUI precedent and the `tui` cargo-feature gating pattern.
+* `aden-view-design.adoc`, `viz-design.adoc`, `viewer-unified-explorer.adoc`: the browser-native graph inspector (the separate GUI surface coxn reuses, not rebuilds).
+* `improving-adens-mcp.adoc`: the MCP-first form factor and the "thin CLI/TUI whose action space is aden's MCP tools" framing.
+* `competitive-position.adoc`, `market-demand-2026.adoc`: why the context layer (not the loop) is the moat.

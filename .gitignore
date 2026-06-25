@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target/
+
+# Backtraces
+*.rs.bk
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+
+# Local env, not committed
+/.env
