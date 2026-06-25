@@ -55,7 +55,7 @@ async fn main() -> io::Result<()> {
     tools.register(Box::new(EchoTool));
     tools.register_latent(Box::new(AsmTool::new(dir.clone())));
     tools.register_latent(Box::new(UnderstandTool::new(dir.clone())));
-    let (model, model_label) = resolve_model();
+    let (model, model_label) = resolve_model(&dir);
     let mut pump = Pump::new(model, tools);
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: it sets the
@@ -84,32 +84,51 @@ fn status_line(dir: &Path, model_label: &str, task: &str) -> String {
     format!("{model_label}  |  {detail}")
 }
 
+/// Build an OpenAI-compatible model with a status label tagging its source.
+fn openai_model(
+    base_url: String,
+    model: String,
+    key: Option<String>,
+    source: &str,
+) -> (AnyModel, String) {
+    let label = format!("{model} @ {base_url} ({source})");
+    (
+        AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(base_url, model, key)),
+        label,
+    )
+}
+
 /// Pick the model backend at runtime, returning it with a short label for the
-/// status line. Resolution order: an explicit `COXN_MODEL_BASE_URL`, then a
-/// local provider auto-detected on its well-known port (Ollama / LM Studio),
-/// then the offline stub. Selection is data, not a type, so per-role routing and
-/// sub-agents drop in without reworking the seam.
-fn resolve_model() -> (AnyModel, String) {
+/// status line. Resolution order: an explicit `COXN_MODEL_BASE_URL`, then
+/// `.aden/config.toml` (`model.base_url` / `model.name`), then a local provider
+/// auto-detected on its well-known port (Ollama / LM Studio), then the offline
+/// stub. Selection is data, not a type, so per-role routing and sub-agents drop
+/// in without reworking the seam. The key always comes from the environment,
+/// never the committed config.
+fn resolve_model(dir: &Path) -> (AnyModel, String) {
+    let env_key = || {
+        std::env::var("COXN_MODEL_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+    };
+
+    // 1. Explicit environment override.
     if let Ok(base_url) = std::env::var("COXN_MODEL_BASE_URL")
         && !base_url.trim().is_empty()
     {
         let model = std::env::var("COXN_MODEL_NAME").unwrap_or_else(|_| "local".to_string());
-        let key = std::env::var("COXN_MODEL_KEY")
-            .ok()
-            .filter(|k| !k.is_empty());
-        let label = format!("{model} @ {base_url}");
-        return (
-            AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(base_url, model, key)),
-            label,
-        );
+        return openai_model(base_url, model, env_key(), "env");
     }
+    // 2. aden config (.aden/config.toml). Secrets stay in the env, not the file.
+    if let Some(base_url) = aden::config_get(dir, "model.base_url") {
+        let model = aden::config_get(dir, "model.name").unwrap_or_else(|| "local".to_string());
+        return openai_model(base_url, model, env_key(), "config");
+    }
+    // 3. Local auto-detection.
     if let Some((base_url, model)) = openai::detect() {
-        let label = format!("{model} @ {base_url} (auto)");
-        return (
-            AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(base_url, model, None)),
-            label,
-        );
+        return openai_model(base_url, model, None, "auto");
     }
+    // 4. Offline stub.
     (
         AnyModel::Stub(StubModel),
         "stub (no model; start Ollama/LM Studio or set COXN_MODEL_BASE_URL)".to_string(),

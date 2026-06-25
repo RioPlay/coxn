@@ -155,6 +155,28 @@ fn extract_savings(status: &str) -> Option<String> {
     (!detail.is_empty()).then(|| format!("aden {detail}"))
 }
 
+/// Read a runtime preference from `.aden/config.toml` via `aden config get`.
+/// `None` when the key is unset, aden cannot run, or the value is empty. Lets
+/// coxn pin a provider/model without environment variables.
+pub fn config_get(dir: &Path, key: &str) -> Option<String> {
+    config_get_with(&aden_bin(), dir, key)
+}
+
+fn config_get_with(bin: &str, dir: &Path, key: &str) -> Option<String> {
+    let out = Command::new(bin)
+        .arg("config")
+        .arg("get")
+        .arg(key)
+        .arg(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 /// Run a command expecting text on stdout; non-zero exit is an error.
 fn run_text(mut cmd: Command) -> Result<String, AdenError> {
     let out = cmd.output().map_err(|e| AdenError::Spawn(e.to_string()))?;
@@ -236,6 +258,25 @@ mod tests {
         );
         assert!(matches!(out.verdict, GateVerdict::Error(_)));
         assert!(!out.verdict.proceed());
+    }
+
+    #[test]
+    fn config_get_returns_value_or_none() {
+        let _serial = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir();
+
+        let found = fake_aden("cfg-ok", 0, "ollama-model");
+        assert_eq!(
+            config_get_with(found.to_str().unwrap(), &dir, "model.name"),
+            Some("ollama-model".to_string())
+        );
+
+        // Missing key: aden exits non-zero -> None.
+        let missing = fake_aden("cfg-miss", 1, "");
+        assert_eq!(
+            config_get_with(missing.to_str().unwrap(), &dir, "model.name"),
+            None
+        );
     }
 
     #[test]
