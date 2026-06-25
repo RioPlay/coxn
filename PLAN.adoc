@@ -20,13 +20,18 @@ prerequisites are out of scope here and tracked under Phase 2 blockers.
 
 == Phase 1: the dumb pump MVP
 
+DONE: the Phase 1 pump MVP runs. `coxn` drives the stub backend through the TUI
+loop end to end (24 tests green, clippy/fmt clean). Phase 2 (aden wiring) is
+next and starts at the blockers below.
+
+
 * [x] P1.1 `model`: `call_model()` seam over `Model` trait; `ModelRequest`/`ModelResponse`/`Message`/`Role`/`ToolCall`/`ModelError` + `StubModel`. 2 async tests green, no provider named.
 * [x] P1.2 `model`: `DEFAULT_SYSTEM_PROMPT` empty (zero-default-context floor), guard test asserts it adds nothing by default.
 * [x] P1.3 `tools`: `ToolRegistry` (register/names/dispatch) over a `Tool` trait, `EchoTool` built-in, unknown-tool is an error. 3 tests green.
 * [x] P1.4 `tui`: ratatui alt-screen shell -- `View` + pure `render` (tail-scrolling output pane + status line), `Tui` lifecycle, `map_key`/`poll_action` event wiring. 5 tests incl. `TestBackend` render.
 * [x] P1.5 `tui`: confirm modal -- `View::confirm/dismiss`, centered overlay with proceed/block hint, `map_modal_key` (y/Enter proceed, n/Esc block), `Confirm`/`Cancel` actions. 3 more tests.
 * [x] P1.6 `pump`: `Pump<M>` manual loop -- `run_turn` calls model, dispatches tools, feeds results back, repeats to a no-tool reply; tool-hop cap paces it; bare system prompt. Gate hook marked Phase 2. 4 tests.
-* [ ] P1.7 Wire pump + tui + model + tools end to end; `coxn` runs the loop against the stub backend (MVP exit criterion)
+* [x] P1.7 Wired end to end: `main` drives `Pump<StubModel>` through the TUI (mode-aware input/modal keys, one-line input prompt). Verified under a PTY: type -> stub echo transcript -> Ctrl-C quits clean; no-TTY exits gracefully. `map_key`/`poll_action` superseded by `map_input_key`; tokio current_thread flavor.
 
 == Phase 2 blockers (aden-side, OUT OF SCOPE in this repo)
 

@@ -1,8 +1,9 @@
 //! The TUI chrome: ratatui + crossterm, minimal.
 //!
-//! A streaming output pane, a status line, and a confirm modal overlaid on a
-//! blocked gate. Immediate-mode render loop: append to a buffer, redraw next
-//! frame. No graph rendering; the inspector stays browser-native (`aden view`).
+//! A streaming output pane, a status line, a one-line input prompt, and a
+//! confirm modal overlaid on a blocked gate. Immediate-mode render loop: append
+//! to a buffer, redraw next frame. No graph rendering; the inspector stays
+//! browser-native (`aden view`).
 //!
 //! Alt-screen tradeoff: coxn runs full-screen for layout (the status line needs
 //! it), which loses native terminal scrollback. This is the one real TUI
@@ -13,13 +14,13 @@
 //! `TestBackend`; terminal lifecycle and event polling are the thin, untested
 //! edges.
 
-// Wired into the pump in P1.6 / P1.7; defined ahead of use until then.
+// View::push is the streaming-append API exercised by tests and used once a
+// provider streams (Phase 3); allow it ahead of that consumer.
 #![allow(dead_code)]
 
 use std::io;
-use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -32,6 +33,8 @@ pub struct View {
     pub output: String,
     /// The status line content (savings land here in Phase 2).
     pub status: String,
+    /// The current input line the user is typing.
+    pub input: String,
     /// A pending confirmation prompt. When set, the modal renders over the pane
     /// and the modal key mapping applies. The pump sets this (e.g. on a blocked
     /// gate) and clears it once the user answers.
@@ -64,6 +67,21 @@ impl View {
     pub fn dismiss(&mut self) {
         self.modal = None;
     }
+
+    /// Append a typed character to the input line.
+    pub fn input_push(&mut self, c: char) {
+        self.input.push(c);
+    }
+
+    /// Delete the last character of the input line.
+    pub fn input_backspace(&mut self) {
+        self.input.pop();
+    }
+
+    /// Take the input line, leaving it empty (on submit).
+    pub fn take_input(&mut self) -> String {
+        std::mem::take(&mut self.input)
+    }
 }
 
 /// The visible tail of the output: the last `height` lines, so a streaming pane
@@ -90,15 +108,21 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
-/// Render one frame: an output pane filling the screen above a one-row status
-/// line, with the confirm modal overlaid when active. Pure in `view`; testable
-/// with `TestBackend`.
+/// Render one frame: an output pane above a one-row status line and a one-row
+/// input prompt, with the confirm modal overlaid when active. Pure in `view`;
+/// testable with `TestBackend`.
 pub fn render(frame: &mut Frame, view: &View) {
-    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
+    let areas = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(frame.area());
     let pane = areas[0];
     let tail = visible_tail(&view.output, pane.height as usize);
     frame.render_widget(Paragraph::new(tail), pane);
     frame.render_widget(Paragraph::new(view.status.as_str()), areas[1]);
+    frame.render_widget(Paragraph::new(format!("> {}", view.input)), areas[2]);
 
     if let Some(prompt) = &view.modal {
         let hint = "[y] proceed   [n] block";
@@ -118,18 +142,26 @@ pub fn render(frame: &mut Frame, view: &View) {
 pub enum Action {
     /// Leave the pump.
     Quit,
+    /// Submit the current input line as a user turn.
+    Submit,
+    /// Append a typed character to the input line.
+    Append(char),
+    /// Delete the last input character.
+    Backspace,
     /// Answer a confirm modal: proceed.
     Confirm,
     /// Answer a confirm modal: block.
     Cancel,
 }
 
-/// Map a key event to an action, if any. Pure and testable. `q` or `Ctrl-C`
-/// quit; everything else is ignored at this layer.
-pub fn map_key(key: KeyEvent) -> Option<Action> {
+/// Map a key event while typing. `Ctrl-C` quits, Enter submits, Backspace
+/// deletes, and any other printable character is appended. Pure and testable.
+pub fn map_input_key(key: KeyEvent) -> Option<Action> {
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Action::Quit),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Quit),
+        (KeyCode::Enter, _) => Some(Action::Submit),
+        (KeyCode::Backspace, _) => Some(Action::Backspace),
+        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => Some(Action::Append(c)),
         _ => None,
     }
 }
@@ -144,30 +176,21 @@ pub fn map_modal_key(key: KeyEvent) -> Option<Action> {
     }
 }
 
-/// Poll for a key event for up to `timeout` and map it to an action. Returns
-/// `None` on timeout or an unmapped key.
-pub fn poll_action(timeout: Duration) -> io::Result<Option<Action>> {
-    if event::poll(timeout)?
-        && let Event::Key(key) = event::read()?
-    {
-        return Ok(map_key(key));
-    }
-    Ok(None)
-}
-
 /// The terminal lifecycle owner: enters the alt screen and raw mode on
-/// construction (via `ratatui::init`) and restores on drop. The render loop
-/// draws through [`Tui::draw`].
+/// construction and restores on drop. The render loop draws through
+/// [`Tui::draw`].
 pub struct Tui {
     terminal: ratatui::DefaultTerminal,
 }
 
 impl Tui {
     /// Take over the terminal (alt screen, raw mode, panic-restore hook).
-    pub fn new() -> Self {
-        Self {
-            terminal: ratatui::init(),
-        }
+    /// Fails gracefully without panicking when there is no terminal (CI,
+    /// containers, pipes), which coxn is meant to run in.
+    pub fn new() -> io::Result<Self> {
+        Ok(Self {
+            terminal: ratatui::try_init()?,
+        })
     }
 
     /// Draw one frame of the view.
@@ -179,7 +202,7 @@ impl Tui {
 
 impl Drop for Tui {
     fn drop(&mut self) {
-        ratatui::restore();
+        ratatui::try_restore().ok();
     }
 }
 
@@ -205,13 +228,27 @@ mod tests {
     }
 
     #[test]
-    fn keys_map_to_actions() {
-        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+    fn input_keys_map_to_actions() {
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        let other = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
-        assert_eq!(map_key(q), Some(Action::Quit));
-        assert_eq!(map_key(ctrl_c), Some(Action::Quit));
-        assert_eq!(map_key(other), None);
+        assert_eq!(map_input_key(a), Some(Action::Append('a')));
+        assert_eq!(map_input_key(enter), Some(Action::Submit));
+        assert_eq!(map_input_key(backspace), Some(Action::Backspace));
+        assert_eq!(map_input_key(ctrl_c), Some(Action::Quit));
+    }
+
+    #[test]
+    fn input_edits_and_submit_clears() {
+        let mut view = View::new();
+        view.input_push('h');
+        view.input_push('i');
+        view.input_push('x');
+        view.input_backspace();
+        assert_eq!(view.input, "hi");
+        assert_eq!(view.take_input(), "hi");
+        assert!(view.input.is_empty());
     }
 
     /// Stringify the test buffer so we can assert what was drawn.

@@ -8,9 +8,6 @@
 //! Handlers are synchronous for the MVP. I/O-bound tools (real aden calls) may
 //! want async dispatch later; revisit in Phase 2 rather than speculatively now.
 
-// Wired into the pump in P1.6 / P1.7; defined ahead of use until then.
-#![allow(dead_code)]
-
 use crate::model::ToolCall;
 
 /// The outcome of running a tool: the text fed back to the model as a Tool

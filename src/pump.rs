@@ -10,9 +10,6 @@
 //! at the edit point (a write tool consults `impact-diff --scope` before its
 //! result is accepted). No aden calls happen here yet.
 
-// Wired into main in P1.7; defined ahead of use until then.
-#![allow(dead_code)]
-
 use crate::model::{
     DEFAULT_SYSTEM_PROMPT, Message, Model, ModelError, ModelRequest, Role, call_model,
 };
