@@ -80,7 +80,7 @@ DONE. Deps approved (P3.0) and the path verified live against LM Studio.
 
 The action surface that makes coxn drive (not suggest). All verified live end
 to end against a throwaway git repo + LM Studio gpt-oss-20b, and the aden seam
-verified against the real T3 codebase (`~/Projects/t3code`).
+verified against a real third-party codebase.
 
 * [x] P4.1 Action tools: `edit` (replace an exact unique string) and `write_file` (create/overwrite, makes parent dirs). Both `mutates() == true` and declare `target_path` so the pump can snapshot.
 * [x] P4.2 Apply -> gate -> revert: per DESIGN, aden reads the working-tree diff, so the pump applies the edit, runs `impact-diff --scope`, and on scope-escape/blast-leak reverts only that file (restore bytes / remove a new file) and feeds the verdict back. In-scope edits persist. No git, no new deps. Unit-tested (revert/persist/no-gate) + live.
@@ -97,7 +97,7 @@ verified against the real T3 codebase (`~/Projects/t3code`).
 
 == Notes / decisions
 
-* Live validation (against `~/Projects/t3code`, the real T3 Chat monorepo, 42k-contract aden store): the full aden seam -- `scope`, `impact-diff --scope` (in-scope AND scope-escape on a dirty tree), `asm` (bare seeds resolve), `status` savings, `config` -- all confirmed against real aden 0.2.0. The TUI loop confirmed against LM Studio gpt-oss-20b: auto-detect, grounded reply on a real symbol, tool-calling round-trip.
+* Live validation (against a real third-party codebase, 42k-contract aden store): the full aden seam -- `scope`, `impact-diff --scope` (in-scope AND scope-escape on a dirty tree), `asm` (bare seeds resolve), `status` savings, `config` -- all confirmed against real aden 0.2.0. The TUI loop confirmed against LM Studio gpt-oss-20b: auto-detect, grounded reply on a real symbol, tool-calling round-trip.
 * Gated editing confirmed live on a throwaway repo: model called `edit` with correct JSON, coxn applied + gated in-scope, the change persisted on disk.
 * Known constraint: `impact-diff` judges the WHOLE working-tree diff vs HEAD, so a tree already dirty outside the scope mandate blocks every edit. coxn effectively expects a tree scoped to the task.
 * Open: merge the aden `feat/coxn-directional-prereqs` branch (PoC gate now satisfied) -- outward-facing, awaiting the user. Streaming/Ollama-native and sub-agents remain.
