@@ -22,6 +22,16 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a slug is safe to use as a filename: non-empty and only alphanumeric,
+/// `-`, or `_`. Rejects path-traversal (`..`, `/`, absolute) so a `/resume <slug>`
+/// cannot escape the sessions directory and create/append to an arbitrary file.
+fn valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// The sessions directory: `$XDG_DATA_HOME/coxn/sessions` or
 /// `~/.local/share/coxn/sessions`. `None` if neither is set.
 fn sessions_dir() -> Option<PathBuf> {
@@ -60,11 +70,12 @@ impl Session {
     }
 
     /// Reopen an existing session by slug for continued appending (`/resume`).
-    /// Falls back to a no-op session if the data dir or file is unavailable.
+    /// Falls back to a no-op session if the slug is unsafe or the data dir is
+    /// unavailable.
     pub fn open(slug: &str) -> Session {
         let path = match sessions_dir() {
-            Some(dir) => dir.join(format!("{slug}.jsonl")),
-            None => PathBuf::new(),
+            Some(dir) if valid_slug(slug) => dir.join(format!("{slug}.jsonl")),
+            _ => PathBuf::new(),
         };
         let file = OpenOptions::new()
             .create(true)
@@ -142,6 +153,9 @@ pub fn list() -> Vec<SessionInfo> {
 /// Load a session's messages by slug. Lines that do not parse are skipped, so a
 /// partially-written tail (from a crash) does not abort the load.
 pub fn load(slug: &str) -> Vec<Message> {
+    if !valid_slug(slug) {
+        return Vec::new();
+    }
     let Some(dir) = sessions_dir() else {
         return Vec::new();
     };
@@ -187,6 +201,20 @@ pub fn relative_age(secs: u64) -> String {
 mod tests {
     use super::*;
     use crate::model::Role;
+
+    #[test]
+    fn slug_validation_rejects_path_traversal() {
+        assert!(valid_slug("1782360134"));
+        assert!(valid_slug("my-session_2"));
+        // Traversal / separators / empties are refused.
+        assert!(!valid_slug("../../.bashrc"));
+        assert!(!valid_slug("a/b"));
+        assert!(!valid_slug("..")); // would escape the sessions dir
+        assert!(!valid_slug(""));
+        // An unsafe slug opens a no-op session (no file) and loads nothing.
+        assert!(Session::open("../escape").slug().is_empty());
+        assert!(load("../escape").is_empty());
+    }
 
     #[test]
     fn relative_age_buckets() {
