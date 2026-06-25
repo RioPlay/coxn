@@ -43,6 +43,39 @@ impl Snapshot {
     }
 }
 
+/// The user's decision on a mutating tool call (the four-decision approval).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// Run the call.
+    Allow,
+    /// Skip this call; feed a declined note back to the model.
+    Decline,
+    /// Decline this call and end the turn.
+    CancelTurn,
+}
+
+/// Per-turn I/O the pump drives: stream assistant text out, and ask the user to
+/// approve a mutating tool before it runs. The TUI implements it (drive); a
+/// silent default ([`SilentIo`]) serves tests and non-interactive callers. One
+/// owner of the terminal avoids the two-borrow problem of separate closures.
+pub trait TurnIo {
+    /// A streamed assistant text fragment; return `false` to cancel the turn.
+    fn on_delta(&mut self, delta: &str) -> bool;
+    /// Approve a mutating tool before it runs. Default: allow (tests / silent).
+    fn approve(&mut self, _call: &ToolCall) -> Approval {
+        Approval::Allow
+    }
+}
+
+/// A silent [`TurnIo`]: stream nothing visibly, allow every mutation. Used by
+/// the non-streaming [`Pump::run_turn`] and tests.
+struct SilentIo;
+impl TurnIo for SilentIo {
+    fn on_delta(&mut self, _delta: &str) -> bool {
+        true
+    }
+}
+
 /// Dispatch a tool call, flattening the result/error into the text fed back to
 /// the model (an unknown tool or a tool error is information, not a failure).
 fn dispatch_result(tools: &ToolRegistry, call: &ToolCall) -> String {
@@ -162,25 +195,22 @@ impl<M: Model> Pump<M> {
     /// back, and repeats until the model stops calling tools or the hop cap hits.
     #[allow(dead_code)]
     pub async fn run_turn(&mut self) -> Result<String, ModelError> {
-        self.run_turn_streaming(&mut |_| true).await
+        self.run_turn_streaming(&mut SilentIo).await
     }
 
-    /// Drive one turn, streaming assistant text fragments through `on_delta` as
-    /// they arrive (for live rendering). `on_delta` returns `false` to cancel:
-    /// the turn stops after the in-flight model reply, the partial text is kept,
-    /// and any partial tool calls are dropped (not dispatched). Otherwise
-    /// identical to [`Pump::run_turn`].
-    pub async fn run_turn_streaming(
-        &mut self,
-        on_delta: &mut dyn FnMut(&str) -> bool,
-    ) -> Result<String, ModelError> {
+    /// Drive one turn through `io`: stream assistant text (io.on_delta, which
+    /// returns false to cancel) and approve each mutating tool (io.approve)
+    /// before it runs. A cancelled stream keeps the partial text and drops
+    /// partial tool calls; a declined tool is skipped; a cancel-turn approval
+    /// ends the turn after feeding results for the remaining calls.
+    pub async fn run_turn_streaming(&mut self, io: &mut dyn TurnIo) -> Result<String, ModelError> {
         for _ in 0..MAX_TOOL_HOPS {
             let request = self.request();
             // Wrap the sink to notice a cancellation request mid-stream.
             let mut cancelled = false;
             let response = {
                 let mut sink = |delta: &str| {
-                    let keep_going = on_delta(delta);
+                    let keep_going = io.on_delta(delta);
                     cancelled |= !keep_going;
                     keep_going
                 };
@@ -210,20 +240,31 @@ impl<M: Model> Pump<M> {
                 return Ok(content);
             }
 
-            // Dispatch each tool call and feed the result back as a tool
-            // message. A mutating tool is applied and then gated: aden reads the
-            // working-tree diff, so the edit must land on disk before the gate
-            // can judge it; a non-in-scope verdict reverts it and feeds the
-            // verdict back to the model (which must adapt).
+            // Dispatch each tool call and feed the result back as a tool message.
+            // A mutating tool is approved by the user, then applied and (when a
+            // task scope is active) gated by aden. Every call gets a result so
+            // tool-call/result pairing stays valid even on a mid-turn cancel.
+            let mut end_turn = false;
             for call in &response.tool_calls {
-                let content = if self.tools.mutates(&call.name) {
-                    self.run_gated_mutation(call)
+                let result = if end_turn {
+                    "turn cancelled by the user".to_string()
+                } else if self.tools.mutates(&call.name) {
+                    match io.approve(call) {
+                        Approval::Allow => self.run_gated_mutation(call),
+                        Approval::Decline => format!("the user declined the {} call", call.name),
+                        Approval::CancelTurn => {
+                            end_turn = true;
+                            "turn cancelled by the user".to_string()
+                        }
+                    }
                 } else {
                     dispatch_result(&self.tools, call)
                 };
-                // The tool result records which call it answers.
                 self.messages
-                    .push(Message::tool_result(call.id.clone(), content));
+                    .push(Message::tool_result(call.id.clone(), result));
+            }
+            if end_turn {
+                return Ok(content);
             }
         }
         Err(ModelError::Backend("tool-hop cap reached".to_string()))
@@ -236,15 +277,8 @@ impl<M: Model> Pump<M> {
     /// runs the gate, and reverts the file on a block. Returns the text fed back
     /// to the model.
     fn run_gated_mutation(&mut self, call: &ToolCall) -> String {
-        // No scope means no gate. Rather than edit ungoverned, refuse: aden
-        // directs edits. (With no task, the action tools are not even advertised;
-        // this is the backstop.)
-        if self.gate.is_none() {
-            return "EDIT BLOCKED: no task scope is active, so edits are ungated. \
-                Start coxn with a task (COXN_TASK_NAME) to enable editing."
-                .to_string();
-        }
-        // Snapshot the target before applying, so a blocked edit can be reverted.
+        // The user already approved this call. Snapshot the target before
+        // applying, so a gate-blocked edit can be reverted.
         let path = self.tools.target_path(call);
         let snapshot = path.as_deref().map(Snapshot::capture);
         // Apply. A tool error means nothing landed: surface it, skip the gate.
@@ -252,8 +286,12 @@ impl<M: Model> Pump<M> {
             Ok(text) => text,
             Err(err) => return err,
         };
-        // Judge the resulting diff (owned outcome releases the gate borrow).
-        let outcome = self.gate.as_ref().expect("gate present").check();
+        // With no task scope, the user's approval is the only gate and the edit
+        // stands. With a scope, aden also judges the resulting working-tree diff.
+        let Some(gate) = self.gate.as_ref() else {
+            return applied;
+        };
+        let outcome = gate.check();
         if outcome.proceed() {
             return applied;
         }
@@ -494,6 +532,25 @@ mod tests {
         assert!(pump.take_block().is_none());
     }
 
+    /// A TurnIo that cancels the stream on the first fragment.
+    struct CancelIo;
+    impl TurnIo for CancelIo {
+        fn on_delta(&mut self, _delta: &str) -> bool {
+            false
+        }
+    }
+
+    /// A TurnIo that streams silently and returns a fixed approval decision.
+    struct ApproveIo(Approval);
+    impl TurnIo for ApproveIo {
+        fn on_delta(&mut self, _delta: &str) -> bool {
+            true
+        }
+        fn approve(&mut self, _call: &ToolCall) -> Approval {
+            self.0
+        }
+    }
+
     #[tokio::test]
     async fn cancel_drops_partial_tool_calls_and_ends_the_turn() {
         // The model returns text + a tool call; the sink cancels on the text.
@@ -501,12 +558,36 @@ mod tests {
         let mut pump = Pump::new(model, edit_registry());
         pump.set_gate(Box::new(FakeGate(outcome(GateVerdict::InScope, "ok"))));
         pump.push_user("go");
-        let out = pump.run_turn_streaming(&mut |_| false).await.expect("turn");
+        let out = pump.run_turn_streaming(&mut CancelIo).await.expect("turn");
         assert_eq!(out, "editing");
         // The edit was never dispatched (no tool message), and the turn ended
         // without consuming the second scripted response.
         assert!(pump.messages().iter().all(|m| m.role != Role::Tool));
         assert!(pump.take_block().is_none());
+    }
+
+    #[tokio::test]
+    async fn declined_mutation_is_not_applied() {
+        let dir = temp_dir("decline");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let args = r#"{"path":"a.txt","old_string":"world","new_string":"there"}"#;
+        let model = ScriptedModel::new(vec![calls_tool("edit", args), assistant("ok")]);
+        let mut pump = Pump::new(model, real_edit_registry(&dir));
+        pump.set_gate(Box::new(FakeGate(outcome(GateVerdict::InScope, "ok"))));
+        pump.push_user("edit a.txt");
+        // The user declines the edit: it must not touch the file.
+        pump.run_turn_streaming(&mut ApproveIo(Approval::Decline))
+            .await
+            .expect("turn");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+        let tool_msg = pump
+            .messages()
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result");
+        assert!(tool_msg.content.contains("declined"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -601,23 +682,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mutating_tool_without_a_gate_is_refused() {
+    async fn an_approved_edit_without_a_gate_applies() {
         let dir = temp_dir("nogate");
         let file = dir.join("a.txt");
         std::fs::write(&file, "hello world").unwrap();
         let args = r#"{"path":"a.txt","old_string":"world","new_string":"there"}"#;
         let model = ScriptedModel::new(vec![calls_tool("edit", args), assistant("ok")]);
         let mut pump = Pump::new(model, real_edit_registry(&dir));
-        // No gate set: edits must be refused rather than applied ungated.
+        // No task scope, so no aden gate: the user's approval is the only gate,
+        // and the approved edit lands (run_turn's SilentIo allows by default).
         pump.push_user("edit a.txt");
         pump.run_turn().await.expect("turn completes");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
-        let tool_msg = pump
-            .messages()
-            .iter()
-            .find(|m| m.role == Role::Tool)
-            .expect("tool message");
-        assert!(tool_msg.content.contains("no task scope"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello there");
         std::fs::remove_dir_all(&dir).ok();
     }
 
