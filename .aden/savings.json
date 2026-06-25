@@ -1,0 +1,19 @@
+{
+  "schema": 2,
+  "all_time": {
+    "queries": 3,
+    "returned_tokens": 7834,
+    "baseline_tokens": 32401,
+    "saved_tokens": 24567,
+    "tool_calls_saved": 6
+  },
+  "session": {
+    "started_unix": 1782369151,
+    "last_unix": 1782369164,
+    "queries": 3,
+    "returned_tokens": 7834,
+    "baseline_tokens": 32401,
+    "saved_tokens": 24567,
+    "tool_calls_saved": 6
+  }
+}

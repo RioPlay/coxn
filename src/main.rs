@@ -25,6 +25,9 @@ use tui::{Action, Tui, View, map_input_key, map_modal_key};
 /// How long the event loop waits for a key before redrawing.
 const TICK: Duration = Duration::from_millis(100);
 
+/// Lines the transcript scrolls per Up/Down (a wheel notch in most terminals).
+const SCROLL_STEP: u16 = 3;
+
 /// Format the conversation into the output pane text. An assistant turn that
 /// only requested tools (no text) renders its calls so the line is not blank.
 fn transcript(messages: &[Message]) -> String {
@@ -381,12 +384,17 @@ fn load_task(dir: &Path) -> Task {
 /// Help shown by `/help`.
 const HELP: &str = "commands:\n  \
 /help            show this help\n  \
-/model           list available models (* = active)\n  \
+/model           list available models (* = active, [loaded] = hot)\n  \
 /model <name|#>  switch the active model\n  \
 /model @<role>   switch to the model mapped for a role (route.<role> config)\n  \
 /tools           list the aden tools the model can discover\n  \
 /clear           clear the conversation (keeps the task scope)\n  \
 /quit            leave coxn\n\
+keys:\n  \
+Enter            send         Ctrl-C   cancel a turn / quit when idle\n  \
+Up/Down          scroll chat  PgUp/Dn  scroll a page\n  \
+Ctrl-P/Ctrl-N    input history             Ctrl-W   delete word\n  \
+Left/Right Home/End  move cursor\n\
 anything else is sent to the model.";
 
 /// A slash command typed into the input line.
@@ -469,9 +477,14 @@ async fn drive(
             Some(Action::HistoryNext) => view.history_next(),
             Some(Action::ScrollUp) => {
                 let (w, h) = pane_dims(tui);
+                view.scroll_up(SCROLL_STEP, view.max_scroll(w, h));
+            }
+            Some(Action::ScrollDown) => view.scroll_down(SCROLL_STEP),
+            Some(Action::PageUp) => {
+                let (w, h) = pane_dims(tui);
                 view.scroll_up(h, view.max_scroll(w, h));
             }
-            Some(Action::ScrollDown) => {
+            Some(Action::PageDown) => {
                 let (_, h) = pane_dims(tui);
                 view.scroll_down(h);
             }
