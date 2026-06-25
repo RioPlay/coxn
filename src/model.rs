@@ -111,11 +111,22 @@ pub struct ModelRequest {
     pub tools: Vec<ToolDef>,
 }
 
-/// A model's response: the assistant message plus any tool calls to run.
+/// Token usage a backend reports for a turn (provider-neutral). Drives the
+/// context meter; `prompt_tokens` is the size of the context that was sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+/// A model's response: the assistant message, any tool calls to run, and the
+/// token usage when the backend reports it (`None` otherwise).
 #[derive(Debug, Clone)]
 pub struct ModelResponse {
     pub message: Message,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<Usage>,
 }
 
 /// An error from a model backend.
@@ -218,6 +229,7 @@ impl Model for StubModel {
         Ok(ModelResponse {
             message: Message::new(Role::Assistant, format!("stub: {last_user}")),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }
 }

@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Message, Model, ModelError, ModelRequest, ModelResponse, Role, ToolCall};
+use crate::model::{
+    Message, Model, ModelError, ModelRequest, ModelResponse, Role, ToolCall, Usage,
+};
 
 /// Well-known local providers, probed in order for zero-config startup.
 const LOCAL_CANDIDATES: [&str; 2] = ["http://localhost:11434/v1", "http://localhost:1234/v1"];
@@ -188,6 +190,36 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool>,
     stream: bool,
+    /// Ask for a final usage chunk when streaming; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+/// Token usage as reported on the wire (`usage` object). Shared by the buffered
+/// and streamed paths.
+#[derive(Deserialize)]
+struct WireUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
+}
+
+impl WireUsage {
+    fn into_usage(self) -> Usage {
+        Usage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -236,6 +268,8 @@ struct WireToolFunction {
 struct ChatResponse {
     #[serde(default)]
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
 }
 
 #[derive(Deserialize)]
@@ -308,6 +342,11 @@ fn to_wire<'a>(model: &'a str, request: &ModelRequest, stream: bool) -> ChatRequ
         messages,
         tools,
         stream,
+        // Ask for the final usage chunk only when streaming (it is in the body
+        // for a buffered call).
+        stream_options: stream.then_some(StreamOptions {
+            include_usage: true,
+        }),
     }
 }
 
@@ -338,16 +377,20 @@ fn from_wire(response: ChatResponse) -> Result<ModelResponse, ModelError> {
     Ok(ModelResponse {
         message: Message::new(Role::Assistant, content),
         tool_calls,
+        usage: response.usage.map(WireUsage::into_usage),
     })
 }
 
 // --- streaming (Server-Sent Events) ---
 
-/// One streamed chunk: `{"choices":[{"delta":{...}}]}`.
+/// One streamed chunk: `{"choices":[{"delta":{...}}]}` (and a trailing
+/// `{"usage":{...}}` chunk when `stream_options.include_usage` was sent).
 #[derive(Deserialize)]
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
 }
 
 #[derive(Deserialize)]
@@ -385,11 +428,13 @@ struct StreamFunction {
 }
 
 /// Accumulates streamed chunks into a single response: text appended in order,
-/// tool calls assembled by index (id/name set once, arguments concatenated).
+/// tool calls assembled by index (id/name set once, arguments concatenated),
+/// and the usage from the trailing chunk.
 #[derive(Default)]
 struct StreamState {
     content: String,
     calls: Vec<ToolCall>,
+    usage: Option<Usage>,
 }
 
 impl StreamState {
@@ -397,6 +442,9 @@ impl StreamState {
     /// `false` if `on_delta` requested cancellation.
     fn apply(&mut self, chunk: StreamChunk, on_delta: &mut dyn FnMut(&str) -> bool) -> bool {
         let mut keep_going = true;
+        if let Some(u) = chunk.usage {
+            self.usage = Some(u.into_usage());
+        }
         for choice in chunk.choices {
             if let Some(text) = choice.delta.content
                 && !text.is_empty()
@@ -439,6 +487,7 @@ impl StreamState {
                 .into_iter()
                 .filter(|c| !c.name.is_empty())
                 .collect(),
+            usage: self.usage,
         }
     }
 }
@@ -672,6 +721,45 @@ mod tests {
         // still the auto-detect default.
         assert_eq!(ids, vec!["llama3.1".to_string(), "qwen".to_string()]);
         assert_eq!(ids.first().map(String::as_str), Some("llama3.1"));
+    }
+
+    #[test]
+    fn streaming_request_asks_for_usage() {
+        let req = request("", &[(Role::User, "hi")]);
+        // Streaming sets stream_options.include_usage; buffered omits it.
+        let streamed = serde_json::to_value(to_wire("m", &req, true)).unwrap();
+        assert_eq!(streamed["stream_options"]["include_usage"], true);
+        let buffered = serde_json::to_value(to_wire("m", &req, false)).unwrap();
+        assert!(buffered.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn from_wire_carries_usage() {
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}],
+            "usage":{"prompt_tokens":1234,"completion_tokens":56,"total_tokens":1290}}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let out = from_wire(resp).unwrap();
+        let u = out.usage.expect("usage present");
+        assert_eq!(u.prompt_tokens, 1234);
+        assert_eq!(u.total_tokens, 1290);
+    }
+
+    #[test]
+    fn streaming_captures_the_trailing_usage_chunk() {
+        let mut state = StreamState::default();
+        for line in [
+            r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":99,"completion_tokens":3,"total_tokens":102}}"#,
+            "data: [DONE]",
+        ] {
+            let mut sink = |_: &str| true;
+            if fold_sse_line(line, &mut state, &mut sink) {
+                break;
+            }
+        }
+        let resp = state.finish();
+        assert_eq!(resp.message.content, "hi");
+        assert_eq!(resp.usage.map(|u| u.prompt_tokens), Some(99));
     }
 
     #[test]

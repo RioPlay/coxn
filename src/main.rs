@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
 
-use model::{AnyModel, Message, Role, StubModel};
+use model::{AnyModel, Message, Role, StubModel, Usage};
 use pump::Pump;
 use tools::{AdenTool, EditTool, ReadFileTool, ToolRegistry, WriteTool};
 use tui::{Action, Tui, View, map_input_key, map_modal_key};
@@ -133,11 +133,26 @@ fn boot_status(model_label: &str, task: &str) -> String {
 }
 
 /// The status line: the active model, then aden's savings estimate when there
-/// is one, else the task and a `/help` hint (the [`boot_status`] form).
-fn status_line(dir: &Path, model_label: &str, task: &str) -> String {
-    match aden::savings(dir) {
+/// is one (else the task + `/help` hint), then the context meter once a turn has
+/// reported token usage.
+fn status_line(dir: &Path, model_label: &str, task: &str, usage: Option<Usage>) -> String {
+    let base = match aden::savings(dir) {
         Some(savings) => format!("{model_label}  |  {savings}"),
         None => boot_status(model_label, task),
+    };
+    match usage {
+        Some(u) if u.prompt_tokens > 0 => format!("{base}  |  {}", ctx_meter(u.prompt_tokens)),
+        _ => base,
+    }
+}
+
+/// Format a context-size meter: the prompt tokens sent on the last turn, so the
+/// user can see the conversation growing and `/clear` before it gets unwieldy.
+fn ctx_meter(prompt_tokens: u32) -> String {
+    if prompt_tokens >= 1000 {
+        format!("~{:.1}k ctx", prompt_tokens as f64 / 1000.0)
+    } else {
+        format!("~{prompt_tokens} ctx")
     }
 }
 
@@ -543,7 +558,12 @@ async fn drive(
                             match resolved {
                                 Ok(model) => {
                                     view.output = switch_model(pump, sel, &model);
-                                    view.set_status(status_line(dir, &sel.label(), task));
+                                    view.set_status(status_line(
+                                        dir,
+                                        &sel.label(),
+                                        task,
+                                        pump.last_usage(),
+                                    ));
                                 }
                                 Err(msg) => view.output = msg,
                             }
@@ -552,7 +572,12 @@ async fn drive(
                         Command::Clear => {
                             pump.clear_conversation();
                             view.output.clear();
-                            view.set_status(status_line(dir, &sel.label(), task));
+                            view.set_status(status_line(
+                                dir,
+                                &sel.label(),
+                                task,
+                                pump.last_usage(),
+                            ));
                         }
                         Command::Unknown(c) => {
                             view.output = format!("unknown command: /{c}  (try /help)");
@@ -611,8 +636,8 @@ async fn drive(
                 match result {
                     Ok(_) => {
                         view.output = transcript(pump.messages());
-                        // Refresh the model + savings status after the turn.
-                        let status = status_line(dir, &sel.label(), task);
+                        // Refresh the model + savings + context status after the turn.
+                        let status = status_line(dir, &sel.label(), task, pump.last_usage());
                         view.set_status(if cancelled {
                             format!("{status}  (cancelled)")
                         } else {
