@@ -59,9 +59,9 @@ latter). Tested against the offline aden branch via `COXN_ADEN_BIN`.
 
 GATED on a dependency decision. Not yet approved -- confirm P3.0 before implementing.
 
-* [ ] P3.0 Dependency approval: HTTP client + JSON. Recommend `serde` + `serde_json` + `ureq` (lean, blocking; the loop already blocks). Alternative `reqwest` (async, heavier). FLAG and confirm before adding any dep.
+* [x] P3.0 Dependency approval: `serde` + `serde_json` + `ureq` (json + rustls, default-features off to drop cookies). Approved and added.
 * [x] P3.1 Runtime model selection: `AnyModel` enum the pump is monomorphized over, so the backend is chosen at runtime (per agent/role) not baked into the type. `resolve_model()` in main picks it (stub for now; P3.2 branches on a configured/detected provider). No new deps. 1 dispatch test.
-* [ ] P3.2 `OpenAiCompatModel` backend: `/v1/chat/completions` (messages + tools -> message + tool_calls), non-streaming. Covers LM Studio, Ollama, OpenRouter (-> Claude/GPT/Gemini/...), vLLM, OpenAI.
+* [x] P3.2 `OpenAiCompatModel` backend: `POST {base_url}/chat/completions` via ureq, non-streaming, text turns. Selected by `COXN_MODEL_BASE_URL`/`NAME`/`KEY`. Pure `to_wire`/`from_wire` translation, 5 hermetic tests. Network call unverified in-sandbox (verify with LM Studio/Ollama running). Tool-calling over the wire deferred (needs `tool_call_id` threading on Message + tool schemas on Tool) -- see P3.2b.
 * [ ] P3.3 Local-first auto-detection: probe Ollama `:11434` / LM Studio `:1234`; resolution order env/flag -> `aden config` -> auto-detect -> clear error.
 * [ ] P3.4 Config via `aden config` (`.aden/config.toml`): provider base URLs + per-role models. Secrets (cloud keys) via env only, never committed.
 * [ ] P3.5 Progressive per-role routing (scout/synth/orchestrate) with one-model-works defaults; never a mandatory matrix.
@@ -69,6 +69,7 @@ GATED on a dependency decision. Not yet approved -- confirm P3.0 before implemen
 
 == Phase 3b / later (provider)
 
+* [ ] P3.2b Tool-calling over the wire: enrich `Message` with `tool_call_id` linkage + JSON schemas on `Tool`; reconstruct OpenAI assistant `tool_calls` + `tool` messages; parse `tool_calls` from the response. (Until then the OpenAI backend chats; the stub exercises tools.)
 * [ ] Streaming + Ollama-native `/api/chat` profile (OpenAI-compat drops tool calls under streaming).
 * [ ] Optional Anthropic-direct profile (native prompt caching, exact billing).
 

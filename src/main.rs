@@ -6,6 +6,7 @@
 mod aden;
 mod gate;
 mod model;
+mod openai;
 mod pump;
 mod tools;
 mod tui;
@@ -74,12 +75,22 @@ fn status_line(dir: &Path, base: &str) -> String {
     aden::savings(dir).unwrap_or_else(|| base.to_string())
 }
 
-/// Pick the model backend at runtime. P3.2 branches here on a configured or
-/// auto-detected provider (`base_url` + model) and returns the OpenAI-compatible
-/// backend; until then it is the offline stub. Selection is data, not a type, so
-/// per-role routing and sub-agents drop in without reworking the seam.
+/// Pick the model backend at runtime. A configured `COXN_MODEL_BASE_URL` selects
+/// the OpenAI-compatible backend (LM Studio / Ollama / OpenRouter / ...);
+/// otherwise the offline stub. Local-first auto-detection of a running provider
+/// is P3.3. Selection is data, not a type, so per-role routing and sub-agents
+/// drop in without reworking the seam.
 fn resolve_model() -> AnyModel {
-    AnyModel::Stub(StubModel)
+    match std::env::var("COXN_MODEL_BASE_URL") {
+        Ok(base_url) if !base_url.trim().is_empty() => {
+            let model = std::env::var("COXN_MODEL_NAME").unwrap_or_else(|_| "local".to_string());
+            let key = std::env::var("COXN_MODEL_KEY")
+                .ok()
+                .filter(|k| !k.is_empty());
+            AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(base_url, model, key))
+        }
+        _ => AnyModel::Stub(StubModel),
+    }
 }
 
 /// If `COXN_TASK_NAME` is set, let aden define the scope: run `aden scope` for

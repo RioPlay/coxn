@@ -141,15 +141,18 @@ impl Model for StubModel {
 /// so the actual model is chosen at runtime (per agent / per role) rather than
 /// baked into the type. That is what lets sub-agents and workflows mix models
 /// without reworking the seam. The OpenAI-compatible HTTP backend lands here as
-/// a new variant in P3.2; for now the only backend is the offline stub.
+/// a new variant in P3.2; for now the backends are the offline stub and the
+/// OpenAI-compatible HTTP backend (LM Studio / Ollama / OpenRouter / ...).
 pub enum AnyModel {
     Stub(StubModel),
+    OpenAiCompat(crate::openai::OpenAiCompatModel),
 }
 
 impl Model for AnyModel {
     async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
         match self {
             AnyModel::Stub(model) => model.call(request).await,
+            AnyModel::OpenAiCompat(model) => model.call(request).await,
         }
     }
 }
