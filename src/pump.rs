@@ -68,9 +68,12 @@ pub trait TurnIo {
     }
 }
 
-/// A silent [`TurnIo`]: stream nothing visibly, allow every mutation. Used by
-/// the non-streaming [`Pump::run_turn`] and tests.
+/// A silent [`TurnIo`]: stream nothing, allow every mutation. Test-only -- it
+/// bypasses the approval prompt, so it must never reach production (the live
+/// loop always drives a real [`TurnIo`]).
+#[cfg(test)]
 struct SilentIo;
+#[cfg(test)]
 impl TurnIo for SilentIo {
     fn on_delta(&mut self, _delta: &str) -> bool {
         true
@@ -213,7 +216,7 @@ impl<M: Model> Pump<M> {
     /// [`Pump::run_turn_streaming`]; this is the simple form for tests and any
     /// non-interactive caller. Drives the model, dispatches tools, feeds results
     /// back, and repeats until the model stops calling tools or the hop cap hits.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn run_turn(&mut self) -> Result<String, ModelError> {
         self.run_turn_streaming(&mut SilentIo).await
     }
@@ -610,6 +613,67 @@ mod tests {
             .expect("a tool result");
         assert!(tool_msg.content.contains("declined"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn declined_mutation_without_a_gate_is_not_applied() {
+        // The common post-F4 case: no task scope, approval is the only gate.
+        let dir = temp_dir("decline-nogate");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let args = r#"{"path":"a.txt","old_string":"world","new_string":"there"}"#;
+        let model = ScriptedModel::new(vec![calls_tool("edit", args), assistant("ok")]);
+        let mut pump = Pump::new(model, real_edit_registry(&dir));
+        pump.push_user("edit a.txt");
+        pump.run_turn_streaming(&mut ApproveIo(Approval::Decline))
+            .await
+            .expect("turn");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+        assert!(
+            pump.messages()
+                .iter()
+                .any(|m| m.role == Role::Tool && m.content.contains("declined"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_feeds_results_for_every_remaining_call() {
+        // Two tool calls in one response; CancelTurn must still feed a result for
+        // each (valid tool-call/result pairing) and run neither.
+        let two = ModelResponse {
+            message: Message::new(Role::Assistant, "editing two"),
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".to_string(),
+                    name: "edit".to_string(),
+                    arguments: "a".to_string(),
+                },
+                ToolCall {
+                    id: "c2".to_string(),
+                    name: "edit".to_string(),
+                    arguments: "b".to_string(),
+                },
+            ],
+            usage: None,
+        };
+        let model = ScriptedModel::new(vec![two, assistant("unreached")]);
+        let mut pump = Pump::new(model, edit_registry());
+        pump.push_user("go");
+        let out = pump
+            .run_turn_streaming(&mut ApproveIo(Approval::CancelTurn))
+            .await
+            .expect("turn");
+        assert_eq!(out, "editing two");
+        let tool_msgs: Vec<&str> = pump
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(tool_msgs.len(), 2, "both calls get a result");
+        assert!(tool_msgs.iter().all(|c| c.contains("cancelled")));
+        assert!(tool_msgs.iter().all(|c| !c.contains("edited")));
     }
 
     #[tokio::test]
