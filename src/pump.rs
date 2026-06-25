@@ -92,7 +92,7 @@ impl<M: Model> Pump<M> {
         ModelRequest {
             system: self.system.clone(),
             messages: self.messages.clone(),
-            tools: self.tools.names(),
+            tools: self.tools.advertised_defs(),
         }
     }
 
@@ -103,10 +103,16 @@ impl<M: Model> Pump<M> {
     pub async fn run_turn(&mut self) -> Result<String, ModelError> {
         for _ in 0..MAX_TOOL_HOPS {
             let response = call_model(&self.model, self.request()).await?;
-            self.messages.push(response.message.clone());
+            // The assistant message carries the tool calls it requested, so the
+            // history threads correctly back to a function-calling provider.
+            let content = response.message.content.clone();
+            self.messages.push(Message::assistant(
+                content.clone(),
+                response.tool_calls.clone(),
+            ));
 
             if response.tool_calls.is_empty() {
-                return Ok(response.message.content);
+                return Ok(content);
             }
 
             // Dispatch each tool call and feed the result back as a tool
@@ -131,7 +137,9 @@ impl<M: Model> Pump<M> {
                     }
                     _ => dispatch_result(&self.tools, call),
                 };
-                self.messages.push(Message::new(Role::Tool, content));
+                // The tool result records which call it answers.
+                self.messages
+                    .push(Message::tool_result(call.id.clone(), content));
             }
         }
         Err(ModelError::Backend("tool-hop cap reached".to_string()))
@@ -224,6 +232,28 @@ mod tests {
                 (Role::Assistant, "done"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn tool_calls_and_results_carry_linkage() {
+        let model = ScriptedModel::new(vec![calls_echo("calling", "ping"), assistant("done")]);
+        let mut pump = Pump::new(model, echo_registry());
+        pump.push_user("go");
+        pump.run_turn().await.expect("turn completes");
+
+        let msgs = pump.messages();
+        // The assistant message records the tool call it requested.
+        let assistant = msgs
+            .iter()
+            .find(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+            .expect("assistant message with tool calls");
+        assert_eq!(assistant.tool_calls[0].name, "echo");
+        // The tool result records which call it answers (calls_echo uses id t1).
+        let tool = msgs
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool result");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("t1"));
     }
 
     #[tokio::test]

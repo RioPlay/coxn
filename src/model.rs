@@ -35,19 +35,48 @@ pub enum Role {
     Tool,
 }
 
-/// A single message in the conversation.
+/// A single message in the conversation. `tool_calls` and `tool_call_id` carry
+/// the linkage a function-calling provider needs: an assistant message records
+/// the calls it requested, and a tool message records which call it answers.
+/// Both default empty, so a plain text turn is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// Tool calls the assistant requested in this message (assistant role).
+    pub tool_calls: Vec<ToolCall>,
+    /// The id of the tool call this message answers (tool role).
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
-    /// Convenience constructor.
+    /// A plain message with no tool linkage.
     pub fn new(role: Role, content: impl Into<String>) -> Self {
         Self {
             role,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// An assistant message carrying the tool calls it requested.
+    pub fn assistant(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// A tool-result message answering a specific tool call.
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
@@ -62,14 +91,24 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// A tool definition exposed to the model this turn: name, description, and a
+/// JSON Schema for its arguments. Built by the registry from the advertised
+/// tools; a function-calling provider sends these so the model can call them.
+#[derive(Debug, Clone)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
 /// A request to a model: the bare system prompt, the conversation so far, and
-/// the names of the tools exposed this turn. Tool *schemas* are not carried
-/// here; deferred discovery (Phase 2) decides which load.
+/// the tool definitions exposed this turn (the advertised set; deferred
+/// discovery decides which are advertised).
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
     pub system: String,
     pub messages: Vec<Message>,
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolDef>,
 }
 
 /// A model's response: the assistant message plus any tool calls to run.

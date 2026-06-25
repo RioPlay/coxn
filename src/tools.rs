@@ -9,7 +9,33 @@
 //! Handlers are synchronous for the MVP. I/O-bound tools (real aden calls) may
 //! want async dispatch later; revisit when a real provider lands.
 
-use crate::model::ToolCall;
+use crate::model::{ToolCall, ToolDef};
+
+/// Read a string argument from a tool-call payload. If `arguments` is a JSON
+/// object (what a function-calling provider sends), return its `key` field;
+/// otherwise treat the whole trimmed string as the value (bare-string args from
+/// the stub or tests). This lets one tool serve both call styles.
+fn arg(arguments: &str, key: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        // A JSON object: return the named field, or empty if absent.
+        Ok(v) if v.is_object() => v
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        // Not a JSON object (a bare string from the stub/tests): use it whole.
+        _ => arguments.trim().to_string(),
+    }
+}
+
+/// A JSON Schema for a tool taking a single required string parameter.
+fn one_string_param(name: &str, description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { name: { "type": "string", "description": description } },
+        "required": [name],
+    })
+}
 
 /// The outcome of running a tool: the text fed back to the model as a Tool
 /// message, or an error string. Provider-neutral.
@@ -26,6 +52,11 @@ pub trait Tool {
     /// can find a tool by what it does rather than being shown every schema.
     fn intent(&self) -> &str {
         ""
+    }
+    /// JSON Schema for the tool's arguments, sent to a function-calling provider.
+    /// Defaults to an empty object (no parameters).
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
     }
     /// Whether this tool mutates the working tree. The pump consults the gate
     /// before accepting a mutating tool's effect; read-only tools skip it.
@@ -67,12 +98,22 @@ impl ToolRegistry {
         self.latent.push(tool);
     }
 
-    /// The advertised tool list for a request: the discovery seam plus the
-    /// active tools. Latent tools are intentionally omitted (no bloat).
-    pub fn names(&self) -> Vec<String> {
-        let mut names = vec![DISCOVER.to_string()];
-        names.extend(self.active.iter().map(|t| t.name().to_string()));
-        names
+    /// The advertised tool definitions for a request: the discovery seam plus
+    /// the active tools, each with name, description, and argument schema. Latent
+    /// tools are omitted (the model finds them via the discovery seam).
+    pub fn advertised_defs(&self) -> Vec<ToolDef> {
+        let mut defs = vec![ToolDef {
+            name: DISCOVER.to_string(),
+            description: "Search aden's tool catalog by intent; returns matching tool names."
+                .to_string(),
+            parameters: one_string_param("query", "what you want to do"),
+        }];
+        defs.extend(self.active.iter().map(|t| ToolDef {
+            name: t.name().to_string(),
+            description: t.intent().to_string(),
+            parameters: t.parameters(),
+        }));
+        defs
     }
 
     /// Search latent tools by intent/name for `query` (empty lists all),
@@ -163,12 +204,16 @@ impl Tool for AsmTool {
         "assemble an anchor's graph neighborhood (blast radius and context)"
     }
 
+    fn parameters(&self) -> serde_json::Value {
+        one_string_param("anchor", "the aden anchor to assemble")
+    }
+
     fn run(&self, arguments: &str) -> ToolResult {
-        let anchor = arguments.trim();
+        let anchor = arg(arguments, "anchor");
         if anchor.is_empty() {
             return Err("aden_asm needs an anchor argument".to_string());
         }
-        crate::aden::pull(&self.dir, crate::aden::Pull::Asm(anchor)).map_err(|e| e.to_string())
+        crate::aden::pull(&self.dir, crate::aden::Pull::Asm(&anchor)).map_err(|e| e.to_string())
     }
 }
 
@@ -193,12 +238,16 @@ impl Tool for UnderstandTool {
         "a symbol's definition, callers, and downstream impact"
     }
 
+    fn parameters(&self) -> serde_json::Value {
+        one_string_param("symbol", "the symbol name to understand")
+    }
+
     fn run(&self, arguments: &str) -> ToolResult {
-        let symbol = arguments.trim();
+        let symbol = arg(arguments, "symbol");
         if symbol.is_empty() {
             return Err("aden_understand needs a symbol argument".to_string());
         }
-        crate::aden::pull(&self.dir, crate::aden::Pull::Understand(symbol))
+        crate::aden::pull(&self.dir, crate::aden::Pull::Understand(&symbol))
             .map_err(|e| e.to_string())
     }
 }
@@ -236,13 +285,21 @@ mod tests {
         );
     }
 
+    /// The advertised tool names, for assertions.
+    fn advertised_names(r: &ToolRegistry) -> Vec<String> {
+        r.advertised_defs().into_iter().map(|d| d.name).collect()
+    }
+
     #[test]
-    fn names_advertise_the_discovery_seam_and_active_tools() {
+    fn defs_advertise_the_discovery_seam_and_active_tools() {
         // The discovery seam is always advertised; echo is active.
         assert_eq!(
-            registry().names(),
+            advertised_names(&registry()),
             vec![DISCOVER.to_string(), "echo".to_string()]
         );
+        // Each advertised tool carries an argument schema.
+        let defs = registry().advertised_defs();
+        assert_eq!(defs[0].parameters["type"], "object");
     }
 
     #[test]
@@ -252,7 +309,7 @@ mod tests {
         r.register_latent(Box::new(UnderstandTool::new(PathBuf::from("."))));
 
         // Latent tools stay out of the advertised list (no bloat by default).
-        assert_eq!(r.names(), vec![DISCOVER.to_string()]);
+        assert_eq!(advertised_names(&r), vec![DISCOVER.to_string()]);
 
         // Found by intent through the discovery seam.
         let hits = r
@@ -288,5 +345,17 @@ mod tests {
         let understand = UnderstandTool::new(PathBuf::from("."));
         assert!(asm.run("   ").is_err());
         assert!(understand.run("").is_err());
+        // A JSON object missing the field is also empty -> error.
+        assert!(asm.run("{}").is_err());
+    }
+
+    #[test]
+    fn arg_reads_json_field_or_bare_string() {
+        // Function-calling JSON args: pull the named field.
+        assert_eq!(arg(r#"{"anchor":"foo"}"#, "anchor"), "foo");
+        // Bare-string args (stub/tests): use the whole trimmed value.
+        assert_eq!(arg("  foo  ", "anchor"), "foo");
+        // Missing field -> empty.
+        assert_eq!(arg(r#"{"other":"x"}"#, "anchor"), "");
     }
 }
