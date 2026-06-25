@@ -270,11 +270,33 @@ impl Tool for UnderstandTool {
     }
 }
 
-/// Resolve a tool's `path` argument under the project root. Returns `None` for an
-/// empty path so the pump skips snapshotting.
+/// Resolve a `path` argument under the project root, rejecting anything that
+/// could escape it. An action tool writes to the working tree; the gate only
+/// judges the tree's git diff, so a write outside the tree (an absolute path or
+/// `..`) would land ungated. Only a relative path of normal components is
+/// allowed -- no root, no prefix, no `..`.
+fn project_path(dir: &Path, path: &str) -> Result<PathBuf, String> {
+    if path.trim().is_empty() {
+        return Err("a relative path is required".to_string());
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "path must be relative to the project root with no '..' or absolute segments: {path}"
+                ));
+            }
+        }
+    }
+    Ok(dir.join(path))
+}
+
+/// The file a `path`-taking tool will write, for the pump to snapshot. `None`
+/// when the path is missing or would escape the project root (the run will
+/// reject it too).
 fn rooted_path(dir: &Path, arguments: &str) -> Option<PathBuf> {
-    let path = arg(arguments, "path");
-    (!path.is_empty()).then(|| dir.join(path))
+    project_path(dir, &arg(arguments, "path")).ok()
 }
 
 /// Action tool: replace an exact string in a file. Surgical and token-light --
@@ -324,10 +346,10 @@ impl Tool for EditTool {
         let path = arg(arguments, "path");
         let old = arg(arguments, "old_string");
         let new = arg(arguments, "new_string");
-        if path.is_empty() || old.is_empty() {
-            return Err("edit needs path and old_string".to_string());
+        if old.is_empty() {
+            return Err("edit needs old_string".to_string());
         }
-        let full = self.dir.join(&path);
+        let full = project_path(&self.dir, &path)?;
         let text =
             std::fs::read_to_string(&full).map_err(|e| format!("cannot read {path}: {e}"))?;
         match text.matches(&old).count() {
@@ -388,10 +410,7 @@ impl Tool for WriteTool {
     fn run(&self, arguments: &str) -> ToolResult {
         let path = arg(arguments, "path");
         let content = arg(arguments, "content");
-        if path.is_empty() {
-            return Err("write_file needs a path".to_string());
-        }
-        let full = self.dir.join(&path);
+        let full = project_path(&self.dir, &path)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create directories for {path}: {e}"))?;
@@ -542,6 +561,27 @@ mod tests {
         assert!(ambiguous.unwrap_err().contains("occurs 3 times"));
         // The file is untouched when the edit is rejected.
         assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "a a a");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn action_tools_reject_paths_that_escape_the_project_root() {
+        let dir = temp_dir("escape");
+        let edit = EditTool::new(dir.clone());
+        let write = WriteTool::new(dir.clone());
+        // Absolute and parent-traversal paths are refused before any write, and
+        // expose no target to snapshot.
+        for bad in [
+            r#"{"path":"/etc/passwd","old_string":"x","new_string":"y"}"#,
+            r#"{"path":"../../escape.txt","old_string":"x","new_string":"y"}"#,
+            r#"{"path":"src/../../up.txt","old_string":"x","new_string":"y"}"#,
+        ] {
+            assert!(edit.run(bad).unwrap_err().contains("relative"), "{bad}");
+            assert!(edit.target_path(bad).is_none(), "{bad}");
+        }
+        let bad_write = r#"{"path":"/tmp/coxn-escape-probe","content":"x"}"#;
+        assert!(write.run(bad_write).unwrap_err().contains("relative"));
+        assert!(!std::path::Path::new("/tmp/coxn-escape-probe").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
