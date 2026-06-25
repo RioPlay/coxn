@@ -55,9 +55,9 @@ fn transcript(messages: &[Message]) -> String {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
-    // The MVP wiring: the stub backend, the built-in echo tool, and aden-backed
-    // pull-context tools rooted at the working directory. The model pulls
-    // context (asm/understand) on demand; aden directs, coxn relays.
+    // The wiring: a runtime-selected backend and aden-backed pull-context tools
+    // rooted at the working directory. The model pulls context (asm/understand)
+    // on demand; aden directs, coxn relays.
     let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // Deferred disclosure: only the `aden_tools` discovery seam is advertised;
     // the aden tools are latent, found by intent. No tool bloat by default, and
@@ -65,33 +65,52 @@ async fn main() -> io::Result<()> {
     let mut tools = ToolRegistry::new();
     tools.register_latent(Box::new(AsmTool::new(dir.clone())));
     tools.register_latent(Box::new(UnderstandTool::new(dir.clone())));
+    // Take over the terminal and paint a frame first, so the user sees coxn
+    // start instead of a frozen blank while the aden subprocess calls below
+    // (model resolution, scope, asm context, savings) run -- which can take
+    // several seconds on a large repo.
+    let mut view = View::new();
+    view.set_status("starting coxn...".to_string());
+    let mut tui = Tui::new()?;
+    tui.draw(&view)?;
+
     let (model, mut sel) = resolve_model(&dir);
     let mut pump = Pump::new(model, tools);
+    view.set_status(format!("{}  |  loading...", sel.label()));
+    tui.draw(&view)?;
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: it sets the
     // gate mandate and loads exactly the seeds' context. No task = bare prompt.
     let task = load_task(&dir, &mut pump);
+    // A savings-free status at boot: the `aden status` call it would make is the
+    // slowest aden spawn and is purely cosmetic, so defer it to the first
+    // post-turn refresh and let the user reach the prompt sooner.
+    view.set_status(boot_status(&sel.label(), &task));
 
-    let mut view = View::new();
-    view.set_status(status_line(&dir, &sel.label(), &task));
-
-    let mut tui = Tui::new()?;
     let result = drive(&mut tui, &mut view, &mut pump, &dir, &mut sel, &task).await;
     drop(tui); // restore the terminal before surfacing any error
     result
 }
 
-/// The status line: the active model, then aden's savings estimate when there
-/// is one, else the task and a `/help` hint.
-fn status_line(dir: &Path, model_label: &str, task: &str) -> String {
-    let detail = aden::savings(dir).unwrap_or_else(|| {
-        if task.is_empty() {
-            "/help".to_string()
-        } else {
-            format!("{task}  /help")
-        }
-    });
+/// The boot status line: model and task only, no aden `status` call. Used before
+/// the event loop so the slow savings probe does not delay the first prompt; the
+/// savings appear on the first post-turn [`status_line`] refresh.
+fn boot_status(model_label: &str, task: &str) -> String {
+    let detail = if task.is_empty() {
+        "/help".to_string()
+    } else {
+        format!("{task}  /help")
+    };
     format!("{model_label}  |  {detail}")
+}
+
+/// The status line: the active model, then aden's savings estimate when there
+/// is one, else the task and a `/help` hint (the [`boot_status`] form).
+fn status_line(dir: &Path, model_label: &str, task: &str) -> String {
+    match aden::savings(dir) {
+        Some(savings) => format!("{model_label}  |  {savings}"),
+        None => boot_status(model_label, task),
+    }
 }
 
 /// The live provider connection, kept so `/model` can enumerate and switch
