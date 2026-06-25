@@ -89,9 +89,35 @@ verified against a real third-party codebase.
 * [x] P4.5 Boot UX: paint a frame before the slow aden subprocess calls; defer the cosmetic savings probe off the boot path. No more blank/frozen terminal on a large repo.
 * [x] P4.6 README.md: quickstart, model selection, task mode, slash commands, the aden seam.
 
+== Phase F (featureful but slim): distilled from a recon of two local harnesses
+
+A background workflow aden-explored two local TS harnesses and synthesized a
+slim, no-dep feature plan (all through existing seams). Shipped (frequent atomic
+commits; 101 tests green, clippy/fmt clean, still six deps):
+
+* [x] Tool-surface coherence: `read_file` (verbatim, repo-confined) so `edit`
+  (exact-unique-string) is usable; `aden_grep`/`aden_ask`/`aden_locate` exposed
+  (one `AdenTool` over an `AdenQuery`). Path-escape fix (`project_path`).
+* [x] Hot-model detection: `openai::loaded_models` via the native `/api/v0/models`
+  state endpoint; auto-detect prefers a loaded model; `/model` marks `[loaded]`.
+* [x] TUI polish: wrap + scrollback + input editing + history + role color +
+  activity indicator. Scroll-key fix (Up/Down scroll the transcript; history on
+  Ctrl-P/Ctrl-N). Emacs kill ring (Ctrl-K/U/Y).
+* [x] F1 auto-retry transient errors (cancellable countdown). F2 context meter
+  (`~Nk ctx` from usage). F3 append-only JSONL sessions (`/session`, `/resume`).
+  F4 four-decision approval gate (a `TurnIo` trait: `[o]nce/[s]ession/[d]ecline/
+  [x]cancel`). `/think` (reasoning effort). `/edit` (open in `$EDITOR`). Logo.
+* [x] EDITING SEMANTICS CHANGED (supersedes P4.3): the action tools are now
+  ALWAYS advertised and every mutation needs USER APPROVAL; with a task scope,
+  aden's gate applies on top (approve -> apply -> impact-diff -> revert). Edits
+  no longer require a task scope. Adversarially reviewed; fixed a session-slug
+  path-traversal (must-fix) + approval-on-/clear + cancel-turn status.
+* [~] OSC-133 semantic zones -- SKIPPED: raw escape injection does not fit
+  ratatui's cell-grid alt-screen rendering.
+
 == Phase 5 (later): multi-model workflows and sub-agents
 
-* [ ] Sub-agent = pump instance (model by role + `aden scope` context + tool subset + budget); returns a dense result, not a transcript.
+* [~] Sub-agent = pump instance (model by role + `aden scope` context + tool subset + budget); returns a dense result, not a transcript. PARTITION CONSUMPTION DONE: `agents.rs` parses aden's `scope --agents` index + orders by dependency; `/agents` shows the plan with per-role routed models (live-verified). The autonomous runner (one pump per sub-scope, auto-approved, dense-merge) is the remaining step -- gated on aden non-degenerate partitions + multiple loadable role-models to validate.
 * [ ] Execute `aden scope` manifests + overlap/order; coxn spawns/paces/merges. No planner in coxn (aden owns the partition).
 * [ ] Token-efficiency discipline: disjoint scopes, pull + dense-merge, cheap/local fan-out, one-model-per-subtask for cache, per-agent budgets + adaptive stopping. (Parallelism buys wall-clock, not tokens.)
 
