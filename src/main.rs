@@ -435,6 +435,7 @@ keys:\n  \
 Enter            send         Ctrl-C   cancel a turn / quit when idle\n  \
 Up/Down          scroll chat  PgUp/Dn  scroll a page\n  \
 Ctrl-P/Ctrl-N    input history             Ctrl-W   delete word\n  \
+Ctrl-K/Ctrl-U    cut to end/start          Ctrl-Y   yank (paste)\n  \
 Left/Right Home/End  move cursor\n\
 anything else is sent to the model.";
 
@@ -623,6 +624,9 @@ async fn drive(
             Some(Action::CursorHome) => view.cursor_home(),
             Some(Action::CursorEnd) => view.cursor_end(),
             Some(Action::WordDelete) => view.word_delete(),
+            Some(Action::KillToEnd) => view.kill_to_end(),
+            Some(Action::KillToStart) => view.kill_to_start(),
+            Some(Action::Yank) => view.yank(),
             Some(Action::HistoryPrev) => view.history_prev(),
             Some(Action::HistoryNext) => view.history_next(),
             Some(Action::ScrollUp) => {
