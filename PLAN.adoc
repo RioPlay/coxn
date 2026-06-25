@@ -60,7 +60,7 @@ latter). Tested against the offline aden branch via `COXN_ADEN_BIN`.
 GATED on a dependency decision. Not yet approved -- confirm P3.0 before implementing.
 
 * [ ] P3.0 Dependency approval: HTTP client + JSON. Recommend `serde` + `serde_json` + `ureq` (lean, blocking; the loop already blocks). Alternative `reqwest` (async, heavier). FLAG and confirm before adding any dep.
-* [ ] P3.1 Per-call model selection: `call_model()` takes a model handle `{base_url, model, key}` chosen by role at runtime (not a global type). Land with the first backend so sub-agents/workflows never need a seam retrofit.
+* [x] P3.1 Runtime model selection: `AnyModel` enum the pump is monomorphized over, so the backend is chosen at runtime (per agent/role) not baked into the type. `resolve_model()` in main picks it (stub for now; P3.2 branches on a configured/detected provider). No new deps. 1 dispatch test.
 * [ ] P3.2 `OpenAiCompatModel` backend: `/v1/chat/completions` (messages + tools -> message + tool_calls), non-streaming. Covers LM Studio, Ollama, OpenRouter (-> Claude/GPT/Gemini/...), vLLM, OpenAI.
 * [ ] P3.3 Local-first auto-detection: probe Ollama `:11434` / LM Studio `:1234`; resolution order env/flag -> `aden config` -> auto-detect -> clear error.
 * [ ] P3.4 Config via `aden config` (`.aden/config.toml`): provider base URLs + per-role models. Secrets (cloud keys) via env only, never committed.

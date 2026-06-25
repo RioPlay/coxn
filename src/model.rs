@@ -137,6 +137,23 @@ impl Model for StubModel {
     }
 }
 
+/// The runtime-selected model backend. The pump is monomorphized over this enum,
+/// so the actual model is chosen at runtime (per agent / per role) rather than
+/// baked into the type. That is what lets sub-agents and workflows mix models
+/// without reworking the seam. The OpenAI-compatible HTTP backend lands here as
+/// a new variant in P3.2; for now the only backend is the offline stub.
+pub enum AnyModel {
+    Stub(StubModel),
+}
+
+impl Model for AnyModel {
+    async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        match self {
+            AnyModel::Stub(model) => model.call(request).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +202,14 @@ mod tests {
             .await
             .expect("stub never errors");
         assert_eq!(resp.message.content, "stub: second");
+    }
+
+    #[tokio::test]
+    async fn any_model_dispatches_to_its_backend() {
+        let model = AnyModel::Stub(StubModel);
+        let resp = call_model(&model, request_with("hi"))
+            .await
+            .expect("stub never errors");
+        assert_eq!(resp.message.content, "stub: hi");
     }
 }

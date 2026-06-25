@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
 
-use model::{Message, Role, StubModel};
+use model::{AnyModel, Message, Role, StubModel};
 use pump::Pump;
 use tools::{AsmTool, EchoTool, ToolRegistry, UnderstandTool};
 use tui::{Action, Tui, View, map_input_key, map_modal_key};
@@ -54,7 +54,7 @@ async fn main() -> io::Result<()> {
     tools.register(Box::new(EchoTool));
     tools.register_latent(Box::new(AsmTool::new(dir.clone())));
     tools.register_latent(Box::new(UnderstandTool::new(dir.clone())));
-    let mut pump = Pump::new(StubModel, tools);
+    let mut pump = Pump::new(resolve_model(), tools);
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: it sets the
     // gate mandate and loads exactly the seeds' context. No task = bare prompt.
@@ -74,12 +74,20 @@ fn status_line(dir: &Path, base: &str) -> String {
     aden::savings(dir).unwrap_or_else(|| base.to_string())
 }
 
+/// Pick the model backend at runtime. P3.2 branches here on a configured or
+/// auto-detected provider (`base_url` + model) and returns the OpenAI-compatible
+/// backend; until then it is the offline stub. Selection is data, not a type, so
+/// per-role routing and sub-agents drop in without reworking the seam.
+fn resolve_model() -> AnyModel {
+    AnyModel::Stub(StubModel)
+}
+
 /// If `COXN_TASK_NAME` is set, let aden define the scope: run `aden scope` for
 /// the task's seeds, persist the manifest for the gate, and load exactly the
 /// seeds' assembled context into the pump. Returns the status-line text. No
 /// task means the bare, ungated Phase 1 pump. coxn parses nothing — it gates on
 /// the manifest file and loads context from `aden asm` on its own seed inputs.
-fn load_task(dir: &Path, pump: &mut Pump<StubModel>) -> String {
+fn load_task(dir: &Path, pump: &mut Pump<AnyModel>) -> String {
     let Some(name) = std::env::var("COXN_TASK_NAME")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -133,7 +141,7 @@ fn load_task(dir: &Path, pump: &mut Pump<StubModel>) -> String {
 async fn drive(
     tui: &mut Tui,
     view: &mut View,
-    pump: &mut Pump<StubModel>,
+    pump: &mut Pump<AnyModel>,
     dir: &Path,
     base_status: &str,
 ) -> io::Result<()> {
