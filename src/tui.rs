@@ -558,6 +558,16 @@ impl Tui {
         Ok(())
     }
 
+    /// Leave the alt screen and raw mode, run `f` (which gets the real terminal,
+    /// e.g. to launch `$EDITOR`), then re-enter. Lets coxn shell out to a
+    /// full-screen program and come back cleanly.
+    pub fn run_external<F: FnOnce()>(&mut self, f: F) -> io::Result<()> {
+        ratatui::try_restore().ok();
+        f();
+        self.terminal = ratatui::try_init()?;
+        Ok(())
+    }
+
     /// The current terminal size. Used to compute PageUp/PageDown scroll amounts.
     pub fn size(&self) -> Option<ratatui::layout::Size> {
         self.terminal.size().ok()

@@ -429,6 +429,7 @@ const HELP: &str = "commands:\n  \
 /tools           list the aden tools the model can discover\n  \
 /session         list saved sessions\n  \
 /resume <slug>   load a saved session\n  \
+/edit [path]     open the last-edited file (or path) in $EDITOR\n  \
 /clear           clear the conversation (keeps the task scope)\n  \
 /quit            leave coxn\n\
 keys:\n  \
@@ -452,6 +453,8 @@ enum Command {
     Session,
     /// `/resume <slug>` loads a saved session.
     Resume(Option<String>),
+    /// `/edit [path]` opens the last-edited file (or `path`) in `$EDITOR`.
+    OpenEditor(Option<String>),
     Unknown(String),
 }
 
@@ -468,6 +471,7 @@ fn parse_command(input: &str) -> Command {
         "tools" => Command::Tools,
         "session" | "sessions" => Command::Session,
         "resume" => Command::Resume(arg),
+        "edit" => Command::OpenEditor(arg),
         other => Command::Unknown(other.to_string()),
     }
 }
@@ -681,6 +685,30 @@ async fn drive(
                             }
                         }
                         Command::Tools => view.output = pump.tool_catalog(),
+                        Command::OpenEditor(arg) => {
+                            let full = match arg {
+                                Some(a) => Some(dir.join(a)),
+                                None => pump.last_edited(),
+                            };
+                            view.output = match full {
+                                None => "no file to open (usage: /edit <path>)".to_string(),
+                                Some(path) => {
+                                    let editor = std::env::var("VISUAL")
+                                        .or_else(|_| std::env::var("EDITOR"))
+                                        .unwrap_or_default();
+                                    if editor.trim().is_empty() {
+                                        "set $VISUAL or $EDITOR to open files".to_string()
+                                    } else {
+                                        tui.run_external(|| {
+                                            let _ = std::process::Command::new(&editor)
+                                                .arg(&path)
+                                                .status();
+                                        })?;
+                                        format!("opened {} in {editor}", path.display())
+                                    }
+                                }
+                            };
+                        }
                         Command::Session => view.output = session_listing(&session.slug()),
                         Command::Resume(slug) => {
                             view.output = match slug {
