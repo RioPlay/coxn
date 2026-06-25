@@ -76,10 +76,27 @@ Env vars: `COXN_TASK_NAME`, `COXN_TASK_SEEDS` (comma-separated),
 /help            show help
 /model           list available models (* = active)
 /model <name|#>  switch the active model
+/model @<role>   switch to the model mapped for a role (see Roles below)
 /tools           list the aden tools the model can discover
 /clear           clear the conversation (keeps the task scope)
 /quit            leave coxn
 ```
+
+## Roles (model routing)
+
+Map roles to models in `.aden/config.toml` and switch by role with
+`/model @<role>`:
+
+```sh
+aden config set route.scout       qwen2.5-coder
+aden config set route.synth       <a capable model>
+aden config set route.orchestrate <the strongest model>
+```
+
+Roles are open-vocabulary keys; coxn just looks them up (selection is data, not
+inference). A common split is a cheap/local model for scouting and a stronger one
+for synthesis. This is the seam multi-model sub-agents will use to pick a model
+per scope (see `docs/routing.adoc`).
 
 ## aden
 

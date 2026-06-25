@@ -270,6 +270,16 @@ fn switch_model(pump: &mut Pump<AnyModel>, sel: &mut ModelSel, target: &str) -> 
     format!("switched to {}", sel.name)
 }
 
+/// Resolve a role to a model id via the `[route]` table in `.aden/config.toml`
+/// (`route.<role>`), e.g. `route.scout = "qwen2.5-coder"`. Selection is data: the
+/// role is an opaque key, the map is config, coxn only looks it up. The same
+/// lookup the sub-agent runner (B4) uses to pick a model per scope. `None` when
+/// the role is unmapped. (A future `instance:model` value selects the instance
+/// too; today the value is a model id on the active endpoint.)
+fn resolve_role(dir: &Path, role: &str) -> Option<String> {
+    aden::config_get(dir, &format!("route.{role}"))
+}
+
 /// The minimal operating instruction prepended to the scope context in task
 /// mode. coxn's default prompt is empty (zero-default-context), which leaves a
 /// weak local model passive -- it will not reach for the action tools unprompted
@@ -362,6 +372,7 @@ const HELP: &str = "commands:\n  \
 /help            show this help\n  \
 /model           list available models (* = active)\n  \
 /model <name|#>  switch the active model\n  \
+/model @<role>   switch to the model mapped for a role (route.<role> config)\n  \
 /tools           list the aden tools the model can discover\n  \
 /clear           clear the conversation (keeps the task scope)\n  \
 /quit            leave coxn\n\
@@ -441,8 +452,24 @@ async fn drive(
                         Command::Help => view.output = HELP.to_string(),
                         Command::Model(None) => view.output = model_listing(sel),
                         Command::Model(Some(target)) => {
-                            view.output = switch_model(pump, sel, &target);
-                            view.set_status(status_line(dir, &sel.label(), task));
+                            // `@role` resolves through the [route] table; anything
+                            // else is a model name or index.
+                            let resolved = if let Some(role) = target.strip_prefix('@') {
+                                resolve_role(dir, role).ok_or_else(|| {
+                                    format!(
+                                        "no model mapped for role '@{role}'; set route.{role} via aden config"
+                                    )
+                                })
+                            } else {
+                                Ok(target.clone())
+                            };
+                            match resolved {
+                                Ok(model) => {
+                                    view.output = switch_model(pump, sel, &model);
+                                    view.set_status(status_line(dir, &sel.label(), task));
+                                }
+                                Err(msg) => view.output = msg,
+                            }
                         }
                         Command::Tools => view.output = pump.tool_catalog(),
                         Command::Clear => {
@@ -544,6 +571,11 @@ mod tests {
         assert_eq!(
             parse_command("/model 3"),
             Command::Model(Some("3".to_string()))
+        );
+        // A role switch carries the @-prefixed role as the target.
+        assert_eq!(
+            parse_command("/model @scout"),
+            Command::Model(Some("@scout".to_string()))
         );
         assert_eq!(
             parse_command("/bogus"),
