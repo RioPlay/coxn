@@ -40,12 +40,20 @@ impl std::fmt::Display for AdenError {
 
 impl std::error::Error for AdenError {}
 
-/// What to pull from the graph on the model's behalf.
+/// What to pull from the graph on the model's behalf. Each maps to a read-only
+/// aden subcommand; the model reaches code through these dense, structure-aware
+/// queries rather than raw file reads (aden is the context layer).
 pub enum Pull<'a> {
     /// Assemble the neighborhood for an anchor (`aden asm --from`).
     Asm(&'a str),
     /// Definition + callers + downstream impact for a symbol (`aden understand`).
     Understand(&'a str),
+    /// Structure-aware content search, each hit tagged with its symbol (`aden grep`).
+    Grep(&'a str),
+    /// Natural-language question resolved to a subgraph (`aden ask`).
+    Ask(&'a str),
+    /// A symbol's definition and call sites (`aden locate`).
+    Locate(&'a str),
 }
 
 /// Run the blast-radius gate for `manifest` against the working tree at `dir`.
@@ -106,6 +114,15 @@ fn pull_with(bin: &str, dir: &Path, what: Pull) -> Result<String, AdenError> {
         }
         Pull::Understand(symbol) => {
             cmd.arg("understand").arg(symbol).arg(dir);
+        }
+        Pull::Grep(pattern) => {
+            cmd.arg("grep").arg(pattern).arg(dir);
+        }
+        Pull::Ask(question) => {
+            cmd.arg("ask").arg(question).arg(dir);
+        }
+        Pull::Locate(symbol) => {
+            cmd.arg("locate").arg(symbol).arg(dir);
         }
     }
     run_text(cmd)

@@ -200,73 +200,167 @@ impl Tool for EchoTool {
     }
 }
 
-/// Pull-context tool: assemble an anchor's neighborhood via `aden asm`. The
-/// model calls this to pull blast-radius / context on demand (pull, not push);
-/// the argument is the anchor. aden is the bloat arbiter — coxn only relays.
-pub struct AsmTool {
+/// Which read-only aden query an [`AdenTool`] runs. aden is the context layer:
+/// the model reaches code through these dense, structure-aware queries rather
+/// than raw file reads.
+#[derive(Clone, Copy)]
+enum AdenQuery {
+    Asm,
+    Understand,
+    Grep,
+    Ask,
+    Locate,
+}
+
+/// Pull-context tool over one aden read query. The model calls these to pull
+/// blast-radius, search, and comprehension on demand (pull, not push); aden is
+/// the bloat arbiter and coxn only relays.
+pub struct AdenTool {
+    dir: PathBuf,
+    query: AdenQuery,
+}
+
+impl AdenTool {
+    pub fn asm(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            query: AdenQuery::Asm,
+        }
+    }
+    pub fn understand(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            query: AdenQuery::Understand,
+        }
+    }
+    pub fn grep(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            query: AdenQuery::Grep,
+        }
+    }
+    pub fn ask(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            query: AdenQuery::Ask,
+        }
+    }
+    pub fn locate(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            query: AdenQuery::Locate,
+        }
+    }
+
+    /// The argument key this query reads from the call payload.
+    fn arg_key(&self) -> &'static str {
+        match self.query {
+            AdenQuery::Asm => "anchor",
+            AdenQuery::Understand | AdenQuery::Locate => "symbol",
+            AdenQuery::Grep => "pattern",
+            AdenQuery::Ask => "question",
+        }
+    }
+}
+
+impl Tool for AdenTool {
+    fn name(&self) -> &str {
+        match self.query {
+            AdenQuery::Asm => "aden_asm",
+            AdenQuery::Understand => "aden_understand",
+            AdenQuery::Grep => "aden_grep",
+            AdenQuery::Ask => "aden_ask",
+            AdenQuery::Locate => "aden_locate",
+        }
+    }
+
+    fn intent(&self) -> &str {
+        match self.query {
+            AdenQuery::Asm => "assemble an anchor's graph neighborhood (blast radius and context)",
+            AdenQuery::Understand => "a symbol's definition, callers, and downstream impact",
+            AdenQuery::Grep => "structure-aware code search; each hit tagged with its symbol",
+            AdenQuery::Ask => "ask a natural-language question about the codebase",
+            AdenQuery::Locate => "find a symbol's definition and its call sites",
+        }
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        let key = self.arg_key();
+        let desc = match self.query {
+            AdenQuery::Asm => "the aden anchor to assemble",
+            AdenQuery::Understand => "the symbol name to understand",
+            AdenQuery::Grep => "the search pattern",
+            AdenQuery::Ask => "the question to answer",
+            AdenQuery::Locate => "the symbol name to locate",
+        };
+        one_string_param(key, desc)
+    }
+
+    fn run(&self, arguments: &str) -> ToolResult {
+        let value = arg(arguments, self.arg_key());
+        if value.is_empty() {
+            return Err(format!(
+                "{} needs a {} argument",
+                self.name(),
+                self.arg_key()
+            ));
+        }
+        let pull = match self.query {
+            AdenQuery::Asm => crate::aden::Pull::Asm(&value),
+            AdenQuery::Understand => crate::aden::Pull::Understand(&value),
+            AdenQuery::Grep => crate::aden::Pull::Grep(&value),
+            AdenQuery::Ask => crate::aden::Pull::Ask(&value),
+            AdenQuery::Locate => crate::aden::Pull::Locate(&value),
+        };
+        crate::aden::pull(&self.dir, pull).map_err(|e| e.to_string())
+    }
+}
+
+/// The most a `read_file` returns inline before truncating, so a huge file can
+/// not blow up the context. The model can fall back to `aden_grep` for scale.
+const READ_FILE_CAP: usize = 50_000;
+
+/// Read a file's exact contents under the project root. The companion to `edit`:
+/// the model reads verbatim text here to get the precise `old_string` to replace
+/// (aden's context is dense/summarized, not byte-exact). Read-only, so the pump
+/// does not gate it; confined to the project root like the action tools.
+pub struct ReadFileTool {
     dir: PathBuf,
 }
 
-impl AsmTool {
+impl ReadFileTool {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
 }
 
-impl Tool for AsmTool {
+impl Tool for ReadFileTool {
     fn name(&self) -> &str {
-        "aden_asm"
+        "read_file"
     }
 
     fn intent(&self) -> &str {
-        "assemble an anchor's graph neighborhood (blast radius and context)"
+        "read a file's exact contents (use before edit to get the text to replace)"
     }
 
     fn parameters(&self) -> serde_json::Value {
-        one_string_param("anchor", "the aden anchor to assemble")
+        one_string_param("path", "file path relative to the project root")
     }
 
     fn run(&self, arguments: &str) -> ToolResult {
-        let anchor = arg(arguments, "anchor");
-        if anchor.is_empty() {
-            return Err("aden_asm needs an anchor argument".to_string());
+        let path = arg(arguments, "path");
+        let full = project_path(&self.dir, &path)?;
+        let text =
+            std::fs::read_to_string(&full).map_err(|e| format!("cannot read {path}: {e}"))?;
+        if text.len() > READ_FILE_CAP {
+            let head: String = text.chars().take(READ_FILE_CAP).collect();
+            Ok(format!(
+                "{head}\n[truncated: {path} is {} bytes; use aden_grep to search it]",
+                text.len()
+            ))
+        } else {
+            Ok(text)
         }
-        crate::aden::pull(&self.dir, crate::aden::Pull::Asm(&anchor)).map_err(|e| e.to_string())
-    }
-}
-
-/// Pull-context tool: definition + callers + downstream impact for a symbol via
-/// `aden understand`. The argument is the symbol name.
-pub struct UnderstandTool {
-    dir: PathBuf,
-}
-
-impl UnderstandTool {
-    pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
-    }
-}
-
-impl Tool for UnderstandTool {
-    fn name(&self) -> &str {
-        "aden_understand"
-    }
-
-    fn intent(&self) -> &str {
-        "a symbol's definition, callers, and downstream impact"
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        one_string_param("symbol", "the symbol name to understand")
-    }
-
-    fn run(&self, arguments: &str) -> ToolResult {
-        let symbol = arg(arguments, "symbol");
-        if symbol.is_empty() {
-            return Err("aden_understand needs a symbol argument".to_string());
-        }
-        crate::aden::pull(&self.dir, crate::aden::Pull::Understand(&symbol))
-            .map_err(|e| e.to_string())
     }
 }
 
@@ -473,8 +567,8 @@ mod tests {
     #[test]
     fn latent_tools_are_discoverable_but_not_advertised() {
         let mut r = ToolRegistry::new();
-        r.register_latent(Box::new(AsmTool::new(PathBuf::from("."))));
-        r.register_latent(Box::new(UnderstandTool::new(PathBuf::from("."))));
+        r.register_latent(Box::new(AdenTool::asm(PathBuf::from("."))));
+        r.register_latent(Box::new(AdenTool::understand(PathBuf::from("."))));
 
         // Latent tools stay out of the advertised list (no bloat by default).
         assert_eq!(advertised_names(&r), vec![DISCOVER.to_string()]);
@@ -500,8 +594,8 @@ mod tests {
     #[test]
     fn latent_tools_dispatch_once_known() {
         let mut r = ToolRegistry::new();
-        r.register_latent(Box::new(AsmTool::new(PathBuf::from("."))));
-        // Dispatchable even though latent; empty arg proves AsmTool actually ran.
+        r.register_latent(Box::new(AdenTool::asm(PathBuf::from("."))));
+        // Dispatchable even though latent; empty arg proves the tool actually ran.
         assert!(r.dispatch(&call("aden_asm", "")).is_err());
         // Still unknown if never registered.
         assert!(r.dispatch(&call("ghost", "")).is_err());
@@ -509,8 +603,8 @@ mod tests {
 
     #[test]
     fn aden_tools_reject_empty_arguments() {
-        let asm = AsmTool::new(PathBuf::from("."));
-        let understand = UnderstandTool::new(PathBuf::from("."));
+        let asm = AdenTool::asm(PathBuf::from("."));
+        let understand = AdenTool::understand(PathBuf::from("."));
         assert!(asm.run("   ").is_err());
         assert!(understand.run("").is_err());
         // A JSON object missing the field is also empty -> error.
@@ -547,6 +641,56 @@ mod tests {
         );
         // It declares the file it writes, so the pump can snapshot it.
         assert_eq!(tool.target_path(args), Some(dir.join("f.txt")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn aden_tools_cover_the_read_and_search_surface() {
+        let d = PathBuf::from(".");
+        assert_eq!(AdenTool::asm(d.clone()).name(), "aden_asm");
+        assert_eq!(AdenTool::understand(d.clone()).name(), "aden_understand");
+        assert_eq!(AdenTool::grep(d.clone()).name(), "aden_grep");
+        assert_eq!(AdenTool::ask(d.clone()).name(), "aden_ask");
+        assert_eq!(AdenTool::locate(d.clone()).name(), "aden_locate");
+        // Each is read-only (never gated) and rejects an empty arg before shelling out.
+        let grep = AdenTool::grep(d.clone());
+        assert!(!grep.mutates());
+        assert!(grep.run("{}").is_err());
+        assert!(AdenTool::ask(d).run(r#"{"other":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn read_file_returns_exact_contents_and_confines_to_root() {
+        let dir = temp_dir("read");
+        std::fs::write(dir.join("a.txt"), "exact\ncontents").unwrap();
+        let tool = ReadFileTool::new(dir.clone());
+        assert!(!tool.mutates());
+        assert_eq!(
+            tool.run(r#"{"path":"a.txt"}"#),
+            Ok("exact\ncontents".to_string())
+        );
+        // Reads are confined to the project root, like the action tools.
+        assert!(
+            tool.run(r#"{"path":"/etc/passwd"}"#)
+                .unwrap_err()
+                .contains("relative")
+        );
+        assert!(
+            tool.run(r#"{"path":"../../x"}"#)
+                .unwrap_err()
+                .contains("relative")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_truncates_a_large_file() {
+        let dir = temp_dir("read-big");
+        std::fs::write(dir.join("big.txt"), "x".repeat(READ_FILE_CAP + 100)).unwrap();
+        let out = ReadFileTool::new(dir.clone())
+            .run(r#"{"path":"big.txt"}"#)
+            .unwrap();
+        assert!(out.contains("[truncated"), "{out:.80}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

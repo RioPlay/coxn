@@ -19,7 +19,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 
 use model::{AnyModel, Message, Role, StubModel};
 use pump::Pump;
-use tools::{AsmTool, EditTool, ToolRegistry, UnderstandTool, WriteTool};
+use tools::{AdenTool, EditTool, ReadFileTool, ToolRegistry, WriteTool};
 use tui::{Action, Tui, View, map_input_key, map_modal_key};
 
 /// How long the event loop waits for a key before redrawing.
@@ -60,11 +60,14 @@ async fn main() -> io::Result<()> {
     // on demand; aden directs, coxn relays.
     let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // Deferred disclosure: only the `aden_tools` discovery seam is advertised;
-    // the aden tools are latent, found by intent. No tool bloat by default, and
-    // no useless always-on tool for a model to call gratuitously.
+    // aden's read/search tools (the context layer) are latent, found by intent.
+    // No tool bloat by default.
     let mut tools = ToolRegistry::new();
-    tools.register_latent(Box::new(AsmTool::new(dir.clone())));
-    tools.register_latent(Box::new(UnderstandTool::new(dir.clone())));
+    tools.register_latent(Box::new(AdenTool::asm(dir.clone())));
+    tools.register_latent(Box::new(AdenTool::understand(dir.clone())));
+    tools.register_latent(Box::new(AdenTool::grep(dir.clone())));
+    tools.register_latent(Box::new(AdenTool::ask(dir.clone())));
+    tools.register_latent(Box::new(AdenTool::locate(dir.clone())));
 
     // Take over the terminal and paint a frame first, so the user sees coxn
     // start instead of a frozen blank while the aden subprocess calls below
@@ -82,11 +85,13 @@ async fn main() -> io::Result<()> {
     // A named task (COXN_TASK_NAME) makes aden define the scope: the gate
     // mandate and exactly the seeds' context. No task = bare, ungated prompt.
     let task = load_task(&dir);
-    // The action tools (the LLM acts: edit / write_file) are advertised only
-    // when the scope actually gated: aden gates every edit, and there is no
-    // gate without a scope, so editing is off by default (no ungated edits, no
-    // action surface the model cannot use).
+    // The action set (read_file / edit / write_file) is advertised up front only
+    // when the scope actually gated: aden gates every edit, and there is no gate
+    // without a scope, so editing is off by default (no ungated edits). read_file
+    // is advertised with the editors so the model can fetch the exact text to
+    // replace -- editing without reading would be guesswork.
     if task.gate.is_some() {
+        tools.register(Box::new(ReadFileTool::new(dir.clone())));
         tools.register(Box::new(EditTool::new(dir.clone())));
         tools.register(Box::new(WriteTool::new(dir.clone())));
     }
@@ -288,10 +293,12 @@ fn resolve_role(dir: &Path, role: &str) -> Option<String> {
 /// actually gated, so editing is governed.
 const AGENT_PREAMBLE: &str = "\
 You are coxn, a coding agent working within a task scope that aden defined. To \
-change code, call the `edit` or `write_file` tool with a file path -- do not \
-just print a patch for the user to apply. Every edit is gated by aden against \
-the scope and reverted if it escapes, so keep changes minimal and in scope. \
-Pull more context when you need it via aden_tools, aden_asm, and aden_understand.\n\n\
+change code, call `read_file` to get the exact current text, then `edit` (replace \
+an exact unique string) or `write_file` (whole file) -- do not just print a patch \
+for the user to apply. Every edit is gated by aden against the scope and reverted \
+if it escapes, so keep changes minimal and in scope. To understand or search code, \
+use the aden tools (discover them via `aden_tools`): aden_grep, aden_locate, \
+aden_asm, aden_understand, aden_ask.\n\n\
 === task scope context ===\n\n";
 
 /// The result of resolving a task scope: the status-line text, the gate (when
