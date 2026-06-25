@@ -71,6 +71,62 @@ impl Tool for EchoTool {
     }
 }
 
+use std::path::PathBuf;
+
+/// Pull-context tool: assemble an anchor's neighborhood via `aden asm`. The
+/// model calls this to pull blast-radius / context on demand (pull, not push);
+/// the argument is the anchor. aden is the bloat arbiter — coxn only relays.
+pub struct AsmTool {
+    dir: PathBuf,
+}
+
+impl AsmTool {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+impl Tool for AsmTool {
+    fn name(&self) -> &str {
+        "aden_asm"
+    }
+
+    fn run(&self, arguments: &str) -> ToolResult {
+        let anchor = arguments.trim();
+        if anchor.is_empty() {
+            return Err("aden_asm needs an anchor argument".to_string());
+        }
+        crate::aden::pull(&self.dir, crate::aden::Pull::Asm(anchor)).map_err(|e| e.to_string())
+    }
+}
+
+/// Pull-context tool: definition + callers + downstream impact for a symbol via
+/// `aden understand`. The argument is the symbol name.
+pub struct UnderstandTool {
+    dir: PathBuf,
+}
+
+impl UnderstandTool {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+impl Tool for UnderstandTool {
+    fn name(&self) -> &str {
+        "aden_understand"
+    }
+
+    fn run(&self, arguments: &str) -> ToolResult {
+        let symbol = arguments.trim();
+        if symbol.is_empty() {
+            return Err("aden_understand needs a symbol argument".to_string());
+        }
+        crate::aden::pull(&self.dir, crate::aden::Pull::Understand(symbol))
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +163,24 @@ mod tests {
     #[test]
     fn names_lists_registered_tools() {
         assert_eq!(registry().names(), vec!["echo".to_string()]);
+    }
+
+    #[test]
+    fn aden_tools_register_under_their_names() {
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(AsmTool::new(PathBuf::from("."))));
+        r.register(Box::new(UnderstandTool::new(PathBuf::from("."))));
+        assert_eq!(
+            r.names(),
+            vec!["aden_asm".to_string(), "aden_understand".to_string()]
+        );
+    }
+
+    #[test]
+    fn aden_tools_reject_empty_arguments() {
+        let asm = AsmTool::new(PathBuf::from("."));
+        let understand = UnderstandTool::new(PathBuf::from("."));
+        assert!(asm.run("   ").is_err());
+        assert!(understand.run("").is_err());
     }
 }

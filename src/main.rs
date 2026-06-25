@@ -17,7 +17,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 
 use model::{Message, Role, StubModel};
 use pump::Pump;
-use tools::{EchoTool, ToolRegistry};
+use tools::{AsmTool, EchoTool, ToolRegistry, UnderstandTool};
 use tui::{Action, Tui, View, map_input_key, map_modal_key};
 
 /// How long the event loop waits for a key before redrawing.
@@ -42,9 +42,14 @@ fn transcript(messages: &[Message]) -> String {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
-    // The MVP wiring: the stub backend, one built-in tool, the bare pump.
+    // The MVP wiring: the stub backend, the built-in echo tool, and aden-backed
+    // pull-context tools rooted at the working directory. The model pulls
+    // context (asm/understand) on demand; aden directs, coxn relays.
+    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool));
+    tools.register(Box::new(AsmTool::new(dir.clone())));
+    tools.register(Box::new(UnderstandTool::new(dir)));
     let mut pump = Pump::new(StubModel, tools);
 
     let mut view = View::new();

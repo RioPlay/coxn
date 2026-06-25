@@ -139,6 +139,13 @@ fn run_text(mut cmd: Command) -> Result<String, AdenError> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    /// Serializes the tests that exec a freshly-written script. Writing then
+    /// exec'ing a file while another thread forks can transiently fail with
+    /// ETXTBSY ("text file busy"); holding this for each exec'ing test keeps the
+    /// suite deterministic.
+    static EXEC_LOCK: Mutex<()> = Mutex::new(());
 
     /// Write a throwaway executable standing in for `aden`: echo `stdout`, exit
     /// `code`. Lets us test the seam's exit-code and output handling hermetically.
@@ -156,6 +163,7 @@ mod tests {
 
     #[test]
     fn gate_decodes_exit_code_and_captures_message() {
+        let _serial = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir();
         let manifest = dir.join("m.json");
 
@@ -173,6 +181,7 @@ mod tests {
 
     #[test]
     fn gate_that_cannot_run_is_closed() {
+        let _serial = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let out = gate_with(
             "/nonexistent/coxn/aden",
             &std::env::temp_dir(),
@@ -184,6 +193,7 @@ mod tests {
 
     #[test]
     fn text_commands_return_stdout_or_error() {
+        let _serial = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir();
 
         let good = fake_aden("scope-ok", 0, "{\"name\":\"t\"}");
