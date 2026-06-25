@@ -1,0 +1,131 @@
+= coxn <-> aden contract
+:revdate: 2026-06-24
+:status: provisional (consumer-side; aden side is a Phase 2 blocker)
+:sectanchors:
+:sectnums:
+
+This is the seam that keeps the pump a few hundred lines: the exact shape coxn
+consumes from aden and the exit-code protocol coxn obeys. coxn carries no
+intelligence; it reads these structures verbatim and acts on them.
+
+[IMPORTANT]
+====
+Provisional. `aden scope` and the hard exit-code gate live in the aden repo and
+are not built yet (see PLAN.adoc Phase 2 blockers). This document is coxn's
+consumer-side reading of the manifest and verdict, grounded in aden research
+(`aden-as-directional-harness.adoc`). Field names and verdict labels are fixed
+by that source; the numeric exit-code mapping in <<exit-codes>> is coxn's
+proposal and must be reconciled with aden's implementation before the gate is
+promoted from advisory to hard.
+====
+
+== Scope manifest
+
+aden emits one JSON *scope manifest* per task. coxn consumes it verbatim: it is
+the deterministic, token-budgeted definition of what context and which files a
+task is allowed to touch. No task means a bare prompt; a named task means this
+manifest defines the exact context to load and nothing more.
+
+.Manifest fields
+[cols="1,3a"]
+|===
+| Field | Meaning
+
+| `name`
+| Task name. Identifies the scope; used to label the turn and the gate verdict.
+
+| `seeds`
+| The seed anchors the task is about (the symbols a human or planner named as
+the entry point). Resolved by aden from task text via `locate`/`search`.
+
+| `anchors`
+| The expanded anchor set aden derived from the seeds: community membership of
+each seed, union transitive dependents (`dependents_of`, incoming traversal),
+union direct dependencies at depth 1. This is the task's true graph footprint.
+
+| `files`
+| The *file mandate*: the disjoint list of files the agent may touch. coxn
+treats edits outside this list as a scope escape.
+
+| `context`
+| An object `{anchors, budget}`: the `asm` parameters coxn uses to pre-assemble
+the task's context neighborhood under a token budget. `anchors` is the set to
+assemble; `budget` is the token ceiling.
+
+| `risk`
+| Risk class for the scope: `0` none, `<=5` low, `<=20` medium, else high.
+Surfaced in the status line; higher risk warrants a more conservative gate.
+|===
+
+.Example manifest
+[source,json]
+----
+{
+  "name": "lint-json",
+  "seeds": ["cmd_lint"],
+  "anchors": ["cmd_lint", "fmt_report", "lint_rule"],
+  "files": ["src/lint.rs", "src/fmt.rs"],
+  "context": { "anchors": ["cmd_lint", "fmt_report"], "budget": 8192 },
+  "risk": 3
+}
+----
+
+coxn behavior: load exactly `context` (no more), constrain proposed edits to
+`files`, and label the turn with `name`. coxn never widens the manifest.
+
+[[exit-codes]]
+== The gate: `aden impact-diff --scope <manifest.json>`
+
+Before coxn accepts an edit, it runs `impact-diff` with the task's manifest.
+aden compares the touched symbols and their blast set against the manifest and
+emits a verdict. coxn obeys the exit code; it does not re-judge.
+
+.Verdict, per the aden source
+[cols="1,2,1"]
+|===
+| Verdict | Condition | coxn action
+
+| `in-scope`
+| Touched symbols and their dependents stay within the manifest's anchors and
+file mandate.
+| Proceed: accept the edit.
+
+| `scope-escape`
+| An edit touched a symbol or file outside the mandate.
+| Block: surface the verdict, do not accept the edit.
+
+| `blast-leak`
+| Touched symbols are in-scope, but their dependents reach a *sibling scope*
+(the change's blast radius leaks into another task's mandate).
+| Block: surface the leaked dependents, do not accept the edit.
+|===
+
+aden's rule is "exit nonzero on escape." coxn's proposed exit-code mapping
+(provisional, to reconcile with aden):
+
+[cols="1,2"]
+|===
+| Exit code | Meaning
+
+| `0` | `in-scope` -- proceed
+| `1` | `scope-escape` -- blocked
+| `2` | `blast-leak` -- blocked
+| other nonzero | gate error (aden failed to run); coxn treats as block and surfaces the error
+|===
+
+coxn never proceeds on any nonzero exit. A gate that cannot run is a closed
+gate.
+
+=== Per-symbol blast detail
+
+For surfacing in the status line and the block message, `impact-diff` reports,
+per touched symbol: `{anchor, dependent_count, dependents}` plus the risk class
+(`0` none, `<=5` low, `<=20` medium, else high). coxn renders this only when
+the gate blocks or when there is something worth saying; the gate is otherwise
+silent.
+
+== Provenance
+
+Grounded in aden research, `topics/aden-roadmap/aden-as-directional-harness.adoc`
+(the scope-manifest emission, the `impact-diff --scope` gate, and the risk-class
+thresholds). The blast traversal is aden's `dependents_of` incoming-edge walk.
