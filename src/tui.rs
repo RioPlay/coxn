@@ -441,22 +441,27 @@ pub enum Action {
     CursorEnd,
     /// Delete the word before the cursor (Ctrl-W).
     WordDelete,
-    /// Recall the previous history entry (Up).
+    /// Recall the previous input-history entry (Ctrl-P).
     HistoryPrev,
-    /// Navigate forward in history (Down).
+    /// Navigate forward in input history (Ctrl-N).
     HistoryNext,
-    /// Scroll the output pane up one page.
+    /// Scroll the output pane up a few lines (Up / wheel).
     ScrollUp,
-    /// Scroll the output pane down one page.
+    /// Scroll the output pane down a few lines (Down / wheel).
     ScrollDown,
+    /// Scroll the output pane up a full page (PageUp).
+    PageUp,
+    /// Scroll the output pane down a full page (PageDown).
+    PageDown,
     /// Answer a confirm modal: proceed.
     Confirm,
     /// Answer a confirm modal: block.
     Cancel,
 }
 
-/// Map a key event while typing. `Ctrl-C` quits, Enter submits, Backspace
-/// deletes, and any other printable character is appended. Pure and testable.
+/// Map a key event while typing. Up/Down scroll the transcript (so a mouse
+/// wheel, which many terminals translate to arrow keys in the alt screen,
+/// scrolls the chat); input history is on Ctrl-P / Ctrl-N. Pure and testable.
 pub fn map_input_key(key: KeyEvent) -> Option<Action> {
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Quit),
@@ -467,10 +472,13 @@ pub fn map_input_key(key: KeyEvent) -> Option<Action> {
         (KeyCode::Home, _) => Some(Action::CursorHome),
         (KeyCode::End, _) => Some(Action::CursorEnd),
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => Some(Action::WordDelete),
-        (KeyCode::Up, _) => Some(Action::HistoryPrev),
-        (KeyCode::Down, _) => Some(Action::HistoryNext),
-        (KeyCode::PageUp, _) => Some(Action::ScrollUp),
-        (KeyCode::PageDown, _) => Some(Action::ScrollDown),
+        // Input history lives on Ctrl-P / Ctrl-N so the arrows can scroll.
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(Action::HistoryPrev),
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(Action::HistoryNext),
+        (KeyCode::Up, _) => Some(Action::ScrollUp),
+        (KeyCode::Down, _) => Some(Action::ScrollDown),
+        (KeyCode::PageUp, _) => Some(Action::PageUp),
+        (KeyCode::PageDown, _) => Some(Action::PageDown),
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => Some(Action::Append(c)),
         _ => None,
     }
@@ -723,15 +731,20 @@ mod tests {
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
         let pgup = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
         let pgdn = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
         assert_eq!(map_input_key(left), Some(Action::CursorLeft));
         assert_eq!(map_input_key(right), Some(Action::CursorRight));
         assert_eq!(map_input_key(home), Some(Action::CursorHome));
         assert_eq!(map_input_key(end), Some(Action::CursorEnd));
         assert_eq!(map_input_key(ctrl_w), Some(Action::WordDelete));
-        assert_eq!(map_input_key(up), Some(Action::HistoryPrev));
-        assert_eq!(map_input_key(down), Some(Action::HistoryNext));
-        assert_eq!(map_input_key(pgup), Some(Action::ScrollUp));
-        assert_eq!(map_input_key(pgdn), Some(Action::ScrollDown));
+        // Arrows scroll the transcript (so a wheel scrolls chat); history is Ctrl-P/N.
+        assert_eq!(map_input_key(up), Some(Action::ScrollUp));
+        assert_eq!(map_input_key(down), Some(Action::ScrollDown));
+        assert_eq!(map_input_key(pgup), Some(Action::PageUp));
+        assert_eq!(map_input_key(pgdn), Some(Action::PageDown));
+        assert_eq!(map_input_key(ctrl_p), Some(Action::HistoryPrev));
+        assert_eq!(map_input_key(ctrl_n), Some(Action::HistoryNext));
     }
 
     #[test]
