@@ -64,6 +64,13 @@ impl<M: Model> Pump<M> {
         self.gate = Some(gate);
     }
 
+    /// Swap the model backend, keeping the conversation, tools, gate, and
+    /// context. Lets `/model` switch models mid-session (selection is data, not
+    /// a type).
+    pub fn set_model(&mut self, model: M) {
+        self.model = model;
+    }
+
     /// Load the scope-defined context for a named task into the system prompt.
     /// This is the one sanctioned departure from the zero-default-context floor:
     /// no task means a bare prompt; a named task means aden's scope defines the

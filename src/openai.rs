@@ -33,13 +33,33 @@ pub fn detect() -> Option<(String, String)> {
 /// `None` if the endpoint is unreachable or empty. A short timeout keeps a
 /// stalled server from blocking startup; a refused connection fails instantly.
 fn first_model(base_url: &str) -> Option<String> {
+    fetch_models(base_url, None, 800)?.into_iter().next()
+}
+
+/// Every model id advertised by an OpenAI-compatible `/models` endpoint (LM
+/// Studio and Ollama list all installed models here, loaded or not), or `None`
+/// when the endpoint is unreachable. A longer timeout than [`first_model`]'s
+/// since this is on-demand (`/model`), not the startup path. The key, when set,
+/// authorizes a cloud provider's listing (OpenRouter, OpenAI, ...).
+pub fn list_models(base_url: &str, key: Option<&str>) -> Option<Vec<String>> {
+    fetch_models(base_url, key, 2500)
+}
+
+/// GET `{base_url}/models` and return the advertised ids. Shared by startup
+/// detection and `/model`; `timeout_ms` bounds a stalled server.
+fn fetch_models(base_url: &str, key: Option<&str>, timeout_ms: u64) -> Option<Vec<String>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_millis(800)))
+        .timeout_global(Some(Duration::from_millis(timeout_ms)))
         .build()
         .into();
-    let mut response = agent.get(format!("{base_url}/models")).call().ok()?;
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut request = agent.get(url);
+    if let Some(k) = key {
+        request = request.header("Authorization", &format!("Bearer {k}"));
+    }
+    let mut response = request.call().ok()?;
     let models: ModelsResponse = response.body_mut().read_json().ok()?;
-    models.data.into_iter().next().map(|m| m.id)
+    Some(models.data.into_iter().map(|m| m.id).collect())
 }
 
 #[derive(Deserialize)]
@@ -398,13 +418,14 @@ mod tests {
     }
 
     #[test]
-    fn models_list_parses_first_id() {
+    fn models_list_parses_all_ids() {
         let json = r#"{"object":"list","data":[{"id":"llama3.1","object":"model"},{"id":"qwen"}]}"#;
         let models: ModelsResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            models.data.into_iter().next().map(|m| m.id),
-            Some("llama3.1".to_string())
-        );
+        let ids: Vec<String> = models.data.into_iter().map(|m| m.id).collect();
+        // All advertised models surface (not just the first), and the first is
+        // still the auto-detect default.
+        assert_eq!(ids, vec!["llama3.1".to_string(), "qwen".to_string()]);
+        assert_eq!(ids.first().map(String::as_str), Some("llama3.1"));
     }
 
     #[test]

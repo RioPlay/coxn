@@ -65,7 +65,7 @@ async fn main() -> io::Result<()> {
     let mut tools = ToolRegistry::new();
     tools.register_latent(Box::new(AsmTool::new(dir.clone())));
     tools.register_latent(Box::new(UnderstandTool::new(dir.clone())));
-    let (model, model_label) = resolve_model(&dir);
+    let (model, mut sel) = resolve_model(&dir);
     let mut pump = Pump::new(model, tools);
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: it sets the
@@ -73,10 +73,10 @@ async fn main() -> io::Result<()> {
     let task = load_task(&dir, &mut pump);
 
     let mut view = View::new();
-    view.set_status(status_line(&dir, &model_label, &task));
+    view.set_status(status_line(&dir, &sel.label(), &task));
 
     let mut tui = Tui::new()?;
-    let result = drive(&mut tui, &mut view, &mut pump, &dir, &model_label, &task).await;
+    let result = drive(&mut tui, &mut view, &mut pump, &dir, &mut sel, &task).await;
     drop(tui); // restore the terminal before surfacing any error
     result
 }
@@ -94,17 +94,55 @@ fn status_line(dir: &Path, model_label: &str, task: &str) -> String {
     format!("{model_label}  |  {detail}")
 }
 
-/// Build an OpenAI-compatible model with a status label tagging its source.
+/// The live provider connection, kept so `/model` can enumerate and switch
+/// models at runtime without re-resolving. The stub has no endpoint.
+struct Endpoint {
+    base_url: String,
+    key: Option<String>,
+    source: &'static str,
+}
+
+/// The active model selection: which model, and (for a real provider) where it
+/// lives. Selection is data, so switching is just rebuilding the backend.
+struct ModelSel {
+    name: String,
+    endpoint: Option<Endpoint>,
+}
+
+impl ModelSel {
+    /// The status-line label tagging the model and how it was resolved.
+    fn label(&self) -> String {
+        match &self.endpoint {
+            Some(e) => format!("{} @ {} ({})", self.name, e.base_url, e.source),
+            None => {
+                "stub (no model; start Ollama/LM Studio or set COXN_MODEL_BASE_URL)".to_string()
+            }
+        }
+    }
+}
+
+/// Build an OpenAI-compatible model paired with its selection state.
 fn openai_model(
     base_url: String,
     model: String,
     key: Option<String>,
-    source: &str,
-) -> (AnyModel, String) {
-    let label = format!("{model} @ {base_url} ({source})");
+    source: &'static str,
+) -> (AnyModel, ModelSel) {
+    let backend = AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(
+        base_url.clone(),
+        model.clone(),
+        key.clone(),
+    ));
     (
-        AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(base_url, model, key)),
-        label,
+        backend,
+        ModelSel {
+            name: model,
+            endpoint: Some(Endpoint {
+                base_url,
+                key,
+                source,
+            }),
+        },
     )
 }
 
@@ -115,7 +153,7 @@ fn openai_model(
 /// stub. Selection is data, not a type, so per-role routing and sub-agents drop
 /// in without reworking the seam. The key always comes from the environment,
 /// never the committed config.
-fn resolve_model(dir: &Path) -> (AnyModel, String) {
+fn resolve_model(dir: &Path) -> (AnyModel, ModelSel) {
     let env_key = || {
         std::env::var("COXN_MODEL_KEY")
             .ok()
@@ -141,8 +179,61 @@ fn resolve_model(dir: &Path) -> (AnyModel, String) {
     // 4. Offline stub.
     (
         AnyModel::Stub(StubModel),
-        "stub (no model; start Ollama/LM Studio or set COXN_MODEL_BASE_URL)".to_string(),
+        ModelSel {
+            name: "stub".to_string(),
+            endpoint: None,
+        },
     )
+}
+
+/// Render the `/model` listing: every model the provider advertises (loaded or
+/// not), the active one marked. Falls back to the label when there is no
+/// provider or the listing cannot be fetched.
+fn model_listing(sel: &ModelSel) -> String {
+    let Some(e) = &sel.endpoint else {
+        return format!("model: {}", sel.label());
+    };
+    match openai::list_models(&e.base_url, e.key.as_deref()) {
+        Some(models) if !models.is_empty() => {
+            let mut out = format!("models on {} (/model <name|#> to switch):\n", e.base_url);
+            for (i, m) in models.iter().enumerate() {
+                let mark = if *m == sel.name { '*' } else { ' ' };
+                out.push_str(&format!("  {mark} {:>2}. {m}\n", i + 1));
+            }
+            out.push_str("(* = active)");
+            out
+        }
+        _ => format!(
+            "model: {}  (could not list models from {})",
+            sel.label(),
+            e.base_url
+        ),
+    }
+}
+
+/// Switch the active model to `target` (a 1-based index into the listing or a
+/// model name). A name not in the listing is still allowed so an unloaded model
+/// can be selected (the backend JIT-loads it on first call). Returns the status
+/// message to show.
+fn switch_model(pump: &mut Pump<AnyModel>, sel: &mut ModelSel, target: &str) -> String {
+    let Some(e) = &sel.endpoint else {
+        return "no provider to switch on (offline stub)".to_string();
+    };
+    let listed = openai::list_models(&e.base_url, e.key.as_deref()).unwrap_or_default();
+    let chosen = match target.parse::<usize>() {
+        Ok(n) => match listed.get(n.wrapping_sub(1)) {
+            Some(m) => m.clone(),
+            None => return format!("no model #{n} (there are {})", listed.len()),
+        },
+        Err(_) => target.to_string(),
+    };
+    pump.set_model(AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(
+        e.base_url.clone(),
+        chosen.clone(),
+        e.key.clone(),
+    )));
+    sel.name = chosen;
+    format!("switched to {}", sel.name)
 }
 
 /// If `COXN_TASK_NAME` is set, let aden define the scope: run `aden scope` for
@@ -201,11 +292,12 @@ fn load_task(dir: &Path, pump: &mut Pump<AnyModel>) -> String {
 
 /// Help shown by `/help`.
 const HELP: &str = "commands:\n  \
-/help          show this help\n  \
-/model         show the active model\n  \
-/tools         list the aden tools the model can discover\n  \
-/clear         clear the conversation (keeps the task scope)\n  \
-/quit          leave coxn\n\
+/help            show this help\n  \
+/model           list available models (* = active)\n  \
+/model <name|#>  switch the active model\n  \
+/tools           list the aden tools the model can discover\n  \
+/clear           clear the conversation (keeps the task scope)\n  \
+/quit            leave coxn\n\
 anything else is sent to the model.";
 
 /// A slash command typed into the input line.
@@ -214,23 +306,22 @@ enum Command {
     Help,
     Quit,
     Clear,
-    Model,
+    /// `/model` lists; `/model <name|#>` switches.
+    Model(Option<String>),
     Tools,
     Unknown(String),
 }
 
 /// Parse a leading-slash input into a command. Pure and testable.
 fn parse_command(input: &str) -> Command {
-    let word = input
-        .trim_start_matches('/')
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
+    let mut words = input.trim_start_matches('/').split_whitespace();
+    let word = words.next().unwrap_or("");
+    let arg = words.next().map(|s| s.to_string());
     match word {
         "help" | "h" | "?" => Command::Help,
         "quit" | "q" | "exit" => Command::Quit,
         "clear" => Command::Clear,
-        "model" => Command::Model,
+        "model" => Command::Model(arg),
         "tools" => Command::Tools,
         other => Command::Unknown(other.to_string()),
     }
@@ -243,7 +334,7 @@ async fn drive(
     view: &mut View,
     pump: &mut Pump<AnyModel>,
     dir: &Path,
-    model_label: &str,
+    sel: &mut ModelSel,
     task: &str,
 ) -> io::Result<()> {
     loop {
@@ -281,12 +372,16 @@ async fn drive(
                     match parse_command(text.trim()) {
                         Command::Quit => return Ok(()),
                         Command::Help => view.output = HELP.to_string(),
-                        Command::Model => view.output = format!("model: {model_label}"),
+                        Command::Model(None) => view.output = model_listing(sel),
+                        Command::Model(Some(target)) => {
+                            view.output = switch_model(pump, sel, &target);
+                            view.set_status(status_line(dir, &sel.label(), task));
+                        }
                         Command::Tools => view.output = pump.tool_catalog(),
                         Command::Clear => {
                             pump.clear_conversation();
                             view.output.clear();
-                            view.set_status(status_line(dir, model_label, task));
+                            view.set_status(status_line(dir, &sel.label(), task));
                         }
                         Command::Unknown(c) => {
                             view.output = format!("unknown command: /{c}  (try /help)");
@@ -299,7 +394,7 @@ async fn drive(
                     Ok(_) => {
                         view.output = transcript(pump.messages());
                         // Refresh the model + savings status after the turn.
-                        view.set_status(status_line(dir, model_label, task));
+                        view.set_status(status_line(dir, &sel.label(), task));
                     }
                     Err(err) => {
                         // Keep the error visible (don't let the savings refresh
@@ -358,10 +453,17 @@ mod tests {
         assert_eq!(parse_command("/?"), Command::Help);
         assert_eq!(parse_command("/q"), Command::Quit);
         assert_eq!(parse_command("/clear"), Command::Clear);
-        assert_eq!(parse_command("/model"), Command::Model);
         assert_eq!(parse_command("/tools"), Command::Tools);
-        // Extra args are ignored; the verb decides.
-        assert_eq!(parse_command("/model gpt"), Command::Model);
+        // /model lists; /model <arg> carries the switch target.
+        assert_eq!(parse_command("/model"), Command::Model(None));
+        assert_eq!(
+            parse_command("/model gpt"),
+            Command::Model(Some("gpt".to_string()))
+        );
+        assert_eq!(
+            parse_command("/model 3"),
+            Command::Model(Some("3".to_string()))
+        );
         assert_eq!(
             parse_command("/bogus"),
             Command::Unknown("bogus".to_string())
