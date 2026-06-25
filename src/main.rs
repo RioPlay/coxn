@@ -9,6 +9,7 @@ mod gate;
 mod model;
 mod openai;
 mod pump;
+mod sandbox;
 mod session;
 mod tools;
 mod tui;
@@ -22,7 +23,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
 use model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
 use pump::{Approval, Pump, TurnIo};
-use tools::{AdenTool, EditTool, ReadFileTool, ToolRegistry, WriteTool};
+use tools::{AdenTool, EditTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
 use tui::{
     Action, Menu, MenuItem, MenuKind, Tui, View, map_input_key, map_menu_key, map_modal_key,
 };
@@ -106,6 +107,11 @@ async fn main() -> io::Result<()> {
     tools.register(Box::new(ReadFileTool::new(dir.clone())));
     tools.register(Box::new(EditTool::new(dir.clone())));
     tools.register(Box::new(WriteTool::new(dir.clone())));
+    // run_command lets the model close the edit->build->test loop. It is the
+    // riskiest tool, so it is always approval-gated and confined by bwrap when
+    // present (probed once here; the answer is shown at the approval prompt).
+    let bwrap = sandbox::bwrap_available();
+    tools.register(Box::new(RunTool::new(dir.clone(), bwrap)));
 
     // Take over the terminal and paint a frame first, so the user sees coxn
     // start instead of a frozen blank while the aden subprocess calls below
@@ -137,7 +143,16 @@ async fn main() -> io::Result<()> {
     // post-turn refresh and let the user reach the prompt sooner.
     view.set_status(boot_status(&sel.label(), &task.status));
 
-    let result = drive(&mut tui, &mut view, &mut pump, &dir, &mut sel, &task.status).await;
+    let result = drive(
+        &mut tui,
+        &mut view,
+        &mut pump,
+        &dir,
+        &mut sel,
+        &task.status,
+        bwrap,
+    )
+    .await;
     drop(tui); // restore the terminal before surfacing any error
     result
 }
@@ -518,9 +533,11 @@ You are coxn, a coding agent working within a task scope that aden defined. To \
 change code, call `read_file` to get the exact current text, then `edit` (replace \
 an exact unique string) or `write_file` (whole file) -- do not just print a patch \
 for the user to apply. Every edit is gated by aden against the scope and reverted \
-if it escapes, so keep changes minimal and in scope. To understand or search code, \
-use the aden tools (discover them via `aden_tools`): aden_grep, aden_locate, \
-aden_asm, aden_understand, aden_ask.\n\n\
+if it escapes, so keep changes minimal and in scope. To build, test, run, or use \
+git, call `run_command`: it runs in a sandbox confined to the project, with no \
+network unless you set network:true. Verify your changes by running the tests. To \
+understand or search code, use the aden tools (discover them via `aden_tools`): \
+aden_grep, aden_locate, aden_asm, aden_understand, aden_ask.\n\n\
 === task scope context ===\n\n";
 
 /// The result of resolving a task scope: the status-line text, the gate (when
@@ -618,7 +635,9 @@ Up/Down          scroll chat  PgUp/Dn  scroll a page\n  \
 Ctrl-P/Ctrl-N    input history             Ctrl-W   delete word\n  \
 Ctrl-K/Ctrl-U    cut to end/start          Ctrl-Y   yank (paste)\n  \
 Left/Right Home/End  move cursor\n\
-anything else is sent to the model.";
+anything else is sent to the model.\n\
+the model can run shell commands (sandboxed; network off by default); you \
+approve each one at the prompt.";
 
 /// A slash command typed into the input line.
 #[derive(Debug, PartialEq, Eq)]
@@ -693,12 +712,27 @@ fn pane_dims(tui: &Tui) -> (u16, u16) {
         .unwrap_or((80, 1))
 }
 
-/// Summarize a tool call for the approval prompt: the tool name plus its target
-/// path when it has one.
-fn approval_summary(call: &ToolCall) -> String {
-    let path = serde_json::from_str::<serde_json::Value>(&call.arguments)
-        .ok()
-        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string));
+/// Summarize a tool call for the approval prompt. For `run_command`, show the
+/// command, whether network was requested, and the confinement level (so the
+/// user judges the real risk before approving). For the file tools, the name
+/// plus its target path. `bwrap` is whether sandbox confinement is available.
+fn approval_summary(call: &ToolCall, bwrap: bool) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
+    if call.name == "run_command" {
+        let command = parsed
+            .as_ref()
+            .and_then(|v| v.get("command").and_then(|c| c.as_str()))
+            .unwrap_or("")
+            .trim();
+        let network = parsed
+            .as_ref()
+            .and_then(|v| v.get("network").and_then(|n| n.as_bool()))
+            .unwrap_or(false);
+        let box_tag = if bwrap { "sandbox" } else { "NO SANDBOX" };
+        let net_tag = if network { ", NET ON" } else { "" };
+        return format!("run [{box_tag}{net_tag}]: {command}");
+    }
+    let path = parsed.and_then(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string));
     match path {
         Some(p) => format!("{} {p}", call.name),
         None => call.name.clone(),
@@ -718,6 +752,9 @@ struct DriveIo<'a> {
     /// Set when an approval prompt returned cancel-turn.
     cancel_turn: bool,
     approvals: &'a mut HashSet<String>,
+    /// Whether bwrap confinement is available, surfaced in the run_command
+    /// approval prompt so the user knows the isolation level before approving.
+    bwrap: bool,
 }
 
 impl TurnIo for DriveIo<'_> {
@@ -742,7 +779,7 @@ impl TurnIo for DriveIo<'_> {
         if self.approvals.contains(&call.name) {
             return Approval::Allow;
         }
-        let summary = approval_summary(call);
+        let summary = approval_summary(call, self.bwrap);
         loop {
             self.view.set_status(format!(
                 "approve {summary}?  [o]nce  [s]ession (all {} calls)  [d]ecline  [x] cancel turn",
@@ -785,6 +822,7 @@ async fn drive(
     dir: &Path,
     sel: &mut ModelSel,
     task: &str,
+    bwrap: bool,
 ) -> io::Result<()> {
     // Append-only session persistence: every message not yet written is flushed
     // after each turn. `persisted` tracks how many of pump.messages() are on disk.
@@ -1042,6 +1080,7 @@ async fn drive(
                         cancelled: false,
                         cancel_turn: false,
                         approvals: &mut approvals,
+                        bwrap,
                     };
                     let r = pump.run_turn_streaming(&mut io).await;
                     cancelled = io.cancelled || io.cancel_turn;

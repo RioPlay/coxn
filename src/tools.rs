@@ -30,6 +30,15 @@ fn arg(arguments: &str, key: &str) -> String {
     }
 }
 
+/// Read a boolean argument from a tool-call payload (a JSON object's `key`
+/// field), defaulting to `false` when absent or not a bool.
+fn arg_bool(arguments: &str, key: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| v.get(key).and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
 /// A JSON Schema for a tool taking a single required string parameter.
 fn one_string_param(name: &str, description: &str) -> serde_json::Value {
     serde_json::json!({
@@ -64,6 +73,14 @@ pub trait Tool {
     /// before accepting a mutating tool's effect; read-only tools skip it.
     fn mutates(&self) -> bool {
         false
+    }
+    /// Whether a gate-blocked mutation can be undone by restoring a single-file
+    /// snapshot. True for file edits (they declare a [`Tool::target_path`]);
+    /// false for a command, whose arbitrary effects coxn cannot snapshot -- for
+    /// it the gate degrades to detecting and reporting scope impact rather than
+    /// reverting. Only consulted for mutating tools.
+    fn revertible(&self) -> bool {
+        true
     }
     /// The file this call will write, for a mutating tool, so the pump can
     /// snapshot it before applying and restore it if the gate blocks the edit.
@@ -164,6 +181,13 @@ impl ToolRegistry {
     /// An unknown tool is treated as non-mutating; dispatch handles the error.
     pub fn mutates(&self, name: &str) -> bool {
         self.find(name).map(|t| t.mutates()).unwrap_or(false)
+    }
+
+    /// Whether the named tool's mutation can be reverted by a single-file
+    /// snapshot (file edits) or not (a command). Unknown tools default to
+    /// revertible; dispatch handles the error path.
+    pub fn revertible(&self, name: &str) -> bool {
+        self.find(name).map(|t| t.revertible()).unwrap_or(true)
     }
 
     /// The file a call will write, if its tool declares one. Lets the pump
@@ -514,6 +538,91 @@ impl Tool for WriteTool {
     }
 }
 
+/// Action tool: run a shell command, confined by the sandbox. The riskiest
+/// capability coxn exposes -- arbitrary execution -- so it is always approval
+/// gated (`mutates` is true) and, when bwrap is present, namespace-confined to
+/// the project root with no network by default (see [`crate::sandbox`]). A
+/// command's effects are not a single-file edit, so it is not revertible: the
+/// aden gate degrades to detection-and-report for it (see the pump).
+pub struct RunTool {
+    dir: PathBuf,
+    /// Whether bwrap was found at startup; selects sandbox vs direct-exec.
+    bwrap: bool,
+}
+
+impl RunTool {
+    pub fn new(dir: PathBuf, bwrap: bool) -> Self {
+        Self { dir, bwrap }
+    }
+}
+
+impl Tool for RunTool {
+    fn name(&self) -> &str {
+        "run_command"
+    }
+
+    fn intent(&self) -> &str {
+        "run a shell command in a sandbox (project root writable, no network unless requested) -- use for builds, tests, git, listing files"
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "the shell command to run (sh -c) in the project root" },
+                "network": { "type": "boolean", "description": "set true ONLY if the command needs network access (e.g. fetching dependencies); off by default" },
+            },
+            "required": ["command"],
+        })
+    }
+
+    fn mutates(&self) -> bool {
+        // Not necessarily a mutation, but the riskiest call there is: route it
+        // through the pump's approval gate like the editors.
+        true
+    }
+
+    fn revertible(&self) -> bool {
+        // A command's arbitrary effects cannot be undone by a file snapshot.
+        false
+    }
+
+    fn run(&self, arguments: &str) -> ToolResult {
+        let command = arg(arguments, "command");
+        if command.trim().is_empty() {
+            return Err("run_command needs a command argument".to_string());
+        }
+        let network = arg_bool(arguments, "network");
+        Ok(format_run(&crate::sandbox::run(
+            &self.dir, &command, network, self.bwrap,
+        )))
+    }
+}
+
+/// Render a command's outcome as the text fed back to the model: a sandbox
+/// warning when it ran unconfined, the exit status, then the (capped) output.
+fn format_run(outcome: &crate::sandbox::RunOutcome) -> String {
+    let mut s = String::new();
+    if outcome.confinement == crate::sandbox::Confinement::Unsandboxed {
+        s.push_str("WARNING: bwrap not found; command ran WITHOUT sandbox isolation (approval was the only gate).\n");
+    }
+    if outcome.timed_out {
+        s.push_str("[command timed out and was killed]\n");
+    } else {
+        match outcome.exit_code {
+            Some(0) => s.push_str("exit 0\n"),
+            Some(code) => s.push_str(&format!("exit {code}\n")),
+            None => s.push_str("[killed by signal]\n"),
+        }
+    }
+    if outcome.output.is_empty() {
+        s.push_str("(no output)");
+    } else {
+        s.push_str(&outcome.output);
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,6 +836,38 @@ mod tests {
         assert!(write.run(bad_write).unwrap_err().contains("relative"));
         assert!(!std::path::Path::new("/tmp/coxn-escape-probe").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn arg_bool_reads_json_bool_or_defaults_false() {
+        assert!(arg_bool(r#"{"network":true}"#, "network"));
+        assert!(!arg_bool(r#"{"network":false}"#, "network"));
+        assert!(!arg_bool(r#"{"other":true}"#, "network"));
+        assert!(!arg_bool("not json", "network"));
+    }
+
+    #[test]
+    fn run_tool_is_gated_and_not_revertible() {
+        let tool = RunTool::new(PathBuf::from("."), false);
+        assert_eq!(tool.name(), "run_command");
+        // Always approval-gated, never snapshot-revertible, no single target.
+        assert!(tool.mutates());
+        assert!(!tool.revertible());
+        assert!(tool.target_path(r#"{"command":"ls"}"#).is_none());
+        // An empty command is rejected before launching anything.
+        assert!(tool.run(r#"{"command":"  "}"#).is_err());
+    }
+
+    #[test]
+    fn run_tool_executes_via_fallback_and_reports_exit() {
+        // bwrap=false exercises the portable direct-exec path (no sandbox dep).
+        let tool = RunTool::new(std::env::temp_dir(), false);
+        let out = tool.run(r#"{"command":"printf hello"}"#).expect("runs");
+        assert!(out.contains("exit 0"), "{out}");
+        assert!(out.contains("hello"), "{out}");
+        assert!(out.contains("WITHOUT sandbox"), "fallback warns: {out}");
+        let bad = tool.run(r#"{"command":"exit 7"}"#).expect("runs");
+        assert!(bad.contains("exit 7"), "{bad}");
     }
 
     #[test]
