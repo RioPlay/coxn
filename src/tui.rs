@@ -1,8 +1,8 @@
 //! The TUI chrome: ratatui + crossterm, minimal.
 //!
-//! A streaming output pane and a status line (the confirm modal lands in P1.5).
-//! Immediate-mode render loop: append to a buffer, redraw next frame. No graph
-//! rendering; the inspector stays browser-native (`aden view`).
+//! A streaming output pane, a status line, and a confirm modal overlaid on a
+//! blocked gate. Immediate-mode render loop: append to a buffer, redraw next
+//! frame. No graph rendering; the inspector stays browser-native (`aden view`).
 //!
 //! Alt-screen tradeoff: coxn runs full-screen for layout (the status line needs
 //! it), which loses native terminal scrollback. This is the one real TUI
@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
-use ratatui::widgets::Paragraph;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 /// The view state coxn renders: the streaming output buffer and the status
 /// line. Pure data; [`render`] is a function of it.
@@ -32,6 +32,10 @@ pub struct View {
     pub output: String,
     /// The status line content (savings land here in Phase 2).
     pub status: String,
+    /// A pending confirmation prompt. When set, the modal renders over the pane
+    /// and the modal key mapping applies. The pump sets this (e.g. on a blocked
+    /// gate) and clears it once the user answers.
+    pub modal: Option<String>,
 }
 
 impl View {
@@ -49,6 +53,17 @@ impl View {
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
     }
+
+    /// Raise a confirmation modal with `prompt`. Block on the user's answer
+    /// (proceed / block) is the pump's job; this only sets the view state.
+    pub fn confirm(&mut self, prompt: impl Into<String>) {
+        self.modal = Some(prompt.into());
+    }
+
+    /// Dismiss the modal once answered.
+    pub fn dismiss(&mut self) {
+        self.modal = None;
+    }
 }
 
 /// The visible tail of the output: the last `height` lines, so a streaming pane
@@ -63,14 +78,39 @@ fn visible_tail(output: &str, height: usize) -> String {
     lines[start..].join("\n")
 }
 
+/// A rectangle of `width` x `height` centered in `area`, clamped to fit.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
 /// Render one frame: an output pane filling the screen above a one-row status
-/// line. Pure in `view`; testable with `TestBackend`.
+/// line, with the confirm modal overlaid when active. Pure in `view`; testable
+/// with `TestBackend`.
 pub fn render(frame: &mut Frame, view: &View) {
     let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
     let pane = areas[0];
     let tail = visible_tail(&view.output, pane.height as usize);
     frame.render_widget(Paragraph::new(tail), pane);
     frame.render_widget(Paragraph::new(view.status.as_str()), areas[1]);
+
+    if let Some(prompt) = &view.modal {
+        let hint = "[y] proceed   [n] block";
+        let inner_width = prompt.chars().count().max(hint.len()) as u16;
+        let area = centered_rect(inner_width + 4, 4, frame.area());
+        let block = Block::default().borders(Borders::ALL).title("confirm");
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(format!("{prompt}\n{hint}")).block(block),
+            area,
+        );
+    }
 }
 
 /// A user intent decoded from a key event. The pump decides what to do with it.
@@ -78,6 +118,10 @@ pub fn render(frame: &mut Frame, view: &View) {
 pub enum Action {
     /// Leave the pump.
     Quit,
+    /// Answer a confirm modal: proceed.
+    Confirm,
+    /// Answer a confirm modal: block.
+    Cancel,
 }
 
 /// Map a key event to an action, if any. Pure and testable. `q` or `Ctrl-C`
@@ -86,6 +130,16 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Action::Quit),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Quit),
+        _ => None,
+    }
+}
+
+/// Map a key event while a confirm modal is up. `y`/Enter proceed; `n`/Esc
+/// block. The pump selects this mapping when [`View::modal`] is set.
+pub fn map_modal_key(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Action::Confirm),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
         _ => None,
     }
 }
@@ -186,5 +240,43 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("hello"), "output pane: {text:?}");
         assert!(text.contains("ready"), "status line: {text:?}");
+    }
+
+    #[test]
+    fn modal_keys_map_to_confirm_and_cancel() {
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let other = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(map_modal_key(y), Some(Action::Confirm));
+        assert_eq!(map_modal_key(enter), Some(Action::Confirm));
+        assert_eq!(map_modal_key(n), Some(Action::Cancel));
+        assert_eq!(map_modal_key(esc), Some(Action::Cancel));
+        assert_eq!(map_modal_key(other), None);
+    }
+
+    #[test]
+    fn confirm_and_dismiss_toggle_the_modal() {
+        let mut view = View::new();
+        assert!(view.modal.is_none());
+        view.confirm("scope-escape: src/other.rs");
+        assert_eq!(view.modal.as_deref(), Some("scope-escape: src/other.rs"));
+        view.dismiss();
+        assert!(view.modal.is_none());
+    }
+
+    #[test]
+    fn render_overlays_the_modal_when_active() {
+        let mut view = View::new();
+        view.push("background");
+        view.confirm("blocked");
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("blocked"), "modal prompt: {text:?}");
+        assert!(text.contains("[y] proceed"), "modal hint: {text:?}");
     }
 }
