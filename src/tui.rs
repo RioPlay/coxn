@@ -27,6 +27,32 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+/// What a [`Menu`] selects, so the event loop knows how to act on Enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKind {
+    /// Switch the active model to the selected id.
+    Model,
+    /// Resume the selected session slug.
+    Session,
+}
+
+/// One selectable row: the `value` acted on, and the `label` shown.
+#[derive(Debug, Clone)]
+pub struct MenuItem {
+    pub value: String,
+    pub label: String,
+}
+
+/// An arrow-navigable picker overlaid on the pane. Up/Down move `selected`,
+/// Enter acts on the selected item's `value`, Esc cancels.
+#[derive(Debug, Clone)]
+pub struct Menu {
+    pub kind: MenuKind,
+    pub title: String,
+    pub items: Vec<MenuItem>,
+    pub selected: usize,
+}
+
 /// The view state coxn renders: the streaming output buffer and the status
 /// line. Pure data; [`render`] is a function of it.
 #[derive(Debug, Default)]
@@ -61,6 +87,9 @@ pub struct View {
     /// Kill ring: text cut by Ctrl-K / Ctrl-U, newest last; Ctrl-Y yanks the
     /// most recent. A simple stack (no yank-pop) -- enough to reuse cut text.
     pub kill_ring: Vec<String>,
+    /// An active picker overlay (e.g. `/model`, `/session`). When set, keys
+    /// navigate it instead of editing the input line.
+    pub menu: Option<Menu>,
 }
 
 impl View {
@@ -88,6 +117,33 @@ impl View {
     /// Dismiss the modal once answered.
     pub fn dismiss(&mut self) {
         self.modal = None;
+    }
+
+    /// Open a picker overlay (non-empty menus only).
+    pub fn open_menu(&mut self, menu: Menu) {
+        if !menu.items.is_empty() {
+            self.menu = Some(menu);
+        }
+    }
+
+    /// Close the picker.
+    pub fn close_menu(&mut self) {
+        self.menu = None;
+    }
+
+    /// Move the picker selection by `delta` (wraps at the ends).
+    pub fn menu_move(&mut self, delta: i32) {
+        if let Some(menu) = &mut self.menu {
+            let len = menu.items.len() as i32;
+            if len > 0 {
+                menu.selected = (((menu.selected as i32 + delta) % len + len) % len) as usize;
+            }
+        }
+    }
+
+    /// The selected menu item, if a picker is open.
+    pub fn menu_selected(&self) -> Option<&MenuItem> {
+        self.menu.as_ref().and_then(|m| m.items.get(m.selected))
     }
 
     /// Append a typed character at the cursor position.
@@ -445,6 +501,40 @@ pub fn render(frame: &mut Frame, view: &View) {
             Paragraph::new(format!("{prompt}\n{hint}")).block(block),
             area,
         );
+    } else if let Some(menu) = &view.menu {
+        // The picker overlay: one row per item, the selected one reverse-video.
+        let hint = "Up/Down select - Enter choose - Esc cancel";
+        let width = menu
+            .items
+            .iter()
+            .map(|i| i.label.chars().count())
+            .chain([menu.title.chars().count(), hint.len()])
+            .max()
+            .unwrap_or(0) as u16;
+        let lines: Vec<Line<'static>> = menu
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let style = if i == menu.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(format!(" {} ", item.label), style))
+            })
+            .chain([Line::from(Span::styled(
+                format!(" {hint} "),
+                Style::default().fg(Color::DarkGray),
+            ))])
+            .collect();
+        let height = lines.len() as u16 + 2;
+        let area = centered_rect(width + 4, height, frame.area());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(menu.title.clone());
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
 
@@ -489,6 +579,16 @@ pub enum Action {
     PageUp,
     /// Scroll the output pane down a full page (PageDown).
     PageDown,
+    /// Complete the current input token (Tab).
+    Complete,
+    /// Move the picker selection up.
+    MenuUp,
+    /// Move the picker selection down.
+    MenuDown,
+    /// Act on the selected picker item (Enter).
+    MenuSelect,
+    /// Close the picker without acting (Esc).
+    MenuCancel,
     /// Answer a confirm modal: proceed.
     Confirm,
     /// Answer a confirm modal: block.
@@ -507,6 +607,7 @@ pub fn map_input_key(key: KeyEvent) -> Option<Action> {
         (KeyCode::Right, _) => Some(Action::CursorRight),
         (KeyCode::Home, _) => Some(Action::CursorHome),
         (KeyCode::End, _) => Some(Action::CursorEnd),
+        (KeyCode::Tab, _) => Some(Action::Complete),
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => Some(Action::WordDelete),
         (KeyCode::Char('k'), KeyModifiers::CONTROL) => Some(Action::KillToEnd),
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => Some(Action::KillToStart),
@@ -529,6 +630,22 @@ pub fn map_modal_key(key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
+        _ => None,
+    }
+}
+
+/// Map a key event while a picker is open: Up/Down (or Ctrl-P/Ctrl-N) move the
+/// selection, Enter acts, Esc / Ctrl-C cancels. Selected by [`View::menu`].
+pub fn map_menu_key(key: KeyEvent) -> Option<Action> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, _) | (KeyCode::Char('k' | 'p'), KeyModifiers::CONTROL) => {
+            Some(Action::MenuUp)
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('j' | 'n'), KeyModifiers::CONTROL) => {
+            Some(Action::MenuDown)
+        }
+        (KeyCode::Enter, _) => Some(Action::MenuSelect),
+        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::MenuCancel),
         _ => None,
     }
 }
@@ -688,6 +805,51 @@ mod tests {
         assert_eq!(map_input_key(ck('k')), Some(Action::KillToEnd));
         assert_eq!(map_input_key(ck('u')), Some(Action::KillToStart));
         assert_eq!(map_input_key(ck('y')), Some(Action::Yank));
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(map_input_key(tab), Some(Action::Complete));
+    }
+
+    fn menu_item(s: &str) -> MenuItem {
+        MenuItem {
+            value: s.to_string(),
+            label: s.to_string(),
+        }
+    }
+
+    #[test]
+    fn menu_navigation_wraps_and_selects() {
+        let mut v = View::new();
+        v.open_menu(Menu {
+            kind: MenuKind::Model,
+            title: "m".to_string(),
+            items: vec![menu_item("a"), menu_item("b"), menu_item("c")],
+            selected: 0,
+        });
+        v.menu_move(-1); // wrap up to the last
+        assert_eq!(v.menu_selected().unwrap().value, "c");
+        v.menu_move(1); // wrap back to the first
+        assert_eq!(v.menu_selected().unwrap().value, "a");
+        v.menu_move(1);
+        assert_eq!(v.menu_selected().unwrap().value, "b");
+        v.close_menu();
+        assert!(v.menu.is_none());
+        // An empty menu does not open.
+        v.open_menu(Menu {
+            kind: MenuKind::Session,
+            title: "s".to_string(),
+            items: Vec::new(),
+            selected: 0,
+        });
+        assert!(v.menu.is_none());
+    }
+
+    #[test]
+    fn menu_keys_map_to_actions() {
+        let k = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        assert_eq!(map_menu_key(k(KeyCode::Up)), Some(Action::MenuUp));
+        assert_eq!(map_menu_key(k(KeyCode::Down)), Some(Action::MenuDown));
+        assert_eq!(map_menu_key(k(KeyCode::Enter)), Some(Action::MenuSelect));
+        assert_eq!(map_menu_key(k(KeyCode::Esc)), Some(Action::MenuCancel));
     }
 
     #[test]
