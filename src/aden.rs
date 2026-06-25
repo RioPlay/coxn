@@ -7,14 +7,14 @@
 //! exit-code contract and text output (see docs/contract.adoc) are shaped for
 //! exactly this.
 
-// The seam is wired into the pump in P2.2 (pull-context tools) and P2.3 (gate);
-// allow ahead-of-wiring use until then.
+// gate (P2.3) and pull (P2.2) are wired; scope() is consumed by the
+// scope->context loader in P2.4. Allow until then.
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::gate::GateVerdict;
+use crate::gate::{Gate, GateOutcome, GateVerdict};
 
 /// The aden binary to invoke. `COXN_ADEN_BIN` overrides it (e.g. to point at a
 /// dev build or the offline branch); otherwise `aden` on PATH.
@@ -43,13 +43,6 @@ impl std::fmt::Display for AdenError {
 }
 
 impl std::error::Error for AdenError {}
-
-/// The gate outcome: the verdict coxn obeys plus aden's surfaced message.
-#[derive(Debug)]
-pub struct GateOutcome {
-    pub verdict: GateVerdict,
-    pub message: String,
-}
 
 /// What to pull from the graph on the model's behalf.
 pub enum Pull<'a> {
@@ -120,6 +113,26 @@ fn pull_with(bin: &str, dir: &Path, what: Pull) -> Result<String, AdenError> {
         }
     }
     run_text(cmd)
+}
+
+/// The real blast-radius gate: runs `aden impact-diff --scope` for a fixed
+/// manifest against a working tree. Implements [`Gate`] so the pump can consult
+/// it before accepting an edit without knowing aden exists.
+pub struct AdenGate {
+    dir: PathBuf,
+    manifest: PathBuf,
+}
+
+impl AdenGate {
+    pub fn new(dir: PathBuf, manifest: PathBuf) -> Self {
+        Self { dir, manifest }
+    }
+}
+
+impl Gate for AdenGate {
+    fn check(&self) -> GateOutcome {
+        gate(&self.dir, &self.manifest)
+    }
 }
 
 /// Run a command expecting text on stdout; non-zero exit is an error.

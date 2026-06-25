@@ -21,6 +21,11 @@ pub trait Tool {
     fn name(&self) -> &str;
     /// Run the tool against its raw arguments payload.
     fn run(&self, arguments: &str) -> ToolResult;
+    /// Whether this tool mutates the working tree. The pump consults the gate
+    /// before accepting a mutating tool's effect; read-only tools skip it.
+    fn mutates(&self) -> bool {
+        false
+    }
 }
 
 /// A thin registry: a set of tools dispatched by name. No schemas, no
@@ -54,6 +59,16 @@ impl ToolRegistry {
             Some(tool) => tool.run(&call.arguments),
             None => Err(format!("unknown tool: {}", call.name)),
         }
+    }
+
+    /// Whether the named tool mutates the working tree (so the pump gates it).
+    /// An unknown tool is treated as non-mutating; dispatch handles the error.
+    pub fn mutates(&self, name: &str) -> bool {
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.mutates())
+            .unwrap_or(false)
     }
 }
 

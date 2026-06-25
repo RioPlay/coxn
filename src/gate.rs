@@ -97,6 +97,28 @@ impl GateVerdict {
     }
 }
 
+/// A gate verdict plus the human-readable message aden surfaced with it.
+#[derive(Debug, Clone)]
+pub struct GateOutcome {
+    pub verdict: GateVerdict,
+    pub message: String,
+}
+
+impl GateOutcome {
+    /// Whether the edit may proceed (delegates to the verdict).
+    pub fn proceed(&self) -> bool {
+        self.verdict.proceed()
+    }
+}
+
+/// The blast-radius gate the pump consults before accepting an edit. The real
+/// implementation runs `aden impact-diff --scope`; tests use a fake. Kept a
+/// trait so the pump carries no aden specifics and stays unit-testable.
+pub trait Gate {
+    /// Check the current working-tree edit against the scope manifest.
+    fn check(&self) -> GateOutcome;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

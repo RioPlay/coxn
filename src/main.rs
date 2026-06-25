@@ -49,11 +49,21 @@ async fn main() -> io::Result<()> {
     let mut tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool));
     tools.register(Box::new(AsmTool::new(dir.clone())));
-    tools.register(Box::new(UnderstandTool::new(dir)));
+    tools.register(Box::new(UnderstandTool::new(dir.clone())));
     let mut pump = Pump::new(StubModel, tools);
 
+    // If a scope manifest is configured, gate edits against it (aden directs).
+    let gated = std::env::var_os("COXN_SCOPE_MANIFEST").map(std::path::PathBuf::from);
+    if let Some(manifest) = &gated {
+        pump.set_gate(Box::new(aden::AdenGate::new(dir, manifest.clone())));
+    }
+
     let mut view = View::new();
-    view.set_status("coxn  (stub backend)  Ctrl-C to quit");
+    view.set_status(if gated.is_some() {
+        "coxn  (stub backend, gated)  Ctrl-C to quit"
+    } else {
+        "coxn  (stub backend)  Ctrl-C to quit"
+    });
 
     let mut tui = Tui::new()?;
     let result = drive(&mut tui, &mut view, &mut pump).await;
@@ -99,6 +109,10 @@ async fn drive(tui: &mut Tui, view: &mut View, pump: &mut Pump<StubModel>) -> io
                     view.set_status(format!("error: {err}"));
                 }
                 view.output = transcript(pump.messages());
+                // Surface a gate block from this turn as a confirm modal.
+                if let Some(block) = pump.take_block() {
+                    view.confirm(block.message);
+                }
             }
             _ => {}
         }

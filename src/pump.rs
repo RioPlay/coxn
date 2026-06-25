@@ -10,10 +10,20 @@
 //! at the edit point (a write tool consults `impact-diff --scope` before its
 //! result is accepted). No aden calls happen here yet.
 
+use crate::gate::{Gate, GateOutcome};
 use crate::model::{
-    DEFAULT_SYSTEM_PROMPT, Message, Model, ModelError, ModelRequest, Role, call_model,
+    DEFAULT_SYSTEM_PROMPT, Message, Model, ModelError, ModelRequest, Role, ToolCall, call_model,
 };
 use crate::tools::ToolRegistry;
+
+/// Dispatch a tool call, flattening the result/error into the text fed back to
+/// the model (an unknown tool or a tool error is information, not a failure).
+fn dispatch_result(tools: &ToolRegistry, call: &ToolCall) -> String {
+    match tools.dispatch(call) {
+        Ok(out) => out,
+        Err(err) => err,
+    }
+}
 
 /// The pace cap: the most tool hops the pump runs inside a single user turn
 /// before giving up. Bounds a model that loops; the stub never reaches it.
@@ -27,18 +37,36 @@ pub struct Pump<M: Model> {
     tools: ToolRegistry,
     system: String,
     messages: Vec<Message>,
+    /// The blast-radius gate consulted before a mutating tool runs. None = no
+    /// gate (Phase 1 behavior); Some = aden directs edits.
+    gate: Option<Box<dyn Gate>>,
+    /// The most recent gate block, for the TUI to surface as a modal.
+    last_block: Option<GateOutcome>,
 }
 
 impl<M: Model> Pump<M> {
     /// A pump over `model` and `tools`, starting from the bare system prompt
-    /// (the zero-default-context floor) and an empty conversation.
+    /// (the zero-default-context floor) and an empty conversation, no gate.
     pub fn new(model: M, tools: ToolRegistry) -> Self {
         Self {
             model,
             tools,
             system: DEFAULT_SYSTEM_PROMPT.to_string(),
             messages: Vec::new(),
+            gate: None,
+            last_block: None,
         }
+    }
+
+    /// Install the blast-radius gate; mutating tools are then checked before
+    /// they run.
+    pub fn set_gate(&mut self, gate: Box<dyn Gate>) {
+        self.gate = Some(gate);
+    }
+
+    /// Take the most recent gate block (clears it), for the TUI to surface.
+    pub fn take_block(&mut self) -> Option<GateOutcome> {
+        self.last_block.take()
     }
 
     /// The conversation so far, for rendering the transcript.
@@ -73,12 +101,27 @@ impl<M: Model> Pump<M> {
                 return Ok(response.message.content);
             }
 
-            // Dispatch each tool call and feed the result (or error) back as a
-            // tool message. The gate hook for write tools lands here in Phase 2.
+            // Dispatch each tool call and feed the result back as a tool
+            // message. A mutating tool is gated first: aden directs edits, so a
+            // non-in-scope verdict blocks the tool and feeds the verdict back to
+            // the model (which must adapt) instead of running it.
             for call in &response.tool_calls {
-                let content = match self.tools.dispatch(call) {
-                    Ok(out) => out,
-                    Err(err) => err,
+                // Gate a mutating tool first (owned outcome releases the borrow).
+                let outcome = if self.tools.mutates(&call.name) {
+                    self.gate.as_ref().map(|g| g.check())
+                } else {
+                    None
+                };
+                let content = match outcome {
+                    Some(o) if !o.proceed() => {
+                        let msg = format!(
+                            "EDIT BLOCKED by aden gate: {}. Revise to stay in scope.",
+                            o.message
+                        );
+                        self.last_block = Some(o);
+                        msg
+                    }
+                    _ => dispatch_result(&self.tools, call),
                 };
                 self.messages.push(Message::new(Role::Tool, content));
             }
@@ -209,5 +252,119 @@ mod tests {
         pump.push_user("loop");
         let err = pump.run_turn().await.expect_err("cap reached");
         assert!(matches!(err, ModelError::Backend(_)));
+    }
+
+    use crate::gate::{Gate, GateOutcome, GateVerdict};
+    use crate::tools::{Tool, ToolResult};
+
+    /// A gate that always returns a fixed outcome.
+    struct FakeGate(GateOutcome);
+    impl Gate for FakeGate {
+        fn check(&self) -> GateOutcome {
+            self.0.clone()
+        }
+    }
+
+    /// A mutating tool whose run is observable only when it is actually allowed.
+    struct EditTool;
+    impl Tool for EditTool {
+        fn name(&self) -> &str {
+            "edit"
+        }
+        fn run(&self, _arguments: &str) -> ToolResult {
+            Ok("edited".to_string())
+        }
+        fn mutates(&self) -> bool {
+            true
+        }
+    }
+
+    fn edit_registry() -> ToolRegistry {
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(EditTool));
+        r
+    }
+
+    fn calls_edit(text: &str) -> ModelResponse {
+        ModelResponse {
+            message: Message::new(Role::Assistant, text),
+            tool_calls: vec![ToolCall {
+                id: "e1".to_string(),
+                name: "edit".to_string(),
+                arguments: "lib.rs".to_string(),
+            }],
+        }
+    }
+
+    fn outcome(verdict: GateVerdict, message: &str) -> GateOutcome {
+        GateOutcome {
+            verdict,
+            message: message.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_blocks_a_mutating_tool_and_records_the_block() {
+        let model = ScriptedModel::new(vec![calls_edit("editing"), assistant("revised")]);
+        let mut pump = Pump::new(model, edit_registry());
+        pump.set_gate(Box::new(FakeGate(outcome(
+            GateVerdict::BlastLeak,
+            "gate: BLAST-LEAK",
+        ))));
+        pump.push_user("change lib.rs");
+        let out = pump.run_turn().await.expect("turn completes");
+        assert_eq!(out, "revised");
+
+        let tool_msg = pump
+            .messages()
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool message was fed back");
+        // The edit did NOT run ("edited" never appears); the block is fed back.
+        assert!(tool_msg.content.contains("EDIT BLOCKED"), "{tool_msg:?}");
+        assert!(!tool_msg.content.contains("edited"));
+        // The block is recorded for the TUI to surface, then taken once.
+        assert!(pump.take_block().is_some());
+        assert!(pump.take_block().is_none());
+    }
+
+    #[tokio::test]
+    async fn gate_in_scope_lets_the_edit_run() {
+        let model = ScriptedModel::new(vec![calls_edit("editing"), assistant("done")]);
+        let mut pump = Pump::new(model, edit_registry());
+        pump.set_gate(Box::new(FakeGate(outcome(
+            GateVerdict::InScope,
+            "in-scope",
+        ))));
+        pump.push_user("change lib.rs");
+        pump.run_turn().await.expect("turn completes");
+
+        let tool_msg = pump
+            .messages()
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool message was fed back");
+        assert_eq!(tool_msg.content, "edited");
+        assert!(pump.take_block().is_none());
+    }
+
+    #[tokio::test]
+    async fn non_mutating_tool_is_not_gated() {
+        // Echo is read-only, so even a blocking gate never fires for it.
+        let model = ScriptedModel::new(vec![calls_echo("calling", "ping"), assistant("done")]);
+        let mut pump = Pump::new(model, echo_registry());
+        pump.set_gate(Box::new(FakeGate(outcome(
+            GateVerdict::ScopeEscape,
+            "would block",
+        ))));
+        pump.push_user("go");
+        pump.run_turn().await.expect("turn completes");
+        let tool_msg = pump
+            .messages()
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool ran");
+        assert_eq!(tool_msg.content, "ping");
+        assert!(pump.take_block().is_none());
     }
 }
