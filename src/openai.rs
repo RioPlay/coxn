@@ -11,9 +11,47 @@
 //! Streaming (and Ollama's native `/api/chat`, whose OpenAI-compat layer drops
 //! tool calls under streaming) is a later profile.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Message, Model, ModelError, ModelRequest, ModelResponse, Role, ToolCall};
+
+/// Well-known local providers, probed in order for zero-config startup.
+const LOCAL_CANDIDATES: [&str; 2] = ["http://localhost:11434/v1", "http://localhost:1234/v1"];
+
+/// Probe the well-known local providers (Ollama, LM Studio) and return the
+/// `(base_url, model)` of the first that responds with at least one model.
+/// `None` when nothing is running. This is the local-first, zero-config path.
+pub fn detect() -> Option<(String, String)> {
+    LOCAL_CANDIDATES
+        .iter()
+        .find_map(|base| first_model(base).map(|m| (base.to_string(), m)))
+}
+
+/// The first model id advertised by an OpenAI-compatible `/models` endpoint, or
+/// `None` if the endpoint is unreachable or empty. A short timeout keeps a
+/// stalled server from blocking startup; a refused connection fails instantly.
+fn first_model(base_url: &str) -> Option<String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(800)))
+        .build()
+        .into();
+    let mut response = agent.get(format!("{base_url}/models")).call().ok()?;
+    let models: ModelsResponse = response.body_mut().read_json().ok()?;
+    models.data.into_iter().next().map(|m| m.id)
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
 
 /// An OpenAI-compatible chat backend bound to one model spec.
 pub struct OpenAiCompatModel {
@@ -326,6 +364,16 @@ mod tests {
         assert_eq!(tool["role"], "tool");
         assert_eq!(tool["tool_call_id"], "c1");
         assert_eq!(tool["content"], "result text");
+    }
+
+    #[test]
+    fn models_list_parses_first_id() {
+        let json = r#"{"object":"list","data":[{"id":"llama3.1","object":"model"},{"id":"qwen"}]}"#;
+        let models: ModelsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            models.data.into_iter().next().map(|m| m.id),
+            Some("llama3.1".to_string())
+        );
     }
 
     #[test]

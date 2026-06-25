@@ -55,42 +55,65 @@ async fn main() -> io::Result<()> {
     tools.register(Box::new(EchoTool));
     tools.register_latent(Box::new(AsmTool::new(dir.clone())));
     tools.register_latent(Box::new(UnderstandTool::new(dir.clone())));
-    let mut pump = Pump::new(resolve_model(), tools);
+    let (model, model_label) = resolve_model();
+    let mut pump = Pump::new(model, tools);
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: it sets the
     // gate mandate and loads exactly the seeds' context. No task = bare prompt.
-    let base_status = load_task(&dir, &mut pump);
+    let task = load_task(&dir, &mut pump);
 
     let mut view = View::new();
-    view.set_status(status_line(&dir, &base_status));
+    view.set_status(status_line(&dir, &model_label, &task));
 
     let mut tui = Tui::new()?;
-    let result = drive(&mut tui, &mut view, &mut pump, &dir, &base_status).await;
+    let result = drive(&mut tui, &mut view, &mut pump, &dir, &model_label, &task).await;
     drop(tui); // restore the terminal before surfacing any error
     result
 }
 
-/// The status line: aden's savings estimate when available, else the base text.
-fn status_line(dir: &Path, base: &str) -> String {
-    aden::savings(dir).unwrap_or_else(|| base.to_string())
+/// The status line: the active model, then aden's savings estimate when there
+/// is one, else the task and a `/help` hint.
+fn status_line(dir: &Path, model_label: &str, task: &str) -> String {
+    let detail = aden::savings(dir).unwrap_or_else(|| {
+        if task.is_empty() {
+            "/help".to_string()
+        } else {
+            format!("{task}  /help")
+        }
+    });
+    format!("{model_label}  |  {detail}")
 }
 
-/// Pick the model backend at runtime. A configured `COXN_MODEL_BASE_URL` selects
-/// the OpenAI-compatible backend (LM Studio / Ollama / OpenRouter / ...);
-/// otherwise the offline stub. Local-first auto-detection of a running provider
-/// is P3.3. Selection is data, not a type, so per-role routing and sub-agents
-/// drop in without reworking the seam.
-fn resolve_model() -> AnyModel {
-    match std::env::var("COXN_MODEL_BASE_URL") {
-        Ok(base_url) if !base_url.trim().is_empty() => {
-            let model = std::env::var("COXN_MODEL_NAME").unwrap_or_else(|_| "local".to_string());
-            let key = std::env::var("COXN_MODEL_KEY")
-                .ok()
-                .filter(|k| !k.is_empty());
-            AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(base_url, model, key))
-        }
-        _ => AnyModel::Stub(StubModel),
+/// Pick the model backend at runtime, returning it with a short label for the
+/// status line. Resolution order: an explicit `COXN_MODEL_BASE_URL`, then a
+/// local provider auto-detected on its well-known port (Ollama / LM Studio),
+/// then the offline stub. Selection is data, not a type, so per-role routing and
+/// sub-agents drop in without reworking the seam.
+fn resolve_model() -> (AnyModel, String) {
+    if let Ok(base_url) = std::env::var("COXN_MODEL_BASE_URL")
+        && !base_url.trim().is_empty()
+    {
+        let model = std::env::var("COXN_MODEL_NAME").unwrap_or_else(|_| "local".to_string());
+        let key = std::env::var("COXN_MODEL_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+        let label = format!("{model} @ {base_url}");
+        return (
+            AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(base_url, model, key)),
+            label,
+        );
     }
+    if let Some((base_url, model)) = openai::detect() {
+        let label = format!("{model} @ {base_url} (auto)");
+        return (
+            AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(base_url, model, None)),
+            label,
+        );
+    }
+    (
+        AnyModel::Stub(StubModel),
+        "stub (no model; start Ollama/LM Studio or set COXN_MODEL_BASE_URL)".to_string(),
+    )
 }
 
 /// If `COXN_TASK_NAME` is set, let aden define the scope: run `aden scope` for
@@ -103,7 +126,7 @@ fn load_task(dir: &Path, pump: &mut Pump<AnyModel>) -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
     else {
-        return "coxn  (stub backend)  Ctrl-C to quit".to_string();
+        return String::new();
     };
     let seeds: Vec<String> = std::env::var("COXN_TASK_SEEDS")
         .unwrap_or_default()
@@ -141,7 +164,7 @@ fn load_task(dir: &Path, pump: &mut Pump<AnyModel>) -> String {
     }
 
     format!(
-        "coxn  task '{name}' ({} seed(s){})  Ctrl-C to quit",
+        "task '{name}' ({} seed(s){})",
         seeds.len(),
         if gated { ", gated" } else { "" }
     )
@@ -154,7 +177,8 @@ async fn drive(
     view: &mut View,
     pump: &mut Pump<AnyModel>,
     dir: &Path,
-    base_status: &str,
+    model_label: &str,
+    task: &str,
 ) -> io::Result<()> {
     loop {
         tui.draw(view)?;
@@ -187,12 +211,19 @@ async fn drive(
                     continue;
                 }
                 pump.push_user(text);
-                if let Err(err) = pump.run_turn().await {
-                    view.set_status(format!("error: {err}"));
+                match pump.run_turn().await {
+                    Ok(_) => {
+                        view.output = transcript(pump.messages());
+                        // Refresh the model + savings status after the turn.
+                        view.set_status(status_line(dir, model_label, task));
+                    }
+                    Err(err) => {
+                        // Keep the error visible (don't let the savings refresh
+                        // clobber it); the partial transcript still renders.
+                        view.output = transcript(pump.messages());
+                        view.set_status(format!("error: {err}"));
+                    }
                 }
-                view.output = transcript(pump.messages());
-                // Refresh aden's savings estimate after the turn.
-                view.set_status(status_line(dir, base_status));
                 // Surface a gate block from this turn as a confirm modal.
                 if let Some(block) = pump.take_block() {
                     view.confirm(block.message);
