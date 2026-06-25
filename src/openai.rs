@@ -346,13 +346,17 @@ struct StreamState {
 }
 
 impl StreamState {
-    /// Fold one chunk in, emitting any text fragment through `on_delta`.
-    fn apply(&mut self, chunk: StreamChunk, on_delta: &mut dyn FnMut(&str)) {
+    /// Fold one chunk in, emitting any text fragment through `on_delta`. Returns
+    /// `false` if `on_delta` requested cancellation.
+    fn apply(&mut self, chunk: StreamChunk, on_delta: &mut dyn FnMut(&str) -> bool) -> bool {
+        let mut keep_going = true;
         for choice in chunk.choices {
             if let Some(text) = choice.delta.content
                 && !text.is_empty()
             {
-                on_delta(&text);
+                if !on_delta(&text) {
+                    keep_going = false;
+                }
                 self.content.push_str(&text);
             }
             for tc in choice.delta.tool_calls {
@@ -377,6 +381,7 @@ impl StreamState {
                 }
             }
         }
+        keep_going
     }
 
     fn finish(self) -> ModelResponse {
@@ -391,10 +396,14 @@ impl StreamState {
     }
 }
 
-/// Parse one SSE line into a chunk to fold. Returns `Ok(true)` at the `[DONE]`
-/// sentinel, `Ok(false)` for a line to skip (blank, comment, unparseable), and
-/// `Ok(false)` after applying a data chunk. Lenient by design: providers vary.
-fn fold_sse_line(line: &str, state: &mut StreamState, on_delta: &mut dyn FnMut(&str)) -> bool {
+/// Fold one SSE line, returning `true` to stop the read loop -- at the `[DONE]`
+/// sentinel or when `on_delta` requested cancellation. A blank, comment, or
+/// unparseable line is skipped (`false`). Lenient by design: providers vary.
+fn fold_sse_line(
+    line: &str,
+    state: &mut StreamState,
+    on_delta: &mut dyn FnMut(&str) -> bool,
+) -> bool {
     let Some(data) = line.strip_prefix("data:") else {
         return false;
     };
@@ -403,7 +412,8 @@ fn fold_sse_line(line: &str, state: &mut StreamState, on_delta: &mut dyn FnMut(&
         return true;
     }
     if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-        state.apply(chunk, on_delta);
+        // apply returns false when cancellation was requested -> stop.
+        return !state.apply(chunk, on_delta);
     }
     false
 }
@@ -463,7 +473,7 @@ impl Model for OpenAiCompatModel {
     async fn stream(
         &self,
         request: ModelRequest,
-        on_delta: &mut dyn FnMut(&str),
+        on_delta: &mut dyn FnMut(&str) -> bool,
     ) -> Result<ModelResponse, ModelError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = to_wire(&self.model, &request, true);
@@ -635,7 +645,10 @@ mod tests {
         let mut state = StreamState::default();
         let mut deltas = Vec::new();
         for line in lines {
-            let mut sink = |d: &str| deltas.push(d.to_string());
+            let mut sink = |d: &str| {
+                deltas.push(d.to_string());
+                true
+            };
             if fold_sse_line(line, &mut state, &mut sink) {
                 break;
             }
@@ -657,6 +670,27 @@ mod tests {
         assert_eq!(deltas, vec!["Hel", "lo", " world"]);
         assert_eq!(resp.message.content, "Hello world");
         assert!(resp.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn streaming_stops_when_the_sink_cancels() {
+        let mut state = StreamState::default();
+        let mut seen = 0;
+        let lines = [
+            r#"data: {"choices":[{"delta":{"content":"one"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"two"}}]}"#,
+        ];
+        for line in lines {
+            let mut sink = |_d: &str| {
+                seen += 1;
+                false // request cancellation on the first fragment
+            };
+            if fold_sse_line(line, &mut state, &mut sink) {
+                break;
+            }
+        }
+        assert_eq!(seen, 1, "sink fires once, then the loop stops");
+        assert_eq!(state.finish().message.content, "one");
     }
 
     #[test]

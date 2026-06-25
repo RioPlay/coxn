@@ -486,15 +486,26 @@ async fn drive(
                 pump.push_user(text);
                 // Stream the reply: render the transcript so far plus the
                 // assistant text as it arrives, repainting per fragment. The
-                // event loop is blocked during the call (single-threaded), but
-                // the reply now appears live instead of all at once.
+                // reply appears live instead of all at once, and a Ctrl-C between
+                // fragments cancels the turn (kept partial) rather than quitting.
                 let prior = transcript(pump.messages());
+                let mut cancelled = false;
                 let result = {
                     let mut buf = String::new();
-                    let mut sink = |delta: &str| {
+                    let mut sink = |delta: &str| -> bool {
                         buf.push_str(delta);
                         view.output = format!("{prior}\ncoxn: {buf}");
                         let _ = tui.draw(view);
+                        // Non-blocking cancel check: Ctrl-C aborts the turn.
+                        if let Ok(true) = event::poll(Duration::ZERO)
+                            && let Ok(Event::Key(key)) = event::read()
+                            && key.kind == KeyEventKind::Press
+                            && matches!(map_input_key(key), Some(Action::Quit))
+                        {
+                            cancelled = true;
+                            return false;
+                        }
+                        true
                     };
                     pump.run_turn_streaming(&mut sink).await
                 };
@@ -502,7 +513,12 @@ async fn drive(
                     Ok(_) => {
                         view.output = transcript(pump.messages());
                         // Refresh the model + savings status after the turn.
-                        view.set_status(status_line(dir, &sel.label(), task));
+                        let status = status_line(dir, &sel.label(), task);
+                        view.set_status(if cancelled {
+                            format!("{status}  (cancelled)")
+                        } else {
+                            status
+                        });
                     }
                     Err(err) => {
                         // Keep the error visible (don't let the savings refresh

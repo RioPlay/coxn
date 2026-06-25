@@ -141,27 +141,44 @@ impl<M: Model> Pump<M> {
         }
     }
 
-    /// Drive one user turn to completion: call the model, dispatch any tool
-    /// calls, feed their results back as tool messages, and repeat until the
-    /// model returns no tool calls or the hop cap is reached. Every message is
-    /// appended to the conversation. Returns the final assistant text.
-    /// A non-streaming turn (no delta sink). The live TUI uses
+    /// A non-streaming turn (the delta sink is a no-op). The live TUI uses
     /// [`Pump::run_turn_streaming`]; this is the simple form for tests and any
-    /// non-interactive caller.
+    /// non-interactive caller. Drives the model, dispatches tools, feeds results
+    /// back, and repeats until the model stops calling tools or the hop cap hits.
     #[allow(dead_code)]
     pub async fn run_turn(&mut self) -> Result<String, ModelError> {
-        self.run_turn_streaming(&mut |_| {}).await
+        self.run_turn_streaming(&mut |_| true).await
     }
 
     /// Drive one turn, streaming assistant text fragments through `on_delta` as
-    /// they arrive (for live rendering). Otherwise identical to [`Pump::run_turn`].
+    /// they arrive (for live rendering). `on_delta` returns `false` to cancel:
+    /// the turn stops after the in-flight model reply, the partial text is kept,
+    /// and any partial tool calls are dropped (not dispatched). Otherwise
+    /// identical to [`Pump::run_turn`].
     pub async fn run_turn_streaming(
         &mut self,
-        on_delta: &mut dyn FnMut(&str),
+        on_delta: &mut dyn FnMut(&str) -> bool,
     ) -> Result<String, ModelError> {
         for _ in 0..MAX_TOOL_HOPS {
             let request = self.request();
-            let response = self.model.stream(request, on_delta).await?;
+            // Wrap the sink to notice a cancellation request mid-stream.
+            let mut cancelled = false;
+            let response = {
+                let mut sink = |delta: &str| {
+                    let keep_going = on_delta(delta);
+                    cancelled |= !keep_going;
+                    keep_going
+                };
+                self.model.stream(request, &mut sink).await?
+            };
+            if cancelled {
+                // User aborted: record the partial text, drop partial tool calls,
+                // and end the turn.
+                let content = response.message.content.clone();
+                self.messages
+                    .push(Message::assistant(content.clone(), Vec::new()));
+                return Ok(content);
+            }
             // The assistant message carries the tool calls it requested, so the
             // history threads correctly back to a function-calling provider.
             let content = response.message.content.clone();
@@ -451,6 +468,21 @@ mod tests {
         assert!(!tool_msg.content.contains("edited"));
         // The block is recorded for the TUI to surface, then taken once.
         assert!(pump.take_block().is_some());
+        assert!(pump.take_block().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_drops_partial_tool_calls_and_ends_the_turn() {
+        // The model returns text + a tool call; the sink cancels on the text.
+        let model = ScriptedModel::new(vec![calls_edit("editing"), assistant("unreached")]);
+        let mut pump = Pump::new(model, edit_registry());
+        pump.set_gate(Box::new(FakeGate(outcome(GateVerdict::InScope, "ok"))));
+        pump.push_user("go");
+        let out = pump.run_turn_streaming(&mut |_| false).await.expect("turn");
+        assert_eq!(out, "editing");
+        // The edit was never dispatched (no tool message), and the turn ended
+        // without consuming the second scripted response.
+        assert!(pump.messages().iter().all(|m| m.role != Role::Tool));
         assert!(pump.take_block().is_none());
     }
 

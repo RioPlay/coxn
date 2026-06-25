@@ -146,15 +146,16 @@ pub trait Model {
 
     /// Stream a turn, invoking `on_delta` with each assistant text fragment as it
     /// arrives, and returning the assembled response (full text + any tool calls)
-    /// at the end. The default is non-streaming: call [`Model::call`] and emit the
-    /// whole content once, so a backend opts into streaming by overriding this.
-    /// Not `Send` (the sink is a borrowed `&mut dyn FnMut`); coxn's loop is
-    /// single-threaded, which is also why the blocking read can drive the sink
-    /// directly.
+    /// at the end. `on_delta` returns `false` to request cancellation; the
+    /// backend stops reading and returns what it has so far. The default is
+    /// non-streaming: call [`Model::call`] and emit the whole content once, so a
+    /// backend opts into streaming by overriding this. Not `Send` (the sink is a
+    /// borrowed `&mut dyn FnMut`); coxn's loop is single-threaded, which is also
+    /// why the blocking read can drive the sink directly.
     async fn stream(
         &self,
         request: ModelRequest,
-        on_delta: &mut dyn FnMut(&str),
+        on_delta: &mut dyn FnMut(&str) -> bool,
     ) -> Result<ModelResponse, ModelError> {
         let response = self.call(request).await?;
         if !response.message.content.is_empty() {
@@ -219,7 +220,7 @@ impl Model for AnyModel {
     async fn stream(
         &self,
         request: ModelRequest,
-        on_delta: &mut dyn FnMut(&str),
+        on_delta: &mut dyn FnMut(&str) -> bool,
     ) -> Result<ModelResponse, ModelError> {
         match self {
             AnyModel::Stub(model) => model.stream(request, on_delta).await,
