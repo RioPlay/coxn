@@ -19,24 +19,35 @@ use crossterm::event::{self, Event, KeyEventKind};
 
 use model::{AnyModel, Message, Role, StubModel};
 use pump::Pump;
-use tools::{AsmTool, EchoTool, ToolRegistry, UnderstandTool};
+use tools::{AsmTool, ToolRegistry, UnderstandTool};
 use tui::{Action, Tui, View, map_input_key, map_modal_key};
 
 /// How long the event loop waits for a key before redrawing.
 const TICK: Duration = Duration::from_millis(100);
 
-/// Format the conversation into the output pane text.
+/// Format the conversation into the output pane text. An assistant turn that
+/// only requested tools (no text) renders its calls so the line is not blank.
 fn transcript(messages: &[Message]) -> String {
     messages
         .iter()
-        .map(|m| {
-            let who = match m.role {
-                Role::User => "you",
-                Role::Assistant => "coxn",
-                Role::Tool => "tool",
-                Role::System => "sys",
-            };
-            format!("{who}: {}", m.content)
+        .map(|m| match m.role {
+            Role::User => format!("you: {}", m.content),
+            Role::Tool => format!("tool: {}", m.content),
+            Role::System => format!("sys: {}", m.content),
+            Role::Assistant if m.tool_calls.is_empty() => format!("coxn: {}", m.content),
+            Role::Assistant => {
+                let calls = m
+                    .tool_calls
+                    .iter()
+                    .map(|c| format!("{}({})", c.name, c.arguments))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if m.content.is_empty() {
+                    format!("coxn: → {calls}")
+                } else {
+                    format!("coxn: {}  → {calls}", m.content)
+                }
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -48,11 +59,10 @@ async fn main() -> io::Result<()> {
     // pull-context tools rooted at the working directory. The model pulls
     // context (asm/understand) on demand; aden directs, coxn relays.
     let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    // Deferred disclosure: only the discovery seam (+ echo) is advertised; the
-    // aden tools are latent, found by intent via `aden_tools`. No tool bloat by
-    // default.
+    // Deferred disclosure: only the `aden_tools` discovery seam is advertised;
+    // the aden tools are latent, found by intent. No tool bloat by default, and
+    // no useless always-on tool for a model to call gratuitously.
     let mut tools = ToolRegistry::new();
-    tools.register(Box::new(EchoTool));
     tools.register_latent(Box::new(AsmTool::new(dir.clone())));
     tools.register_latent(Box::new(UnderstandTool::new(dir.clone())));
     let (model, model_label) = resolve_model(&dir);
@@ -319,6 +329,27 @@ mod tests {
             Message::new(Role::Assistant, "stub: hi"),
         ];
         assert_eq!(transcript(&messages), "you: hi\ncoxn: stub: hi");
+    }
+
+    #[test]
+    fn transcript_renders_a_tool_call_turn() {
+        use model::ToolCall;
+        let messages = vec![
+            Message::new(Role::User, "go"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "aden_asm".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("c1", "result"),
+        ];
+        assert_eq!(
+            transcript(&messages),
+            "you: go\ncoxn: → aden_asm({})\ntool: result"
+        );
     }
 
     #[test]

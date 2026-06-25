@@ -88,7 +88,9 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// Add an always-advertised tool.
+    /// Add an always-advertised tool. Kept for harness extension; today only the
+    /// built-in discovery seam is always-on, so the binary registers none.
+    #[allow(dead_code)]
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.active.push(tool);
     }
@@ -166,10 +168,13 @@ impl ToolRegistry {
     }
 }
 
-/// A trivial built-in tool: returns its arguments verbatim. A placeholder that
-/// proves the dispatch path; the real tools are aden's, discovered on demand.
+/// A trivial tool that returns its arguments verbatim. Kept only to exercise the
+/// dispatch path in tests; the live binary advertises no such tool (the real
+/// tools are aden's, discovered on demand), so it is test-only.
+#[cfg(test)]
 pub struct EchoTool;
 
+#[cfg(test)]
 impl Tool for EchoTool {
     fn name(&self) -> &str {
         "echo"
