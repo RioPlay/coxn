@@ -234,12 +234,16 @@ fn model_listing(sel: &ModelSel) -> String {
     };
     match openai::list_models(&e.base_url, e.key.as_deref()) {
         Some(models) if !models.is_empty() => {
+            // Best-effort load state, so the user can pick a hot model and skip a
+            // slow cold load. Empty (no annotations) on servers that do not report it.
+            let loaded = openai::loaded_models(&e.base_url, e.key.as_deref()).unwrap_or_default();
             let mut out = format!("models on {} (/model <name|#> to switch):\n", e.base_url);
             for (i, m) in models.iter().enumerate() {
                 let mark = if *m == sel.name { '*' } else { ' ' };
-                out.push_str(&format!("  {mark} {:>2}. {m}\n", i + 1));
+                let hot = if loaded.contains(m) { "  [loaded]" } else { "" };
+                out.push_str(&format!("  {mark} {:>2}. {m}{hot}\n", i + 1));
             }
-            out.push_str("(* = active)");
+            out.push_str("(* = active, [loaded] = hot in memory)");
             out
         }
         _ => format!(

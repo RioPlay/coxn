@@ -51,12 +51,59 @@ fn model_agent(streaming: bool) -> ureq::Agent {
 }
 
 /// Probe the well-known local providers (Ollama, LM Studio) and return the
-/// `(base_url, model)` of the first that responds with at least one model.
-/// `None` when nothing is running. This is the local-first, zero-config path.
+/// `(base_url, model)` of the first that responds. Prefers a model already
+/// loaded in memory ("hot") when the server reports load state, so `cargo run`
+/// does not pick a cold model that then stalls or fails to load; falls back to
+/// the first advertised model otherwise. `None` when nothing is running.
 pub fn detect() -> Option<(String, String)> {
-    LOCAL_CANDIDATES
-        .iter()
-        .find_map(|base| first_model(base).map(|m| (base.to_string(), m)))
+    LOCAL_CANDIDATES.iter().find_map(|base| {
+        let model = loaded_models(base, None)
+            .and_then(|hot| hot.into_iter().next())
+            .or_else(|| first_model(base))?;
+        Some((base.to_string(), model))
+    })
+}
+
+/// Best-effort set of currently-loaded ("hot") model ids, via a server's native
+/// load-state endpoint. The chat-completions `/v1/models` does not carry load
+/// state; some local servers expose it at `/api/v0/models` with a `state` field.
+/// `None` for any server that does not expose it -- callers then simply omit the
+/// hot/cold distinction. The `/v1` suffix is dropped to reach the native root.
+pub fn loaded_models(base_url: &str, key: Option<&str>) -> Option<Vec<String>> {
+    let trimmed = base_url.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    let url = format!("{root}/api/v0/models");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(1500)))
+        .build()
+        .into();
+    let mut request = agent.get(url);
+    if let Some(k) = key {
+        request = request.header("Authorization", &format!("Bearer {k}"));
+    }
+    let mut response = request.call().ok()?;
+    let parsed: NativeModels = response.body_mut().read_json().ok()?;
+    Some(
+        parsed
+            .data
+            .into_iter()
+            .filter(|m| m.state.as_deref() == Some("loaded"))
+            .map(|m| m.id)
+            .collect(),
+    )
+}
+
+#[derive(Deserialize)]
+struct NativeModels {
+    #[serde(default)]
+    data: Vec<NativeModel>,
+}
+
+#[derive(Deserialize)]
+struct NativeModel {
+    id: String,
+    #[serde(default)]
+    state: Option<String>,
 }
 
 /// The first model id advertised by an OpenAI-compatible `/models` endpoint, or
@@ -625,6 +672,23 @@ mod tests {
         // still the auto-detect default.
         assert_eq!(ids, vec!["llama3.1".to_string(), "qwen".to_string()]);
         assert_eq!(ids.first().map(String::as_str), Some("llama3.1"));
+    }
+
+    #[test]
+    fn native_models_parses_only_loaded_ids() {
+        let json = r#"{"data":[
+            {"id":"hot-a","state":"loaded","type":"llm"},
+            {"id":"cold-b","state":"not-loaded","type":"llm"},
+            {"id":"hot-c","state":"loaded"}
+        ]}"#;
+        let parsed: NativeModels = serde_json::from_str(json).unwrap();
+        let loaded: Vec<String> = parsed
+            .data
+            .into_iter()
+            .filter(|m| m.state.as_deref() == Some("loaded"))
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(loaded, vec!["hot-a".to_string(), "hot-c".to_string()]);
     }
 
     #[test]
