@@ -300,36 +300,55 @@ impl<M: Model> Pump<M> {
     /// runs the gate, and reverts the file on a block. Returns the text fed back
     /// to the model.
     fn run_gated_mutation(&mut self, call: &ToolCall) -> String {
-        // The user already approved this call. Snapshot the target before
-        // applying, so a gate-blocked edit can be reverted.
+        // A file edit can be undone by restoring a single-file snapshot; a
+        // command's arbitrary effects cannot, so it skips the snapshot and the
+        // gate degrades to detection-and-report rather than reverting.
+        let revertible = self.tools.revertible(&call.name);
+        // The user already approved this call. Snapshot the target (if any)
+        // before applying, so a gate-blocked edit can be reverted.
         let path = self.tools.target_path(call);
-        let snapshot = path.as_deref().map(Snapshot::capture);
+        let snapshot = if revertible {
+            path.as_deref().map(Snapshot::capture)
+        } else {
+            None
+        };
         // Apply. A tool error means nothing landed: surface it, skip the gate.
         let applied = match self.tools.dispatch(call) {
             Ok(text) => text,
             Err(err) => return err,
         };
-        // With no task scope, the user's approval is the only gate and the edit
-        // stands. With a scope, aden also judges the resulting working-tree diff.
+        // With no task scope, the user's approval is the only gate and the
+        // effect stands. With a scope, aden also judges the working-tree diff.
         let Some(gate) = self.gate.as_ref() else {
-            self.last_edited = path;
+            if revertible {
+                self.last_edited = path;
+            }
             return applied;
         };
         let outcome = gate.check();
         if outcome.proceed() {
-            self.last_edited = path;
+            if revertible {
+                self.last_edited = path;
+            }
             return applied;
         }
-        // Out of scope: revert the file and feed the verdict back to the model.
-        if let (Some(p), Some(snap)) = (&path, &snapshot) {
-            snap.restore(p);
+        // Out of scope. Record the block for the TUI, then either revert the
+        // file (an edit) or report honestly that a command's effects stand.
+        self.last_block = Some(outcome.clone());
+        if revertible {
+            if let (Some(p), Some(snap)) = (&path, &snapshot) {
+                snap.restore(p);
+            }
+            format!(
+                "EDIT BLOCKED by aden gate: {}. The change was reverted; revise to stay in scope.",
+                outcome.message
+            )
+        } else {
+            format!(
+                "{applied}\n\nWARNING: the aden gate reports this command pushed the working tree out of scope: {}. coxn cannot auto-revert a command's effects -- inspect and revert manually if needed.",
+                outcome.message
+            )
         }
-        let msg = format!(
-            "EDIT BLOCKED by aden gate: {}. The change was reverted; revise to stay in scope.",
-            outcome.message
-        );
-        self.last_block = Some(outcome);
-        msg
     }
 }
 
@@ -674,6 +693,82 @@ mod tests {
         assert_eq!(tool_msgs.len(), 2, "both calls get a result");
         assert!(tool_msgs.iter().all(|c| c.contains("cancelled")));
         assert!(tool_msgs.iter().all(|c| !c.contains("edited")));
+    }
+
+    /// A mutating-but-not-revertible tool, like a shell command.
+    struct CommandTool;
+    impl Tool for CommandTool {
+        fn name(&self) -> &str {
+            "run_command"
+        }
+        fn run(&self, _arguments: &str) -> ToolResult {
+            Ok("exit 0\nbuilt".to_string())
+        }
+        fn mutates(&self) -> bool {
+            true
+        }
+        fn revertible(&self) -> bool {
+            false
+        }
+    }
+
+    fn command_registry() -> ToolRegistry {
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(CommandTool));
+        r
+    }
+
+    fn calls_command() -> ModelResponse {
+        ModelResponse {
+            message: Message::new(Role::Assistant, "running"),
+            tool_calls: vec![ToolCall {
+                id: "r1".to_string(),
+                name: "run_command".to_string(),
+                arguments: r#"{"command":"cargo build"}"#.to_string(),
+            }],
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_command_is_reported_not_reverted() {
+        // A command that escapes scope keeps its output (nothing to revert) and
+        // is reported honestly, unlike an edit which says "reverted".
+        let model = ScriptedModel::new(vec![calls_command(), assistant("noted")]);
+        let mut pump = Pump::new(model, command_registry());
+        pump.set_gate(Box::new(FakeGate(outcome(
+            GateVerdict::ScopeEscape,
+            "out of scope",
+        ))));
+        pump.push_user("build it");
+        pump.run_turn().await.expect("turn completes");
+        let tool_msg = pump
+            .messages()
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool message");
+        // The command output stands; the message says it was NOT reverted.
+        assert!(tool_msg.content.contains("built"), "{}", tool_msg.content);
+        assert!(tool_msg.content.contains("cannot auto-revert"));
+        assert!(!tool_msg.content.contains("was reverted"));
+        // The block is still recorded for the TUI.
+        assert!(pump.take_block().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_in_scope_command_returns_its_output() {
+        let model = ScriptedModel::new(vec![calls_command(), assistant("ok")]);
+        let mut pump = Pump::new(model, command_registry());
+        pump.set_gate(Box::new(FakeGate(outcome(GateVerdict::InScope, "ok"))));
+        pump.push_user("build it");
+        pump.run_turn().await.expect("turn completes");
+        let tool_msg = pump
+            .messages()
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool message");
+        assert_eq!(tool_msg.content, "exit 0\nbuilt");
+        assert!(pump.take_block().is_none());
     }
 
     #[tokio::test]
