@@ -69,7 +69,7 @@ GATED on a dependency decision. Not yet approved -- confirm P3.0 before implemen
 
 == Phase 3b / later (provider)
 
-* [ ] P3.2b Tool-calling over the wire: enrich `Message` with `tool_call_id` linkage + JSON schemas on `Tool`; reconstruct OpenAI assistant `tool_calls` + `tool` messages; parse `tool_calls` from the response. (Until then the OpenAI backend chats; the stub exercises tools.)
+* [x] P3.2b Tool-calling over the wire: `Message` carries tool_calls/tool_call_id; `Tool` carries JSON schemas; `advertised_defs` -> OpenAI `function` tools; assistant tool_calls + `tool` results threaded; response tool_calls parsed back. Tools read JSON-or-bare args. 2 commits, hermetic tests. Network e2e unverified in-sandbox.
 * [ ] Streaming + Ollama-native `/api/chat` profile (OpenAI-compat drops tool calls under streaming).
 * [ ] Optional Anthropic-direct profile (native prompt caching, exact billing).
 
