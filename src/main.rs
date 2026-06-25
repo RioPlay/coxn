@@ -12,14 +12,15 @@ mod session;
 mod tools;
 mod tui;
 
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
-use model::{AnyModel, Message, Role, StubModel, Usage};
-use pump::Pump;
+use model::{AnyModel, Message, Role, StubModel, ToolCall, Usage};
+use pump::{Approval, Pump, TurnIo};
 use tools::{AdenTool, EditTool, ReadFileTool, ToolRegistry, WriteTool};
 use tui::{Action, Tui, View, map_input_key, map_modal_key};
 
@@ -77,6 +78,13 @@ async fn main() -> io::Result<()> {
     tools.register_latent(Box::new(AdenTool::grep(dir.clone())));
     tools.register_latent(Box::new(AdenTool::ask(dir.clone())));
     tools.register_latent(Box::new(AdenTool::locate(dir.clone())));
+    // The action set is always advertised; each mutating call is gated by user
+    // approval at the prompt, and (when a task scope is active) by aden's
+    // blast-radius gate on top. read_file is advertised with the editors so the
+    // model can fetch the exact text to replace.
+    tools.register(Box::new(ReadFileTool::new(dir.clone())));
+    tools.register(Box::new(EditTool::new(dir.clone())));
+    tools.register(Box::new(WriteTool::new(dir.clone())));
 
     // Take over the terminal and paint a frame first, so the user sees coxn
     // start instead of a frozen blank while the aden subprocess calls below
@@ -92,18 +100,9 @@ async fn main() -> io::Result<()> {
     tui.draw(&view)?;
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: the gate
-    // mandate and exactly the seeds' context. No task = bare, ungated prompt.
+    // mandate and exactly the seeds' context. No task = bare prompt, edits gated
+    // by approval alone.
     let task = load_task(&dir);
-    // The action set (read_file / edit / write_file) is advertised up front only
-    // when the scope actually gated: aden gates every edit, and there is no gate
-    // without a scope, so editing is off by default (no ungated edits). read_file
-    // is advertised with the editors so the model can fetch the exact text to
-    // replace -- editing without reading would be guesswork.
-    if task.gate.is_some() {
-        tools.register(Box::new(ReadFileTool::new(dir.clone())));
-        tools.register(Box::new(EditTool::new(dir.clone())));
-        tools.register(Box::new(WriteTool::new(dir.clone())));
-    }
     let mut pump = Pump::new(model, tools);
     if let Some(gate) = task.gate {
         pump.set_gate(gate);
@@ -484,6 +483,81 @@ fn pane_dims(tui: &Tui) -> (u16, u16) {
         .unwrap_or((80, 1))
 }
 
+/// Summarize a tool call for the approval prompt: the tool name plus its target
+/// path when it has one.
+fn approval_summary(call: &ToolCall) -> String {
+    let path = serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .ok()
+        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string));
+    match path {
+        Some(p) => format!("{} {p}", call.name),
+        None => call.name.clone(),
+    }
+}
+
+/// The per-turn terminal I/O the pump drives: stream the reply live (with a
+/// Ctrl-C cancel check between fragments) and prompt for approval before a
+/// mutating tool runs. Owns the terminal borrows so the pump needs one handle.
+struct DriveIo<'a> {
+    tui: &'a mut Tui,
+    view: &'a mut View,
+    prior: &'a str,
+    buf: String,
+    cancelled: bool,
+    approvals: &'a mut HashSet<String>,
+}
+
+impl TurnIo for DriveIo<'_> {
+    fn on_delta(&mut self, delta: &str) -> bool {
+        self.buf.push_str(delta);
+        self.view.output = format!("{}\ncoxn: {}", self.prior, self.buf);
+        let _ = self.tui.draw(self.view);
+        // Non-blocking cancel check: Ctrl-C aborts the turn.
+        if let Ok(true) = event::poll(Duration::ZERO)
+            && let Ok(Event::Key(key)) = event::read()
+            && key.kind == KeyEventKind::Press
+            && matches!(map_input_key(key), Some(Action::Quit))
+        {
+            self.cancelled = true;
+            return false;
+        }
+        true
+    }
+
+    fn approve(&mut self, call: &ToolCall) -> Approval {
+        // A tool approved for the session never prompts again.
+        if self.approvals.contains(&call.name) {
+            return Approval::Allow;
+        }
+        let summary = approval_summary(call);
+        loop {
+            self.view.set_status(format!(
+                "approve {summary}?  [o]nce  [s]ession  [d]ecline  [x] cancel turn"
+            ));
+            let _ = self.tui.draw(self.view);
+            if event::poll(TICK).unwrap_or(false)
+                && let Ok(Event::Key(key)) = event::read()
+                && key.kind == KeyEventKind::Press
+            {
+                // Ctrl-C cancels the turn here too, not just x/Esc.
+                if matches!(map_input_key(key), Some(Action::Quit)) {
+                    return Approval::CancelTurn;
+                }
+                match key.code {
+                    KeyCode::Char('o' | 'O') => return Approval::Allow,
+                    KeyCode::Char('s' | 'S') => {
+                        self.approvals.insert(call.name.clone());
+                        return Approval::Allow;
+                    }
+                    KeyCode::Char('d' | 'D') => return Approval::Decline,
+                    KeyCode::Char('x' | 'X') | KeyCode::Esc => return Approval::CancelTurn,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// The event loop: draw, read a key, route it by mode (modal vs input), and run
 /// a turn on submit. Carries no intelligence; it only paces and shuttles.
 async fn drive(
@@ -498,6 +572,8 @@ async fn drive(
     // after each turn. `persisted` tracks how many of pump.messages() are on disk.
     let mut session = session::Session::create();
     let mut persisted = 0usize;
+    // Tool names approved "for the session" -- they skip the approval prompt.
+    let mut approvals: HashSet<String> = HashSet::new();
     loop {
         tui.draw(view)?;
 
@@ -634,31 +710,23 @@ async fn drive(
                 // reply appears live instead of all at once, and a Ctrl-C between
                 // fragments cancels the turn (kept partial) rather than quitting.
                 let prior = transcript(pump.messages());
-                let mut cancelled = false;
                 view.pending = true;
-                // Run the turn, retrying transient backend errors (rate limit,
-                // unavailable, dropped connection) with a cancellable countdown.
+                // Run the turn (streaming + per-tool approval via DriveIo),
+                // retrying transient backend errors with a cancellable countdown.
                 let mut attempt = 0u32;
-                let result = loop {
-                    let r = {
-                        let mut buf = String::new();
-                        let mut sink = |delta: &str| -> bool {
-                            buf.push_str(delta);
-                            view.output = format!("{prior}\ncoxn: {buf}");
-                            let _ = tui.draw(view);
-                            // Non-blocking cancel check: Ctrl-C aborts the turn.
-                            if let Ok(true) = event::poll(Duration::ZERO)
-                                && let Ok(Event::Key(key)) = event::read()
-                                && key.kind == KeyEventKind::Press
-                                && matches!(map_input_key(key), Some(Action::Quit))
-                            {
-                                cancelled = true;
-                                return false;
-                            }
-                            true
-                        };
-                        pump.run_turn_streaming(&mut sink).await
+                let result;
+                let mut cancelled;
+                loop {
+                    let mut io = DriveIo {
+                        tui,
+                        view,
+                        prior: &prior,
+                        buf: String::new(),
+                        cancelled: false,
+                        approvals: &mut approvals,
                     };
+                    let r = pump.run_turn_streaming(&mut io).await;
+                    cancelled = io.cancelled;
                     if let Err(e) = &r
                         && e.is_transient()
                         && attempt < MAX_RETRIES
@@ -667,12 +735,14 @@ async fn drive(
                         attempt += 1;
                         let secs = RETRY_BACKOFF_SECS[(attempt - 1) as usize];
                         if retry_wait(tui, view, attempt, secs)? {
-                            break r; // user gave up; surface the error
+                            result = r; // user gave up; surface the error
+                            break;
                         }
                         continue;
                     }
-                    break r;
-                };
+                    result = r;
+                    break;
+                }
                 view.pending = false;
                 match result {
                     Ok(_) => {
