@@ -66,6 +66,7 @@ GATED on a dependency decision. Not yet approved -- confirm P3.0 before implemen
 * [ ] P3.4 Config via `aden config` (`.aden/config.toml`): provider base URLs + per-role models. Secrets (cloud keys) via env only, never committed.
 * [ ] P3.5 Progressive per-role routing (scout/synth/orchestrate) with one-model-works defaults; never a mandatory matrix.
 * [x] P3.6 Status line: shows the active model label, then aden savings or the task + `/help` hint; model errors stay visible (no longer clobbered by the savings refresh).
+* [x] P3.7 Slash commands: leading-`/` input is a local command, not a model turn -- `/help`, `/model`, `/tools`, `/clear`, `/quit` (+ aliases). `parse_command` is pure-tested; `/clear` keeps the task scope.
 
 == Phase 3b / later (provider)
 

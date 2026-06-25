@@ -77,6 +77,16 @@ impl<M: Model> Pump<M> {
         self.last_block.take()
     }
 
+    /// Clear the conversation, keeping the loaded scope context and the gate.
+    pub fn clear_conversation(&mut self) {
+        self.messages.clear();
+    }
+
+    /// A human-readable listing of the aden tools the model can discover.
+    pub fn tool_catalog(&self) -> String {
+        self.tools.discover("")
+    }
+
     /// The conversation so far, for rendering the transcript.
     pub fn messages(&self) -> &[Message] {
         &self.messages

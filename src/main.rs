@@ -170,6 +170,43 @@ fn load_task(dir: &Path, pump: &mut Pump<AnyModel>) -> String {
     )
 }
 
+/// Help shown by `/help`.
+const HELP: &str = "commands:\n  \
+/help          show this help\n  \
+/model         show the active model\n  \
+/tools         list the aden tools the model can discover\n  \
+/clear         clear the conversation (keeps the task scope)\n  \
+/quit          leave coxn\n\
+anything else is sent to the model.";
+
+/// A slash command typed into the input line.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Help,
+    Quit,
+    Clear,
+    Model,
+    Tools,
+    Unknown(String),
+}
+
+/// Parse a leading-slash input into a command. Pure and testable.
+fn parse_command(input: &str) -> Command {
+    let word = input
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    match word {
+        "help" | "h" | "?" => Command::Help,
+        "quit" | "q" | "exit" => Command::Quit,
+        "clear" => Command::Clear,
+        "model" => Command::Model,
+        "tools" => Command::Tools,
+        other => Command::Unknown(other.to_string()),
+    }
+}
+
 /// The event loop: draw, read a key, route it by mode (modal vs input), and run
 /// a turn on submit. Carries no intelligence; it only paces and shuttles.
 async fn drive(
@@ -210,6 +247,24 @@ async fn drive(
                 if text.trim().is_empty() {
                     continue;
                 }
+                // A leading slash is a local command, not a model turn.
+                if text.trim_start().starts_with('/') {
+                    match parse_command(text.trim()) {
+                        Command::Quit => return Ok(()),
+                        Command::Help => view.output = HELP.to_string(),
+                        Command::Model => view.output = format!("model: {model_label}"),
+                        Command::Tools => view.output = pump.tool_catalog(),
+                        Command::Clear => {
+                            pump.clear_conversation();
+                            view.output.clear();
+                            view.set_status(status_line(dir, model_label, task));
+                        }
+                        Command::Unknown(c) => {
+                            view.output = format!("unknown command: /{c}  (try /help)");
+                        }
+                    }
+                    continue;
+                }
                 pump.push_user(text);
                 match pump.run_turn().await {
                     Ok(_) => {
@@ -245,5 +300,21 @@ mod tests {
             Message::new(Role::Assistant, "stub: hi"),
         ];
         assert_eq!(transcript(&messages), "you: hi\ncoxn: stub: hi");
+    }
+
+    #[test]
+    fn parse_command_maps_aliases_and_unknowns() {
+        assert_eq!(parse_command("/help"), Command::Help);
+        assert_eq!(parse_command("/?"), Command::Help);
+        assert_eq!(parse_command("/q"), Command::Quit);
+        assert_eq!(parse_command("/clear"), Command::Clear);
+        assert_eq!(parse_command("/model"), Command::Model);
+        assert_eq!(parse_command("/tools"), Command::Tools);
+        // Extra args are ignored; the verb decides.
+        assert_eq!(parse_command("/model gpt"), Command::Model);
+        assert_eq!(
+            parse_command("/bogus"),
+            Command::Unknown("bogus".to_string())
+        );
     }
 }
