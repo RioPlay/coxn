@@ -69,6 +69,23 @@ pub fn scope(dir: &Path, name: &str, seeds: &[String], budget: u64) -> Result<St
     scope_with(&aden_bin(), dir, name, seeds, budget)
 }
 
+/// Emit a task partition (`aden scope --agents <name> --seed ...`): per-sub-scope
+/// manifests under `.aden/agents/` plus the index on stdout (returned here).
+pub fn scope_agents(
+    dir: &Path,
+    name: &str,
+    seeds: &[String],
+    budget: u64,
+) -> Result<String, AdenError> {
+    let mut cmd = Command::new(aden_bin());
+    cmd.arg("scope").arg("--agents").arg(name);
+    for s in seeds {
+        cmd.arg("--seed").arg(s);
+    }
+    cmd.arg("--budget").arg(budget.to_string()).arg(dir);
+    run_text(cmd)
+}
+
 /// Pull context from aden (asm / understand), returning aden's text output.
 pub fn pull(dir: &Path, what: Pull) -> Result<String, AdenError> {
     pull_with(&aden_bin(), dir, what)
