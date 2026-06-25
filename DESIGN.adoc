@@ -139,13 +139,29 @@ These are changes in the aden repo, not coxn, and they gate a trustworthy harnes
 * The hard gate: run `impact-diff --scope` before accepting any edit; block on violation.
 * Surface `aden status` savings (tokens saved, tool calls saved) in the status line.
 
-=== Phase 3: provider neutrality (only if needed)
+=== Phase 3: provider neutrality and local-first usability
 
-* Additional `call_model()` backends (Anthropic, OpenAI, Gemini, local). Each provider's caching / token-counting / budget profile is abstracted behind the seam. Do not build this speculatively; add a provider when there is a real second target.
+The differentiator stays the context step; the provider layer is commodity, so coxn keeps it to the smallest surface that covers the ecosystem.
+
+* *One OpenAI-compatible backend.* LM Studio, Ollama, vLLM, llama.cpp, OpenRouter, and OpenAI all speak `/v1/chat/completions`. A single `call_model()` backend, configured by `{base_url, model, key}`, covers all of them. OpenRouter bridges that same protocol to Claude / GPT / Gemini / Llama, so the whole cloud matrix is reachable through one adapter. An Anthropic-direct profile (native prompt caching) is an optional later addition, not a prerequisite.
+* *Model selection is per-call data, not a global type.* A model is a `{base_url, model, key}` value chosen by role at invocation time, so sub-agents and workflows can mix models without reworking the seam. This is the one part that must be right from the first `call_model()` commit; the rest can be added incrementally.
+* *Local-first, zero-config start.* On launch coxn probes the well-known local endpoints (Ollama `:11434`, LM Studio `:1234`) and uses one if it is up. A developer with a local model running gets a working, free harness with no key and no config. Resolution order: explicit env or flag, then `aden config` values, then local auto-detect, then a clear error pointing at how to set a provider.
+* *Config through `aden config`, secrets through the environment.* Persistent preferences (provider base URLs, per-role models) live in `.aden/config.toml` and are read via `aden config get` (the ADR-005 prerequisite). Cloud API keys come from the environment and are never written to the committed config. One config layer, no coxn-specific format.
+* *Progressive routing, never mandatory.* With one model configured, every role uses it. Adding a local model and a cloud key lets coxn route the cheap fan-out local and the heavy role to the cloud model automatically. The user is never forced to fill a routing matrix before getting value.
+* *Surface state in the status line, not a settings screen.* The status line shows the active provider and model (and per-role models when more than one) alongside aden savings. No in-TUI settings UI; changing a model is an `aden config` edit or an env var, which keeps the pump minimal.
+* *Tool calling is non-streaming first.* OpenAI-compatible tool calls work for LM Studio and Ollama when not streaming. Ollama's OpenAI-compat layer drops tool calls under streaming; its native `/api/chat` handles streaming plus tools. Streaming, and an Ollama-native profile for streaming-plus-tools, are a later addition.
+
+The usability thesis mirrors the context thesis: minimize the decisions a user must make before getting value. Local-first defaults plus one reused config layer is both the most usable and the most minimal design, so there is no tension with the dumb-pump law.
 
 === Phase 4 (optional, later): live graph bridge
 
 * `aden view --watch` localhost server plus SSE so the browser inspector can pulse nodes as coxn drives the model. Not MVP.
+
+=== Phase 5 (later): multi-model workflows and sub-agents
+
+* *A sub-agent is a pump instance.* The pump is self-contained, so a sub-agent is a pump bound to a model (by role), a scoped context (from `aden scope`), a tool subset, and a token budget. It returns a dense result, not its transcript; durable findings persist to the aden graph, not the context window.
+* *aden owns the partition and the order; coxn executes.* `aden scope` emits per-task manifests plus the overlap report and dependency order (and `aden plan` later). coxn spawns one pump per manifest, paces them, and merges. Do not build a planner in coxn; that is aden's job and is what keeps the pump small.
+* *Token efficiency comes from aden, routing, and cache discipline, not parallelism.* Parallelism buys wall-clock, not tokens. The token levers are: disjoint scopes (so agents do not carry each other's context), pull-not-push plus dense merge, cheap or local models for the bulk fan-out with the expensive model reserved for orchestrate and merge, one model per sub-task to preserve its prompt cache, and per-agent budgets with adaptive stopping.
 
 == Honest caveats and open risks
 
