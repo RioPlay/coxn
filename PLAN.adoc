@@ -57,7 +57,7 @@ latter). Tested against the offline aden branch via `COXN_ADEN_BIN`.
 
 == Phase 3 (coxn-side): provider neutrality and local-first usability
 
-GATED on a dependency decision. Not yet approved -- confirm P3.0 before implementing.
+DONE. Deps approved (P3.0) and the path verified live against LM Studio.
 
 * [x] P3.0 Dependency approval: `serde` + `serde_json` + `ureq` (json + rustls, default-features off to drop cookies). Approved and added.
 * [x] P3.1 Runtime model selection: `AnyModel` enum the pump is monomorphized over, so the backend is chosen at runtime (per agent/role) not baked into the type. `resolve_model()` in main picks it (stub for now; P3.2 branches on a configured/detected provider). No new deps. 1 dispatch test.
@@ -70,9 +70,23 @@ GATED on a dependency decision. Not yet approved -- confirm P3.0 before implemen
 
 == Phase 3b / later (provider)
 
-* [x] P3.2b Tool-calling over the wire: `Message` carries tool_calls/tool_call_id; `Tool` carries JSON schemas; `advertised_defs` -> OpenAI `function` tools; assistant tool_calls + `tool` results threaded; response tool_calls parsed back. Tools read JSON-or-bare args. 2 commits, hermetic tests. Network e2e unverified in-sandbox.
+* [x] P3.2b Tool-calling over the wire: `Message` carries tool_calls/tool_call_id; `Tool` carries JSON schemas; `advertised_defs` -> OpenAI `function` tools; assistant tool_calls + `tool` results threaded; response tool_calls parsed back. Tools read JSON-or-bare args. 2 commits, hermetic tests. Network e2e VERIFIED live (LM Studio gpt-oss-20b).
+* [x] P3.8 Model enumeration + switching: `openai::list_models` lists every model the provider advertises (loaded or not; auth header for cloud); `/model` lists with active marked, `/model <name|#>` switches via `Pump::set_model`. An unlisted name is allowed (backend JIT-loads). Verified live.
 * [ ] Streaming + Ollama-native `/api/chat` profile (OpenAI-compat drops tool calls under streaming).
 * [ ] Optional Anthropic-direct profile (native prompt caching, exact billing).
+
+== Phase 4 (coxn-side): the harness -- gated editing  -- DONE
+
+The action surface that makes coxn drive (not suggest). All verified live end
+to end against a throwaway git repo + LM Studio gpt-oss-20b, and the aden seam
+verified against the real T3 codebase (`~/Projects/t3code`).
+
+* [x] P4.1 Action tools: `edit` (replace an exact unique string) and `write_file` (create/overwrite, makes parent dirs). Both `mutates() == true` and declare `target_path` so the pump can snapshot.
+* [x] P4.2 Apply -> gate -> revert: per DESIGN, aden reads the working-tree diff, so the pump applies the edit, runs `impact-diff --scope`, and on scope-escape/blast-leak reverts only that file (restore bytes / remove a new file) and feeds the verdict back. In-scope edits persist. No git, no new deps. Unit-tested (revert/persist/no-gate) + live.
+* [x] P4.3 Editing requires a scope: no task -> no gate -> mutating tools refused (never ungated), and the action tools are registered only when the scope actually gated.
+* [x] P4.4 Task-mode operating preamble (`AGENT_PREAMBLE`): one sanctioned nudge so a weak model with the empty default prompt actually calls the action tools (gpt-oss-20b otherwise answers "I can't edit files"). Added only when gated.
+* [x] P4.5 Boot UX: paint a frame before the slow aden subprocess calls; defer the cosmetic savings probe off the boot path. No more blank/frozen terminal on a large repo.
+* [x] P4.6 README.md: quickstart, model selection, task mode, slash commands, the aden seam.
 
 == Phase 5 (later): multi-model workflows and sub-agents
 
@@ -82,4 +96,7 @@ GATED on a dependency decision. Not yet approved -- confirm P3.0 before implemen
 
 == Notes / decisions
 
-(append one-line notes as tasks complete)
+* Live validation (against `~/Projects/t3code`, the real T3 Chat monorepo, 42k-contract aden store): the full aden seam -- `scope`, `impact-diff --scope` (in-scope AND scope-escape on a dirty tree), `asm` (bare seeds resolve), `status` savings, `config` -- all confirmed against real aden 0.2.0. The TUI loop confirmed against LM Studio gpt-oss-20b: auto-detect, grounded reply on a real symbol, tool-calling round-trip.
+* Gated editing confirmed live on a throwaway repo: model called `edit` with correct JSON, coxn applied + gated in-scope, the change persisted on disk.
+* Known constraint: `impact-diff` judges the WHOLE working-tree diff vs HEAD, so a tree already dirty outside the scope mandate blocks every edit. coxn effectively expects a tree scoped to the task.
+* Open: merge the aden `feat/coxn-directional-prereqs` branch (PoC gate now satisfied) -- outward-facing, awaiting the user. Streaming/Ollama-native and sub-agents remain.
