@@ -393,6 +393,14 @@ impl Tool for ReadFileTool {
 /// judges the tree's git diff, so a write outside the tree (an absolute path or
 /// `..`) would land ungated. Only a relative path of normal components is
 /// allowed -- no root, no prefix, no `..`.
+///
+/// Symlink safety: after validating components, the function canonicalizes the
+/// deepest existing ancestor of the joined path and confirms it is inside the
+/// canonical project root. A symlink that resolves outside the root is rejected.
+/// A broken symlink in the chain causes canonicalize to fail, which is also
+/// rejected (safe default). The original joined path (not the canonical one) is
+/// returned so that not-yet-created suffix components remain plain Normal
+/// segments -- WriteTool's create_dir_all runs after this returns.
 fn project_path(dir: &Path, path: &str) -> Result<PathBuf, String> {
     if path.trim().is_empty() {
         return Err("a relative path is required".to_string());
@@ -407,7 +415,35 @@ fn project_path(dir: &Path, path: &str) -> Result<PathBuf, String> {
             }
         }
     }
-    Ok(dir.join(path))
+    let joined = dir.join(path);
+    let canonical_root =
+        std::fs::canonicalize(dir).map_err(|e| format!("cannot resolve project root: {e}"))?;
+    // Walk to the deepest existing ancestor of `joined` so we can canonicalize
+    // it. Use `symlink_metadata` (lstat, does not follow): a dangling symlink
+    // component is an existing entry, so we stop on it and canonicalize -- which
+    // fails for a broken link and rejects the path. `try_exists` would follow
+    // the link, see the missing target, skip the component, and let a write
+    // escape through it.
+    let mut ancestor: &Path = &joined;
+    loop {
+        if ancestor.symlink_metadata().is_ok() {
+            break;
+        }
+        match ancestor.parent() {
+            Some(p) => ancestor = p,
+            None => {
+                // Exhausted the path; fall back to the project root itself.
+                ancestor = dir;
+                break;
+            }
+        }
+    }
+    let canonical = std::fs::canonicalize(ancestor)
+        .map_err(|e| format!("path cannot be verified within the project root: {e}"))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!("path escapes the project root: {path}"));
+    }
+    Ok(joined)
 }
 
 /// The file a `path`-taking tool will write, for the pump to snapshot. `None`
@@ -885,6 +921,95 @@ mod tests {
             "hi there"
         );
         assert_eq!(tool.target_path(args), Some(dir.join("sub/new.txt")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn symlink_escape_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("symlink-escape");
+        // A symlink inside the project root that points outside (to /tmp).
+        symlink("/tmp", dir.join("escape")).expect("create symlink");
+        // Attempting to access a path through the escaping symlink must fail.
+        let edit = EditTool::new(dir.clone());
+        let err = edit
+            .run(r#"{"path":"escape/foo","old_string":"x","new_string":"y"}"#)
+            .unwrap_err();
+        assert!(err.contains("escape"), "expected 'escape' in: {err}");
+        let read = ReadFileTool::new(dir.clone());
+        let err = read.run(r#"{"path":"escape/foo"}"#).unwrap_err();
+        assert!(err.contains("escape"), "expected 'escape' in: {err}");
+        let write = WriteTool::new(dir.clone());
+        let err = write
+            .run(r#"{"path":"escape/foo","content":"x"}"#)
+            .unwrap_err();
+        assert!(err.contains("escape"), "expected 'escape' in: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dangling_symlink_component_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("symlink-dangling");
+        // A symlink to a path that does NOT exist yet, outside the root. The
+        // ancestor walk must stop on the symlink entry (not follow it to the
+        // missing target), canonicalize it, and reject -- otherwise a write
+        // would follow the link and create the file outside the project.
+        let outside = std::env::temp_dir().join(format!("coxn-evil-{}", std::process::id()));
+        std::fs::remove_dir_all(&outside).ok();
+        symlink(&outside, dir.join("evil")).expect("create dangling symlink");
+        let write = WriteTool::new(dir.clone());
+        let err = write
+            .run(r#"{"path":"evil/foo","content":"x"}"#)
+            .unwrap_err();
+        assert!(
+            err.contains("escape") || err.contains("verified"),
+            "expected rejection, got: {err}"
+        );
+        // Nothing was created outside the root.
+        assert!(!outside.exists(), "write escaped to {}", outside.display());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normal_in_root_file_still_reads_and_edits() {
+        let dir = temp_dir("symlink-safe-read");
+        std::fs::write(dir.join("ok.txt"), "hello world").unwrap();
+        // Read succeeds for a plain in-root file.
+        let read = ReadFileTool::new(dir.clone());
+        assert_eq!(
+            read.run(r#"{"path":"ok.txt"}"#),
+            Ok("hello world".to_string())
+        );
+        // Edit succeeds for a plain in-root file.
+        let edit = EditTool::new(dir.clone());
+        assert_eq!(
+            edit.run(r#"{"path":"ok.txt","old_string":"hello","new_string":"goodbye"}"#),
+            Ok("edited ok.txt".to_string())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ok.txt")).unwrap(),
+            "goodbye world"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_to_new_nested_dir_succeeds() {
+        let dir = temp_dir("symlink-safe-write");
+        let write = WriteTool::new(dir.clone());
+        // Writing to a path whose intermediate directories do not yet exist must
+        // succeed: the deepest-existing-ancestor walk falls back to an existing
+        // ancestor, confirms it is inside the root, then returns the original
+        // joined path so WriteTool's create_dir_all can make the new dirs.
+        assert_eq!(
+            write.run(r#"{"path":"sub/dir/new.txt","content":"data"}"#),
+            Ok("wrote 4 bytes to sub/dir/new.txt".to_string())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/dir/new.txt")).unwrap(),
+            "data"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
