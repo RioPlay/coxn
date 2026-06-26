@@ -17,7 +17,7 @@ mod tui;
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
@@ -80,7 +80,17 @@ fn transcript(messages: &[Message]) -> String {
         .iter()
         .map(|m| match m.role {
             Role::User => format!("you: {}", m.content),
-            Role::Tool => format!("tool: {}", m.content),
+            Role::Tool => {
+                // run_command results start with "cmd:" and carry their own
+                // structured lines (cmd:/ok:/err:); pass them through verbatim
+                // so the TUI can color each line independently. Older sessions
+                // and aden query results that lack the prefix get "tool: ".
+                if m.content.starts_with("cmd:") {
+                    m.content.clone()
+                } else {
+                    format!("tool: {}", m.content)
+                }
+            }
             Role::System => format!("sys: {}", m.content),
             Role::Assistant if m.tool_calls.is_empty() => format!("coxn: {}", m.content),
             Role::Assistant => {
@@ -160,6 +170,12 @@ async fn main() -> io::Result<()> {
     // slowest aden spawn and is purely cosmetic, so defer it to the first
     // post-turn refresh and let the user reach the prompt sooner.
     view.set_status(boot_status(&sel.label(), &task.status));
+    // When no model was detected, nudge the user with a one-line hint so the
+    // stub is not silently confusing.
+    if sel.name == "stub" {
+        view.output
+            .push_str("\n\nno model detected -- set COXN_MODEL_BASE_URL or start LM Studio/Ollama");
+    }
 
     let result = drive(
         &mut tui,
@@ -1187,7 +1203,7 @@ async fn drive(
                 // reply appears live instead of all at once, and a Ctrl-C between
                 // fragments cancels the turn (kept partial) rather than quitting.
                 let prior = transcript(pump.messages());
-                view.pending = true;
+                view.pending_since = Some(Instant::now());
                 // Run the turn (streaming + per-tool approval via DriveIo),
                 // retrying transient backend errors with a cancellable countdown.
                 let mut attempt = 0u32;
@@ -1224,7 +1240,7 @@ async fn drive(
                     result = r;
                     break;
                 }
-                view.pending = false;
+                view.pending_since = None;
                 match result {
                     Ok(_) => {
                         view.output = transcript(pump.messages());
@@ -1311,6 +1327,26 @@ mod tests {
         assert_eq!(
             transcript(&messages),
             "you: go\ncoxn: → aden_asm({})\ntool: result"
+        );
+    }
+
+    #[test]
+    fn transcript_passes_cmd_tool_messages_through_verbatim() {
+        // A tool message whose content starts with "cmd:" (a run_command result)
+        // must not be prefixed with "tool: " so the TUI can color each line.
+        let cmd_content = "cmd: sandboxed\nok: exit 0\nhello";
+        let messages = vec![Message::tool_result("r1", cmd_content)];
+        let out = transcript(&messages);
+        assert_eq!(out, cmd_content, "cmd: message must be verbatim: {out}");
+
+        // A regular tool message (aden query result) still gets "tool: ".
+        let aden_content = "asm result here";
+        let messages2 = vec![Message::tool_result("r2", aden_content)];
+        let out2 = transcript(&messages2);
+        assert_eq!(
+            out2,
+            format!("tool: {aden_content}"),
+            "non-cmd tool must be prefixed: {out2}"
         );
     }
 
