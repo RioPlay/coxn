@@ -1,6 +1,6 @@
 = coxn <-> aden contract
-:revdate: 2026-06-24
-:status: provisional (consumer-side; aden side is a Phase 2 blocker)
+:revdate: 2026-06-25
+:status: implemented (aden 0.2.0); aden is an optional amplifier
 :sectanchors:
 :sectnums:
 
@@ -10,13 +10,17 @@ intelligence; it reads these structures verbatim and acts on them.
 
 [IMPORTANT]
 ====
-Provisional. `aden scope` and the hard exit-code gate live in the aden repo and
-are not built yet (see PLAN.adoc Phase 2 blockers). This document is coxn's
-consumer-side reading of the manifest and verdict, grounded in aden research
-(`aden-as-directional-harness.adoc`). Field names and verdict labels are fixed
-by that source; the numeric exit-code mapping in <<exit-codes>> is coxn's
-proposal and must be reconciled with aden's implementation before the gate is
-promoted from advisory to hard.
+aden is an *optional amplifier*, not a dependency. coxn probes `aden --version`
+once at boot; when aden is absent it runs standalone (human approval gate plus
+the bwrap sandbox) and never invokes any command below. When aden is present it
+plugs in over this subprocess seam to amplify: dense context (`asm`), the
+blast-radius gate (`impact-diff --scope`), and config-driven model routing.
+
+The `scope` emitter and the hard `impact-diff --scope` exit-code gate are
+implemented in aden 0.2.0 (branch `feat/coxn-directional-prereqs`). The exit-code
+mapping in <<exit-codes>> is reconciled with that implementation. coxn pins a
+minimum of aden 0.2.0; an older aden that lacks these commands degrades to the
+standalone path (the affected calls return errors coxn already tolerates).
 ====
 
 == Scope manifest
@@ -100,8 +104,8 @@ file mandate.
 | Block: surface the leaked dependents, do not accept the edit.
 |===
 
-aden's rule is "exit nonzero on escape." coxn's proposed exit-code mapping
-(provisional, to reconcile with aden):
+aden's rule is "exit nonzero on escape." The exit-code mapping, reconciled with
+aden 0.2.0 (`impact-diff --scope` emits exactly these):
 
 [cols="1,2"]
 |===
@@ -123,6 +127,48 @@ per touched symbol: `{anchor, dependent_count, dependents}` plus the risk class
 (`0` none, `<=5` low, `<=20` medium, else high). coxn renders this only when
 the gate blocks or when there is something worth saying; the gate is otherwise
 silent.
+
+== Command surface and versioning
+
+The complete set of aden commands coxn shells out to (via `COXN_ADEN_BIN`, else
+`aden` on PATH). Every one degrades gracefully when aden is absent or older:
+coxn falls back to the standalone path and never blocks on a missing aden.
+
+[cols="2,3"]
+|===
+| Command | Used for
+
+| `aden --version`
+| Boot probe. Success sets the "aden present" capability; failure selects the
+standalone path (no further aden calls).
+
+| `aden config get <key> <dir>`
+| Read `model.base_url`, `model.name`, and `route.<role>` from `.aden/config.toml`.
+Absent key or missing aden returns nothing; coxn falls through to env / auto-detect.
+
+| `aden scope <name> --seed ... --budget <n> --json <dir>`
+| Emit the task scope manifest (see <<_scope_manifest>>). Drives the gate and
+the loaded context. Failure leaves the turn ungated.
+
+| `aden impact-diff --scope <manifest> <dir>`
+| The gate (see <<exit-codes>>). Exit codes `0`/`1`/`2`; any other nonzero is a
+closed gate.
+
+| `aden asm` / `understand` / `grep` / `ask` / `locate`
+| The five context tools, registered active only when aden is present. A failed
+call returns an error to the model, never a panic.
+
+| `aden status <dir>`
+| The savings estimate in the status line. Absent aden simply omits it.
+
+| `aden scope --agents ...`
+| The task partition for `/agents` (multi-agent foundation). Shelved on the
+aden side until a runner consumes it.
+|===
+
+coxn pins *aden >= 0.2.0* for the gate and `scope`/`config` surface. The merge
+of `feat/coxn-directional-prereqs` into aden mainline is owned by the aden
+maintainer; coxn does not require it to run, only to amplify.
 
 == Provenance
 
