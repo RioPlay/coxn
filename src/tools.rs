@@ -121,6 +121,11 @@ impl ToolRegistry {
     }
 
     /// Add a latent tool: discoverable by intent, not advertised up front.
+    ///
+    /// Used by the discovery seam test suite to confirm that latent registration
+    /// works. In production, aden tools are either active (when aden is present)
+    /// or absent entirely; latent registration is not used in the live binary path.
+    #[allow(dead_code)]
     pub fn register_latent(&mut self, tool: Box<dyn Tool>) {
         self.latent.push(tool);
     }
@@ -379,7 +384,7 @@ impl Tool for ReadFileTool {
         if text.len() > READ_FILE_CAP {
             let head: String = text.chars().take(READ_FILE_CAP).collect();
             Ok(format!(
-                "{head}\n[truncated: {path} is {} bytes; use aden_grep to search it]",
+                "{head}\n[truncated: {path} is {} bytes; use run_command with grep, or aden_grep when available]",
                 text.len()
             ))
         } else {

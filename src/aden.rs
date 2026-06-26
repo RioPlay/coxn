@@ -8,7 +8,7 @@
 //! exactly this.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::gate::{Gate, GateOutcome, GateVerdict};
 
@@ -16,6 +16,48 @@ use crate::gate::{Gate, GateOutcome, GateVerdict};
 /// dev build or the offline branch); otherwise `aden` on PATH.
 fn aden_bin() -> String {
     std::env::var("COXN_ADEN_BIN").unwrap_or_else(|_| "aden".to_string())
+}
+
+/// What aden can do in this session, probed once at startup.
+///
+/// When `available` is false all other fields are `None` and every aden
+/// operation degrades gracefully. Callers must never shell out to aden again
+/// when `available` is false; they read from this cached result instead.
+pub struct AdenCaps {
+    pub available: bool,
+    pub model_base_url: Option<String>,
+    pub model_name: Option<String>,
+}
+
+/// Probe once at boot: can `aden` run from this environment?
+///
+/// Shells `<aden_bin> --version` with stdout/stderr discarded. If the process
+/// cannot spawn (binary not on PATH, not executable, etc.) or exits non-zero,
+/// returns `AdenCaps { available: false, .. }`. If it runs, reads
+/// `model.base_url` and `model.name` from `.aden/config.toml` and returns them
+/// alongside `available: true`. Reading config happens here so the rest of
+/// startup can use `caps` without shelling out again.
+pub fn probe(dir: &Path) -> AdenCaps {
+    let bin = aden_bin();
+    let ok = Command::new(&bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return AdenCaps {
+            available: false,
+            model_base_url: None,
+            model_name: None,
+        };
+    }
+    AdenCaps {
+        available: true,
+        model_base_url: config_get(dir, "model.base_url"),
+        model_name: config_get(dir, "model.name"),
+    }
 }
 
 /// An aden invocation that could not run, or ran but failed.

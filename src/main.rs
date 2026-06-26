@@ -39,6 +39,22 @@ const MAX_RETRIES: u32 = 3;
 /// Backoff before each retry, in seconds (exponential).
 const RETRY_BACKOFF_SECS: [u64; MAX_RETRIES as usize] = [2, 4, 8];
 
+/// Register the five aden read tools.
+///
+/// When `available` is true, each tool is registered as active so the model can
+/// use dense aden retrieval from turn one. When false, nothing is registered;
+/// the `aden_tools` discovery seam will report an empty catalog, which is honest.
+fn register_aden_tools(tools: &mut ToolRegistry, dir: &std::path::Path, available: bool) {
+    if !available {
+        return;
+    }
+    tools.register(Box::new(AdenTool::asm(dir.to_path_buf())));
+    tools.register(Box::new(AdenTool::understand(dir.to_path_buf())));
+    tools.register(Box::new(AdenTool::grep(dir.to_path_buf())));
+    tools.register(Box::new(AdenTool::ask(dir.to_path_buf())));
+    tools.register(Box::new(AdenTool::locate(dir.to_path_buf())));
+}
+
 /// A ship's wheel (the coxswain's helm): coxn steers, aden sets the heading.
 /// Shown in the output pane at startup and after `/clear`, until the first turn.
 const LOGO: &str = r#"
@@ -91,15 +107,17 @@ async fn main() -> io::Result<()> {
     // rooted at the working directory. The model pulls context (asm/understand)
     // on demand; aden directs, coxn relays.
     let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    // Deferred disclosure: only the `aden_tools` discovery seam is advertised;
-    // aden's read/search tools (the context layer) are latent, found by intent.
-    // No tool bloat by default.
+
+    // Probe aden availability once at boot. All downstream decisions read from
+    // `caps`; nothing shells out to aden a second time for the same question.
+    let caps = aden::probe(&dir);
+
+    // When aden is present, register its five read tools as active so the model
+    // uses dense retrieval immediately. When absent, register none; the discovery
+    // seam reports an empty catalog, which is honest.
     let mut tools = ToolRegistry::new();
-    tools.register_latent(Box::new(AdenTool::asm(dir.clone())));
-    tools.register_latent(Box::new(AdenTool::understand(dir.clone())));
-    tools.register_latent(Box::new(AdenTool::grep(dir.clone())));
-    tools.register_latent(Box::new(AdenTool::ask(dir.clone())));
-    tools.register_latent(Box::new(AdenTool::locate(dir.clone())));
+    register_aden_tools(&mut tools, &dir, caps.available);
+
     // The action set is always advertised; each mutating call is gated by user
     // approval at the prompt, and (when a task scope is active) by aden's
     // blast-radius gate on top. read_file is advertised with the editors so the
@@ -123,14 +141,14 @@ async fn main() -> io::Result<()> {
     let mut tui = Tui::new()?;
     tui.draw(&view)?;
 
-    let (model, mut sel) = resolve_model(&dir);
+    let (model, mut sel) = resolve_model(&caps);
     view.set_status(format!("{}  |  loading...", sel.label()));
     tui.draw(&view)?;
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: the gate
     // mandate and exactly the seeds' context. No task = bare prompt, edits gated
     // by approval alone.
-    let task = load_task(&dir);
+    let task = load_task(&dir, &caps);
     let mut pump = Pump::new(model, tools);
     if let Some(gate) = task.gate {
         pump.set_gate(gate);
@@ -148,6 +166,7 @@ async fn main() -> io::Result<()> {
         &mut view,
         &mut pump,
         &dir,
+        &caps,
         &mut sel,
         &task.status,
         bwrap,
@@ -160,9 +179,13 @@ async fn main() -> io::Result<()> {
 /// The boot status line: model and task only, no aden `status` call. Used before
 /// the event loop so the slow savings probe does not delay the first prompt; the
 /// savings appear on the first post-turn [`status_line`] refresh.
+///
+/// When no task is active the detail reads `"ungated  /help"` to make explicit
+/// that edits are not scope-governed. A non-empty `task` string carries its own
+/// mode annotation (e.g. "gated" or "ungated, no aden").
 fn boot_status(model_label: &str, task: &str) -> String {
     let detail = if task.is_empty() {
-        "/help".to_string()
+        "ungated  /help".to_string()
     } else {
         format!("{task}  /help")
     };
@@ -246,13 +269,16 @@ fn openai_model(
 }
 
 /// Pick the model backend at runtime, returning it with a short label for the
-/// status line. Resolution order: an explicit `COXN_MODEL_BASE_URL`, then
-/// `.aden/config.toml` (`model.base_url` / `model.name`), then a local provider
+/// status line. Resolution order: an explicit `COXN_MODEL_BASE_URL`, then the
+/// pre-probed aden caps (`model.base_url` / `model.name`), then a local provider
 /// auto-detected on its well-known port (Ollama / LM Studio), then the offline
 /// stub. Selection is data, not a type, so per-role routing and sub-agents drop
 /// in without reworking the seam. The key always comes from the environment,
 /// never the committed config.
-fn resolve_model(dir: &Path) -> (AnyModel, ModelSel) {
+///
+/// `caps` is passed in rather than re-shelling to aden here; startup already
+/// called `aden::probe` once.
+fn resolve_model(caps: &aden::AdenCaps) -> (AnyModel, ModelSel) {
     let env_key = || {
         std::env::var("COXN_MODEL_KEY")
             .ok()
@@ -266,9 +292,12 @@ fn resolve_model(dir: &Path) -> (AnyModel, ModelSel) {
         let model = std::env::var("COXN_MODEL_NAME").unwrap_or_else(|_| "local".to_string());
         return openai_model(base_url, model, env_key(), "env");
     }
-    // 2. aden config (.aden/config.toml). Secrets stay in the env, not the file.
-    if let Some(base_url) = aden::config_get(dir, "model.base_url") {
-        let model = aden::config_get(dir, "model.name").unwrap_or_else(|| "local".to_string());
+    // 2. aden config (.aden/config.toml) read from pre-probed caps.
+    if let Some(base_url) = caps.model_base_url.clone() {
+        let model = caps
+            .model_name
+            .clone()
+            .unwrap_or_else(|| "local".to_string());
         return openai_model(base_url, model, env_key(), "config");
     }
     // 3. Local auto-detection.
@@ -343,9 +372,12 @@ fn switch_model(pump: &mut Pump<AnyModel>, sel: &mut ModelSel, target: &str) -> 
 /// (`route.<role>`), e.g. `route.scout = "qwen2.5-coder"`. Selection is data: the
 /// role is an opaque key, the map is config, coxn only looks it up. The same
 /// lookup the sub-agent runner (B4) uses to pick a model per scope. `None` when
-/// the role is unmapped. (A future `instance:model` value selects the instance
-/// too; today the value is a model id on the active endpoint.)
-fn resolve_role(dir: &Path, role: &str) -> Option<String> {
+/// the role is unmapped or aden is unavailable. (A future `instance:model` value
+/// selects the instance too; today the value is a model id on the active endpoint.)
+fn resolve_role(dir: &Path, caps: &aden::AdenCaps, role: &str) -> Option<String> {
+    if !caps.available {
+        return None;
+    }
     aden::config_get(dir, &format!("route.{role}"))
 }
 
@@ -493,7 +525,10 @@ fn task_config() -> Option<(String, Vec<String>, u64)> {
 /// Render `/agents`: run aden's partition for the current task and show each
 /// sub-scope, the model its role routes to, and its dependencies. Inspection
 /// only -- the autonomous runner (one pump per sub-scope) is a later step.
-fn agents_listing(dir: &Path) -> String {
+fn agents_listing(dir: &Path, caps: &aden::AdenCaps) -> String {
+    if !caps.available {
+        return "aden is not available; /agents requires aden on PATH".to_string();
+    }
     let Some((name, seeds, budget)) = task_config() else {
         return "set COXN_TASK_NAME + COXN_TASK_SEEDS to partition a task".to_string();
     };
@@ -510,7 +545,8 @@ fn agents_listing(dir: &Path) -> String {
     }
     let mut out = format!("partition of '{name}' (dependency order):\n");
     for s in agents::dependency_order(&scopes) {
-        let model = resolve_role(dir, &s.role).unwrap_or_else(|| "(default model)".to_string());
+        let model =
+            resolve_role(dir, caps, &s.role).unwrap_or_else(|| "(default model)".to_string());
         let after = if s.depends_on.is_empty() {
             String::new()
         } else {
@@ -522,22 +558,27 @@ fn agents_listing(dir: &Path) -> String {
     out
 }
 
-/// The minimal operating instruction prepended to the scope context in task
-/// mode. coxn's default prompt is empty (zero-default-context), which leaves a
-/// weak local model passive -- it will not reach for the action tools unprompted
-/// and answers "I can't edit files." DESIGN sanctions this single nudge: it is
-/// operating instruction, not repo context, and appears only when the scope has
-/// actually gated, so editing is governed.
-const AGENT_PREAMBLE: &str = "\
-You are coxn, a coding agent working within a task scope that aden defined. To \
-change code, call `read_file` to get the exact current text, then `edit` (replace \
-an exact unique string) or `write_file` (whole file) -- do not just print a patch \
-for the user to apply. Every edit is gated by aden against the scope and reverted \
-if it escapes, so keep changes minimal and in scope. To build, test, run, or use \
+/// The aden-agnostic action instructions prepended to scope context in task mode.
+///
+/// coxn's default prompt is empty (zero-default-context), which leaves a weak
+/// local model passive. This nudge makes it act even without aden present.
+/// DESIGN sanctions this single preamble: it is operating instruction, not repo
+/// context, and appears only when a task name is active.
+const AGENT_PREAMBLE_BASE: &str = "\
+You are coxn, a coding agent. To change code, call `read_file` to get the exact \
+current text, then `edit` (replace an exact unique string) or `write_file` (whole \
+file) -- do not print a patch for the user to apply. To build, test, run, or use \
 git, call `run_command`: it runs in a sandbox confined to the project, with no \
-network unless you set network:true. Verify your changes by running the tests. To \
-understand or search code, use the aden tools (discover them via `aden_tools`): \
-aden_grep, aden_locate, aden_asm, aden_understand, aden_ask.\n\n\
+network unless you set network:true. Verify your changes by running the tests.\n\n";
+
+/// The aden-specific suffix appended when aden is present and the scope gated.
+///
+/// Appended after [`AGENT_PREAMBLE_BASE`] when aden produced a scope manifest,
+/// so every edit is governed. Followed immediately by the per-seed asm context.
+const AGENT_PREAMBLE_ADEN: &str = "\
+Edits are gated by aden against the task scope and reverted if they escape, so \
+keep changes minimal and in scope. To search or understand code, use the aden \
+tools: aden_grep, aden_locate, aden_asm, aden_understand, aden_ask.\n\n\
 === task scope context ===\n\n";
 
 /// The result of resolving a task scope: the status-line text, the gate (when
@@ -553,7 +594,10 @@ struct Task {
 /// seeds' context. No task means a bare, ungated prompt. coxn parses nothing --
 /// it gates on the manifest file and loads context from `aden asm` on its own
 /// seed inputs.
-fn load_task(dir: &Path) -> Task {
+///
+/// When aden is absent, the base preamble is still loaded so the model can act;
+/// edits are approval-gated only, and the status line records that honestly.
+fn load_task(dir: &Path, caps: &aden::AdenCaps) -> Task {
     let bare = || Task {
         status: String::new(),
         gate: None,
@@ -576,9 +620,10 @@ fn load_task(dir: &Path) -> Task {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8192);
 
-    // Define the mandate: aden scope -> manifest file -> gate.
+    // Define the mandate when aden is available: aden scope -> manifest -> gate.
     let mut gate: Option<Box<dyn gate::Gate>> = None;
-    if !seeds.is_empty()
+    if caps.available
+        && !seeds.is_empty()
         && let Ok(manifest_json) = aden::scope(dir, &name, &seeds, budget)
     {
         let manifest = std::env::temp_dir().join(format!("coxn-scope-{}.json", std::process::id()));
@@ -588,28 +633,38 @@ fn load_task(dir: &Path) -> Task {
     }
     let gated = gate.is_some();
 
-    // Assemble exactly the scope's context: the operating preamble (only when
-    // gated, so the model is told to act and edits are governed) plus the seeds'
-    // assembled neighborhoods.
-    let mut context = String::new();
+    // Assemble context: always start with the base preamble so the model acts.
+    // When gated, append the aden suffix and the seeds' assembled neighborhoods.
+    // When aden is absent, append a one-line note instead.
+    let mut context = AGENT_PREAMBLE_BASE.to_string();
     if gated {
-        context.push_str(AGENT_PREAMBLE);
-    }
-    for s in &seeds {
-        if let Ok(text) = aden::pull(dir, aden::Pull::Asm(s)) {
-            context.push_str(&text);
-            context.push('\n');
+        context.push_str(AGENT_PREAMBLE_ADEN);
+        for s in &seeds {
+            if let Ok(text) = aden::pull(dir, aden::Pull::Asm(s)) {
+                context.push_str(&text);
+                context.push('\n');
+            }
         }
+    } else if !caps.available {
+        context.push_str(
+            "aden is not available, so edits are gated by your approval only; \
+browse code with read_file and run_command (e.g. grep).\n\n",
+        );
     }
 
+    let status = if gated {
+        format!("task '{name}' ({} seed(s), gated)", seeds.len())
+    } else if caps.available {
+        // aden is present but produced no gate (no seeds, or scope failed).
+        format!("task '{name}' (ungated)")
+    } else {
+        format!("task '{name}' (ungated, no aden)")
+    };
+
     Task {
-        status: format!(
-            "task '{name}' ({} seed(s){})",
-            seeds.len(),
-            if gated { ", gated" } else { "" }
-        ),
+        status,
         gate,
-        context: (!context.is_empty()).then_some(context),
+        context: Some(context),
     }
 }
 
@@ -847,11 +902,13 @@ impl TurnIo for DriveIo<'_> {
 
 /// The event loop: draw, read a key, route it by mode (modal vs input), and run
 /// a turn on submit. Carries no intelligence; it only paces and shuttles.
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     tui: &mut Tui,
     view: &mut View,
     pump: &mut Pump<AnyModel>,
     dir: &Path,
+    caps: &aden::AdenCaps,
     sel: &mut ModelSel,
     task: &str,
     bwrap: bool,
@@ -986,7 +1043,7 @@ async fn drive(
                             // `@role` resolves through the [route] table; anything
                             // else is a model name or index.
                             let resolved = if let Some(role) = target.strip_prefix('@') {
-                                resolve_role(dir, role).ok_or_else(|| {
+                                resolve_role(dir, caps, role).ok_or_else(|| {
                                     format!(
                                         "no model mapped for role '@{role}'; set route.{role} via aden config"
                                     )
@@ -1008,7 +1065,7 @@ async fn drive(
                             }
                         }
                         Command::Tools => view.output = pump.tool_catalog(),
-                        Command::Agents => view.output = agents_listing(dir),
+                        Command::Agents => view.output = agents_listing(dir, caps),
                         Command::Think(arg) => {
                             view.output = match arg.as_deref().map(ThinkingLevel::parse) {
                                 Some(Some(level)) => {
@@ -1309,5 +1366,84 @@ mod tests {
             arguments: r#"{"network":true}"#.into(),
         };
         assert_eq!(command_key(&missing_field), None);
+    }
+
+    #[test]
+    fn boot_status_ungated_when_no_task() {
+        // No task -> detail must contain "ungated".
+        let s = boot_status("stub-model", "");
+        assert!(s.contains("ungated"), "expected 'ungated' in: {s}");
+        assert!(!s.contains("/help") || s.contains("ungated"), "{s}");
+    }
+
+    #[test]
+    fn boot_status_task_text_when_task_set() {
+        // A non-empty task string appears in the status line.
+        let s = boot_status("stub-model", "task 'foo' (1 seed(s), gated)");
+        assert!(s.contains("task 'foo'"), "expected task text in: {s}");
+        // Should not inject "ungated" when the task string is already set.
+        assert!(!s.starts_with("ungated"), "{s}");
+    }
+
+    #[test]
+    fn register_aden_tools_active_when_available() {
+        let mut tools = ToolRegistry::new();
+        register_aden_tools(&mut tools, std::path::Path::new("."), true);
+        let names: Vec<String> = tools
+            .advertised_defs()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for expected in [
+            "aden_asm",
+            "aden_understand",
+            "aden_grep",
+            "aden_ask",
+            "aden_locate",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing {expected} in {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn register_aden_tools_empty_when_unavailable() {
+        let mut tools = ToolRegistry::new();
+        register_aden_tools(&mut tools, std::path::Path::new("."), false);
+        let names: Vec<String> = tools
+            .advertised_defs()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for absent in [
+            "aden_asm",
+            "aden_understand",
+            "aden_grep",
+            "aden_ask",
+            "aden_locate",
+        ] {
+            assert!(
+                !names.contains(&absent.to_string()),
+                "unexpected {absent} in {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preamble_base_has_no_aden_references() {
+        assert!(
+            !AGENT_PREAMBLE_BASE.contains("aden"),
+            "AGENT_PREAMBLE_BASE must not mention aden: {AGENT_PREAMBLE_BASE}"
+        );
+    }
+
+    #[test]
+    fn preamble_aden_mentions_aden() {
+        assert!(
+            AGENT_PREAMBLE_ADEN.contains("aden"),
+            "AGENT_PREAMBLE_ADEN must mention aden"
+        );
     }
 }
