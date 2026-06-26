@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-25
+
 ### Added
 
 - `run_command` tool: the model can run shell commands and close the
@@ -53,4 +55,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The blast-radius gate now degrades for commands: it detects and reports
   scope impact rather than reverting (commands are not snapshot-revertible).
 
-[Unreleased]: https://github.com/RioPlay/coxn/compare/HEAD...HEAD
+### Fixed
+
+- File tools reject paths that resolve outside the project root through a
+  symlink (including a dangling symlink component), closing a path-escape the
+  earlier component-only check missed.
+- Session-scoped approvals reset when switching sessions via `/resume` or the
+  session picker, so an approval granted in one session does not carry over.
+- The `aden_tools` discovery seam and `/tools` list the active aden tools
+  (previously they searched only the latent set, which is empty once aden is
+  present).
+
+[Unreleased]: https://github.com/RioPlay/coxn/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/RioPlay/coxn/releases/tag/v0.2.0
