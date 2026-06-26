@@ -88,6 +88,11 @@ pub trait Tool {
     fn target_path(&self, _arguments: &str) -> Option<PathBuf> {
         None
     }
+    /// The sandbox parameters for a shell-command tool: `(root_dir, use_bwrap)`.
+    /// Only `RunTool` overrides this; all other tools return `None`.
+    fn sandbox_params(&self) -> Option<(&Path, bool)> {
+        None
+    }
 }
 
 /// The name of the always-present discovery seam. The model calls it with an
@@ -200,6 +205,13 @@ impl ToolRegistry {
     pub fn target_path(&self, call: &ToolCall) -> Option<PathBuf> {
         self.find(&call.name)
             .and_then(|t| t.target_path(&call.arguments))
+    }
+
+    /// The sandbox parameters for the active `run_command` tool, if present.
+    /// Returns `(root_dir, use_bwrap)` so the streaming path can spawn the child
+    /// without borrowing the registry across an await point.
+    pub fn run_command_params(&self) -> Option<(&Path, bool)> {
+        self.find("run_command").and_then(|t| t.sandbox_params())
     }
 
     /// Find a tool by name across active and latent sets.
@@ -628,6 +640,10 @@ impl Tool for RunTool {
         false
     }
 
+    fn sandbox_params(&self) -> Option<(&Path, bool)> {
+        Some((&self.dir, self.bwrap))
+    }
+
     fn run(&self, arguments: &str) -> ToolResult {
         let command = arg(arguments, "command");
         if command.trim().is_empty() {
@@ -642,7 +658,7 @@ impl Tool for RunTool {
 
 /// Render a command's outcome as the text fed back to the model: a sandbox
 /// warning when it ran unconfined, the exit status, then the (capped) output.
-fn format_run(outcome: &crate::sandbox::RunOutcome) -> String {
+pub(crate) fn format_run(outcome: &crate::sandbox::RunOutcome) -> String {
     let mut s = String::new();
     if outcome.confinement == crate::sandbox::Confinement::Unsandboxed {
         s.push_str("WARNING: bwrap not found; command ran WITHOUT sandbox isolation (approval was the only gate).\n");

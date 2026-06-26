@@ -817,6 +817,8 @@ struct DriveIo<'a> {
     view: &'a mut View,
     prior: &'a str,
     buf: String,
+    /// Accumulated live output from a streaming run_command call.
+    run_buf: String,
     /// Set when the stream was cancelled (Ctrl-C mid-reply).
     cancelled: bool,
     /// Set when an approval prompt returned cancel-turn.
@@ -830,12 +832,40 @@ struct DriveIo<'a> {
     bwrap: bool,
 }
 
+impl DriveIo<'_> {
+    /// Repaint the output pane with the current assistant text and any live
+    /// run_command output appended below it.
+    fn repaint(&mut self) {
+        self.view.output = if self.run_buf.is_empty() {
+            format!("{}\ncoxn: {}", self.prior, self.buf)
+        } else {
+            format!("{}\ncoxn: {}\n{}", self.prior, self.buf, self.run_buf)
+        };
+        let _ = self.tui.draw(self.view);
+    }
+}
+
 impl TurnIo for DriveIo<'_> {
     fn on_delta(&mut self, delta: &str) -> bool {
         self.buf.push_str(delta);
-        self.view.output = format!("{}\ncoxn: {}", self.prior, self.buf);
-        let _ = self.tui.draw(self.view);
+        self.repaint();
         // Non-blocking cancel check: Ctrl-C aborts the turn.
+        if let Ok(true) = event::poll(Duration::ZERO)
+            && let Ok(Event::Key(key)) = event::read()
+            && key.kind == KeyEventKind::Press
+            && matches!(map_input_key(key), Some(Action::Quit))
+        {
+            self.cancelled = true;
+            return false;
+        }
+        true
+    }
+
+    fn on_run_output(&mut self, line: &str) -> bool {
+        self.run_buf.push_str(line);
+        self.run_buf.push('\n');
+        self.repaint();
+        // Non-blocking cancel check: Ctrl-C kills the child.
         if let Ok(true) = event::poll(Duration::ZERO)
             && let Ok(Event::Key(key)) = event::read()
             && key.kind == KeyEventKind::Press
@@ -1169,6 +1199,7 @@ async fn drive(
                         view,
                         prior: &prior,
                         buf: String::new(),
+                        run_buf: String::new(),
                         cancelled: false,
                         cancel_turn: false,
                         approvals: &mut approvals,

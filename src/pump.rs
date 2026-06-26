@@ -66,6 +66,11 @@ pub trait TurnIo {
     fn approve(&mut self, _call: &ToolCall) -> Approval {
         Approval::Allow
     }
+    /// A line of live output from a streaming `run_command` call. Return `false`
+    /// to cancel (kill the child). Default: accept all lines silently.
+    fn on_run_output(&mut self, _line: &str) -> bool {
+        true
+    }
 }
 
 /// A silent [`TurnIo`]: stream nothing, allow every mutation. Test-only -- it
@@ -268,12 +273,18 @@ impl<M: Model> Pump<M> {
             // task scope is active) gated by aden. Every call gets a result so
             // tool-call/result pairing stays valid even on a mid-turn cancel.
             let mut end_turn = false;
-            for call in &response.tool_calls {
+            for call in &response.tool_calls.clone() {
                 let result = if end_turn {
                     "turn cancelled by the user".to_string()
                 } else if self.tools.mutates(&call.name) {
                     match io.approve(call) {
-                        Approval::Allow => self.run_gated_mutation(call),
+                        Approval::Allow => {
+                            if !self.tools.revertible(&call.name) {
+                                self.run_command_streaming(call, io).await
+                            } else {
+                                self.run_gated_mutation(call)
+                            }
+                        }
                         Approval::Decline => format!("the user declined the {} call", call.name),
                         Approval::CancelTurn => {
                             end_turn = true;
@@ -299,13 +310,14 @@ impl<M: Model> Pump<M> {
     /// on disk to be judged: the pump snapshots the target, applies the tool,
     /// runs the gate, and reverts the file on a block. Returns the text fed back
     /// to the model.
+    ///
+    /// For revertible (file-edit) tools, a blocked mutation reverts the file on
+    /// disk. For non-revertible tools (commands), `gate_command_result` handles
+    /// the gate tail so the behaviour matches the streaming path.
     fn run_gated_mutation(&mut self, call: &ToolCall) -> String {
-        // A file edit can be undone by restoring a single-file snapshot; a
-        // command's arbitrary effects cannot, so it skips the snapshot and the
-        // gate degrades to detection-and-report rather than reverting.
         let revertible = self.tools.revertible(&call.name);
-        // The user already approved this call. Snapshot the target (if any)
-        // before applying, so a gate-blocked edit can be reverted.
+        // Snapshot the target before applying so a gate-blocked edit can be
+        // reverted. Non-revertible tools skip the snapshot.
         let path = self.tools.target_path(call);
         let snapshot = if revertible {
             path.as_deref().map(Snapshot::capture)
@@ -317,38 +329,89 @@ impl<M: Model> Pump<M> {
             Ok(text) => text,
             Err(err) => return err,
         };
+        if !revertible {
+            // Commands use the shared gate-tail helper so the behaviour cannot
+            // diverge from the streaming path.
+            return self.gate_command_result(applied);
+        }
         // With no task scope, the user's approval is the only gate and the
         // effect stands. With a scope, aden also judges the working-tree diff.
         let Some(gate) = self.gate.as_ref() else {
-            if revertible {
-                self.last_edited = path;
-            }
+            self.last_edited = path;
             return applied;
         };
         let outcome = gate.check();
         if outcome.proceed() {
-            if revertible {
-                self.last_edited = path;
-            }
+            self.last_edited = path;
             return applied;
         }
-        // Out of scope. Record the block for the TUI, then either revert the
-        // file (an edit) or report honestly that a command's effects stand.
+        // Out of scope: revert the file and report the block.
         self.last_block = Some(outcome.clone());
-        if revertible {
-            if let (Some(p), Some(snap)) = (&path, &snapshot) {
-                snap.restore(p);
-            }
-            format!(
-                "EDIT BLOCKED by aden gate: {}. The change was reverted; revise to stay in scope.",
-                outcome.message
-            )
-        } else {
-            format!(
-                "{applied}\n\nWARNING: the aden gate reports this command pushed the working tree out of scope: {}. coxn cannot auto-revert a command's effects -- inspect and revert manually if needed.",
-                outcome.message
-            )
+        if let (Some(p), Some(snap)) = (&path, &snapshot) {
+            snap.restore(p);
         }
+        format!(
+            "EDIT BLOCKED by aden gate: {}. The change was reverted; revise to stay in scope.",
+            outcome.message
+        )
+    }
+
+    /// Gate tail for a non-revertible command result: record a block when the
+    /// gate fires, append the WARNING note, or return the applied output cleanly.
+    /// Called by both `run_gated_mutation` (non-revertible path, now removed) and
+    /// `run_command_streaming`, so the behaviour cannot diverge.
+    fn gate_command_result(&mut self, applied: String) -> String {
+        let Some(gate) = self.gate.as_ref() else {
+            return applied;
+        };
+        let outcome = gate.check();
+        if outcome.proceed() {
+            return applied;
+        }
+        self.last_block = Some(outcome.clone());
+        format!(
+            "{applied}\n\nWARNING: the aden gate reports this command pushed the working tree out of scope: {}. coxn cannot auto-revert a command's effects -- inspect and revert manually if needed.",
+            outcome.message
+        )
+    }
+
+    /// Streaming `run_command` path: spawn the child asynchronously, feed each
+    /// line to `io.on_run_output` for live TUI rendering, then apply the gate.
+    /// Falls back to `run_gated_mutation` when `run_command_params` is unavailable
+    /// so any future non-revertible-non-command tool still works.
+    async fn run_command_streaming(&mut self, call: &ToolCall, io: &mut dyn TurnIo) -> String {
+        // Copy out sandbox params before the await so no borrow of self.tools
+        // crosses the await point.
+        let Some((dir, bwrap)) = self.tools.run_command_params() else {
+            return self.run_gated_mutation(call);
+        };
+        let dir = dir.to_path_buf();
+
+        // Parse the command and network flag from the call arguments, mirroring
+        // the arg/arg_bool logic in RunTool::run.
+        let command = match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+            Ok(v) if v.is_object() => v
+                .get("command")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string(),
+            _ => call.arguments.trim().to_string(),
+        };
+        if command.trim().is_empty() {
+            return "run_command needs a command argument".to_string();
+        }
+        let network = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|v| v.get("network").and_then(|n| n.as_bool()))
+            .unwrap_or(false);
+
+        let outcome = crate::sandbox::run_streaming(&dir, &command, network, bwrap, &mut |line| {
+            io.on_run_output(line)
+        })
+        .await;
+
+        let applied = crate::tools::format_run(&outcome);
+        self.gate_command_result(applied)
     }
 }
 
