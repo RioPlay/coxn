@@ -119,6 +119,19 @@ fn safe_env(home: &str, cargo_home: &str, rustup_home: &str) -> Vec<(String, Str
 /// Build the bwrap flag list: project root read-write, the rest of the
 /// filesystem read-only, fresh namespaces, no network unless `network`, a
 /// cleared-and-whitelisted environment, and `sh -c <command>` as the payload.
+///
+/// Accepted residuals:
+///
+/// (a) No seccomp filter is applied. This is deferred because `--unshare-all`
+/// drops all user-namespace capabilities (the primary guard), and maintaining a
+/// correct syscall BPF allowlist across kernel versions is too much surface area
+/// for a six-crate project.
+///
+/// (b) Writes to `./.cargo/config.toml` inside the read-write project bind
+/// persist to the host and can affect future unsandboxed `cargo` runs. The host
+/// `~/.cargo` is bound read-only, so the risk is limited to in-project config.
+/// The approval prompt and aden's scope gate (when a task is active) surface
+/// this before any run_command executes.
 fn bwrap_args(
     root: &Path,
     network: bool,

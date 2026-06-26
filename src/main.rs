@@ -739,6 +739,21 @@ fn approval_summary(call: &ToolCall, bwrap: bool) -> String {
     }
 }
 
+/// Extract the trimmed command string from a `run_command` tool call so that
+/// session approval can be scoped to the exact command rather than the tool
+/// name. Returns `Some(trimmed_command)` when the call is `run_command` and its
+/// arguments parse to a JSON object with a string `"command"` field; `None` for
+/// any other tool or malformed arguments. A `None` result means session approval
+/// must never auto-allow via the command path.
+fn command_key(call: &ToolCall) -> Option<String> {
+    if call.name != "run_command" {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+    let cmd = v.get("command")?.as_str()?;
+    Some(cmd.trim().to_string())
+}
+
 /// The per-turn terminal I/O the pump drives: stream the reply live (with a
 /// Ctrl-C cancel check between fragments) and prompt for approval before a
 /// mutating tool runs. Owns the terminal borrows so the pump needs one handle.
@@ -752,6 +767,9 @@ struct DriveIo<'a> {
     /// Set when an approval prompt returned cancel-turn.
     cancel_turn: bool,
     approvals: &'a mut HashSet<String>,
+    /// Session-approved command strings for `run_command`. Keyed on the exact
+    /// trimmed command so [s] on one command does not auto-allow a different one.
+    approved_commands: &'a mut HashSet<String>,
     /// Whether bwrap confinement is available, surfaced in the run_command
     /// approval prompt so the user knows the isolation level before approving.
     bwrap: bool,
@@ -775,15 +793,25 @@ impl TurnIo for DriveIo<'_> {
     }
 
     fn approve(&mut self, call: &ToolCall) -> Approval {
-        // A tool approved for the session never prompts again.
-        if self.approvals.contains(&call.name) {
+        // run_command session approval is keyed on the exact command string, not
+        // the tool name, so [s] on one command does not auto-allow a different one.
+        if let Some(cmd) = command_key(call) {
+            if self.approved_commands.contains(&cmd) {
+                return Approval::Allow;
+            }
+        } else if self.approvals.contains(&call.name) {
+            // For all other tools, session approval is by tool name.
             return Approval::Allow;
         }
         let summary = approval_summary(call, self.bwrap);
+        let session_label = if command_key(call).is_some() {
+            "[s]ession (this exact command)".to_string()
+        } else {
+            format!("[s]ession (all {} calls)", call.name)
+        };
         loop {
             self.view.set_status(format!(
-                "approve {summary}?  [o]nce  [s]ession (all {} calls)  [d]ecline  [x] cancel turn",
-                call.name
+                "approve {summary}?  [o]nce  {session_label}  [d]ecline  [x] cancel turn",
             ));
             let _ = self.tui.draw(self.view);
             if event::poll(TICK).unwrap_or(false)
@@ -798,7 +826,11 @@ impl TurnIo for DriveIo<'_> {
                 match key.code {
                     KeyCode::Char('o' | 'O') => return Approval::Allow,
                     KeyCode::Char('s' | 'S') => {
-                        self.approvals.insert(call.name.clone());
+                        if let Some(cmd) = command_key(call) {
+                            self.approved_commands.insert(cmd);
+                        } else {
+                            self.approvals.insert(call.name.clone());
+                        }
                         return Approval::Allow;
                     }
                     KeyCode::Char('d' | 'D') => return Approval::Decline,
@@ -830,6 +862,8 @@ async fn drive(
     let mut persisted = 0usize;
     // Tool names approved "for the session" -- they skip the approval prompt.
     let mut approvals: HashSet<String> = HashSet::new();
+    // Exact command strings approved for the session via run_command [s].
+    let mut approved_commands: HashSet<String> = HashSet::new();
     loop {
         tui.draw(view)?;
 
@@ -1044,6 +1078,7 @@ async fn drive(
                             session = session::Session::create();
                             persisted = 0;
                             approvals.clear();
+                            approved_commands.clear();
                             view.set_status(status_line(
                                 dir,
                                 &sel.label(),
@@ -1080,6 +1115,7 @@ async fn drive(
                         cancelled: false,
                         cancel_turn: false,
                         approvals: &mut approvals,
+                        approved_commands: &mut approved_commands,
                         bwrap,
                     };
                     let r = pump.run_turn_streaming(&mut io).await;
@@ -1238,5 +1274,40 @@ mod tests {
             parse_command("/bogus"),
             Command::Unknown("bogus".to_string())
         );
+    }
+
+    #[test]
+    fn command_key_extracts_trimmed_command_for_run_command() {
+        // Valid run_command call yields the trimmed command string.
+        let valid = ToolCall {
+            id: "t1".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"  cargo test  "}"#.into(),
+        };
+        assert_eq!(command_key(&valid), Some("cargo test".to_string()));
+
+        // A different tool name always returns None.
+        let other = ToolCall {
+            id: "t2".into(),
+            name: "edit".into(),
+            arguments: r#"{"command":"cargo test"}"#.into(),
+        };
+        assert_eq!(command_key(&other), None);
+
+        // Malformed JSON returns None.
+        let bad_json = ToolCall {
+            id: "t3".into(),
+            name: "run_command".into(),
+            arguments: "not json".into(),
+        };
+        assert_eq!(command_key(&bad_json), None);
+
+        // Missing "command" field returns None.
+        let missing_field = ToolCall {
+            id: "t4".into(),
+            name: "run_command".into(),
+            arguments: r#"{"network":true}"#.into(),
+        };
+        assert_eq!(command_key(&missing_field), None);
     }
 }
