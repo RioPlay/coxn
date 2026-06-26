@@ -13,6 +13,7 @@
 //! it. No new crate: `bwrap` and `timeout` are shelled out, the same pattern as
 //! aden.
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -206,16 +207,65 @@ fn bwrap_args(
     a
 }
 
+/// Build the full argv (program at index 0) for a command run: optional timeout
+/// prefix, then either bwrap with its flags, or plain sh -c. Both `run` and
+/// `run_streaming` call this so the logic lives in one place.
+fn build_argv(
+    root: &Path,
+    command: &str,
+    network: bool,
+    use_bwrap: bool,
+    home: &str,
+    cargo_home: &str,
+    rustup_home: &str,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    if probe("timeout") {
+        argv.push("timeout".to_string());
+        argv.push(format!("--kill-after={KILL_GRACE_SECS}s"));
+        argv.push(format!("{}s", timeout_secs()));
+    }
+    if use_bwrap {
+        let env = safe_env("/tmp", cargo_home, rustup_home);
+        argv.push("bwrap".to_string());
+        argv.extend(bwrap_args(
+            root,
+            network,
+            &env,
+            cargo_home,
+            rustup_home,
+            command,
+        ));
+    } else {
+        argv.push("sh".to_string());
+        argv.push("-c".to_string());
+        argv.push(command.to_string());
+    }
+    let _ = (home, network); // used only via bwrap_args when use_bwrap; suppress warning
+    argv
+}
+
+/// Apply the cleared-and-whitelisted environment to a `std::process::Command`
+/// for the non-bwrap (direct exec) path. Factored out so both `run` and the
+/// streaming path share identical env setup without duplication.
+fn apply_fallback_env(
+    cmd: &mut Command,
+    root: &Path,
+    home: &str,
+    cargo_home: &str,
+    rustup_home: &str,
+) {
+    cmd.current_dir(root);
+    cmd.env_clear();
+    for (k, v) in safe_env(home, cargo_home, rustup_home) {
+        cmd.env(k, v);
+    }
+}
+
 /// Run `command` confined to `root`. `network` opts the sandbox into the host
 /// network; `use_bwrap` selects the sandbox or the direct-exec fallback (coxn
 /// probes bwrap once at startup and passes the answer here). Blocking: the
 /// caller runs it on the pump's synchronous tool-dispatch path.
-//
-// FIXME(async): this blocks until the command exits, freezing the TUI for the
-// duration (bounded by the timeout). The non-blocking upgrade is a tokio
-// child + line channel drained by the draw loop; it needs an async Tool::run,
-// so it is a separate change. The approval prompt warns the user a command is
-// about to run, so the freeze is expected, not a surprise.
 pub fn run(root: &Path, command: &str, network: bool, use_bwrap: bool) -> RunOutcome {
     let confinement = if use_bwrap {
         Confinement::Sandboxed
@@ -236,49 +286,20 @@ pub fn run(root: &Path, command: &str, network: bool, use_bwrap: bool) -> RunOut
     let cargo_home = env_or("CARGO_HOME", &format!("{home}/.cargo"));
     let rustup_home = env_or("RUSTUP_HOME", &format!("{home}/.rustup"));
 
-    // Wall-clock guard via coreutils `timeout` when present (SIGTERM at the
-    // deadline, SIGKILL after a grace window). --die-with-parent then reaps the
-    // sandbox children.
-    let mut argv: Vec<String> = Vec::new();
-    if probe("timeout") {
-        argv.push("timeout".to_string());
-        argv.push(format!("--kill-after={KILL_GRACE_SECS}s"));
-        argv.push(format!("{}s", timeout_secs()));
-    }
-
-    let mut cmd;
-    if use_bwrap {
-        // HOME points at the in-sandbox tmpfs so host dotfiles are unreachable;
-        // CARGO_HOME/RUSTUP_HOME stay the real (read-only bound) paths.
-        let env = safe_env("/tmp", &cargo_home, &rustup_home);
-        argv.push("bwrap".to_string());
-        argv.extend(bwrap_args(
-            root,
-            network,
-            &env,
-            &cargo_home,
-            &rustup_home,
-            command,
-        ));
-        let (prog, rest) = argv.split_first().expect("argv is non-empty");
-        cmd = Command::new(prog);
-        cmd.args(rest);
-        // bwrap isolates the child env via --clearenv, so the outer env is moot.
-    } else {
-        // No filesystem or network isolation is possible without bwrap. Still
-        // clear the environment so secrets do not leak, pin the cwd to the
-        // project root, and run through sh -c.
-        argv.push("sh".to_string());
-        argv.push("-c".to_string());
-        argv.push(command.to_string());
-        let (prog, rest) = argv.split_first().expect("argv is non-empty");
-        cmd = Command::new(prog);
-        cmd.args(rest);
-        cmd.current_dir(root);
-        cmd.env_clear();
-        for (k, v) in safe_env(&home, &cargo_home, &rustup_home) {
-            cmd.env(k, v);
-        }
+    let argv = build_argv(
+        root,
+        command,
+        network,
+        use_bwrap,
+        &home,
+        &cargo_home,
+        &rustup_home,
+    );
+    let (prog, rest) = argv.split_first().expect("argv is non-empty");
+    let mut cmd = Command::new(prog);
+    cmd.args(rest);
+    if !use_bwrap {
+        apply_fallback_env(&mut cmd, root, &home, &cargo_home, &rustup_home);
     }
     cmd.stdin(Stdio::null());
 
@@ -305,6 +326,167 @@ pub fn run(root: &Path, command: &str, network: bool, use_bwrap: bool) -> RunOut
             timed_out: false,
             output: format!("failed to launch command: {e}"),
         },
+    }
+}
+
+/// Streaming equivalent of [`run`]: spawns the command asynchronously and calls
+/// `on_line` for each line of output as it arrives. Returning `false` from
+/// `on_line` kills the child and stops collection. The returned [`RunOutcome`]
+/// carries the same capped output and exit-code semantics as `run`.
+///
+/// Stderr is merged into stdout via `( cmd ) 2>&1` in the shell invocation so a
+/// single pipe covers both streams; no `select!` is needed.
+pub async fn run_streaming(
+    root: &Path,
+    command: &str,
+    network: bool,
+    use_bwrap: bool,
+    on_line: &mut dyn FnMut(&str) -> bool,
+) -> RunOutcome {
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command as TokioCommand;
+
+    let confinement = if use_bwrap {
+        Confinement::Sandboxed
+    } else {
+        Confinement::Unsandboxed
+    };
+    let command = command.trim();
+    if command.is_empty() {
+        return RunOutcome {
+            confinement,
+            exit_code: None,
+            timed_out: false,
+            output: "no command given".to_string(),
+        };
+    }
+
+    let home = env_or("HOME", "/tmp");
+    let cargo_home = env_or("CARGO_HOME", &format!("{home}/.cargo"));
+    let rustup_home = env_or("RUSTUP_HOME", &format!("{home}/.rustup"));
+
+    // Merge stderr into stdout inside the shell so one pipe covers both streams.
+    let merged = format!("( {command} ) 2>&1");
+    let argv = build_argv(
+        root,
+        &merged,
+        network,
+        use_bwrap,
+        &home,
+        &cargo_home,
+        &rustup_home,
+    );
+    let (prog, rest) = argv.split_first().expect("argv is non-empty");
+
+    let mut cmd = TokioCommand::new(prog);
+    cmd.args(rest);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::null()); // stderr is already merged via the shell wrapper
+    if !use_bwrap {
+        cmd.current_dir(root);
+        cmd.env_clear();
+        for (k, v) in safe_env(&home, &cargo_home, &rustup_home) {
+            cmd.env(k, v);
+        }
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return RunOutcome {
+                confinement,
+                exit_code: None,
+                timed_out: false,
+                output: format!("failed to launch command: {e}"),
+            };
+        }
+    };
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut reader = tokio::io::BufReader::new(stdout).lines();
+    let mut cap = StreamCap::new();
+
+    while let Ok(Some(line)) = reader.next_line().await {
+        cap.push(&line);
+        if !on_line(&line) {
+            child.start_kill().ok();
+            break;
+        }
+    }
+
+    let status = child.wait().await.ok();
+    let exit_code = status.and_then(|s| s.code());
+    RunOutcome {
+        confinement,
+        exit_code,
+        timed_out: exit_code == Some(TIMEOUT_EXIT_CODE),
+        output: cap.into_string(),
+    }
+}
+
+/// Bounded accumulator for streaming output: keeps a head window, ring-buffers
+/// a tail window, and enforces the same character cap as [`cap_output`].
+struct StreamCap {
+    head: Vec<String>,
+    tail: VecDeque<String>,
+    total_lines: usize,
+    chars: usize,
+    over_budget: bool,
+}
+
+impl StreamCap {
+    fn new() -> Self {
+        Self {
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            total_lines: 0,
+            chars: 0,
+            over_budget: false,
+        }
+    }
+
+    fn push(&mut self, line: &str) {
+        if self.over_budget {
+            return;
+        }
+        self.total_lines += 1;
+        self.chars += line.len() + 1; // +1 for the newline
+        if self.chars > OUTPUT_CHAR_CAP {
+            self.over_budget = true;
+            return;
+        }
+        if self.head.len() < HEAD_LINES {
+            self.head.push(line.to_string());
+        } else {
+            self.tail.push_back(line.to_string());
+            if self.tail.len() > TAIL_LINES {
+                self.tail.pop_front();
+            }
+        }
+    }
+
+    fn into_string(self) -> String {
+        let head_count = self.head.len();
+        let tail_count = self.tail.len();
+        let total = self.total_lines;
+
+        let mut out = self.head.join("\n");
+        if total > head_count + tail_count {
+            let omitted = total - head_count - tail_count;
+            out.push_str(&format!("\n... ({omitted} lines omitted) ...\n"));
+            out.push_str(&self.tail.iter().cloned().collect::<Vec<_>>().join("\n"));
+        } else if !self.tail.is_empty() {
+            out.push('\n');
+            out.push_str(&self.tail.iter().cloned().collect::<Vec<_>>().join("\n"));
+        }
+        if self.over_budget && out.chars().count() > OUTPUT_CHAR_CAP {
+            out = out.chars().take(OUTPUT_CHAR_CAP).collect::<String>();
+            out.push_str("\n... (output truncated) ...");
+        } else if self.over_budget {
+            out.push_str("\n... (output truncated) ...");
+        }
+        out
     }
 }
 
@@ -503,5 +685,144 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn sandboxed_streaming_confines_and_blocks_network_when_bwrap_present() {
+        // The streaming path shares build_argv with run(), so the same bwrap
+        // isolation must hold: writes outside the root are blocked and network
+        // is off by default. Re-verified here so a future streaming change that
+        // drifts from the shared argv is caught.
+        if !bwrap_available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("coxn-sbx-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create root");
+
+        let mut sink = |_: &str| true;
+        let ro = run_streaming(
+            &dir,
+            "echo x > /usr/coxn_stream_probe 2>/dev/null && echo WROTE || echo BLOCKED",
+            false,
+            true,
+            &mut sink,
+        )
+        .await;
+        assert_eq!(ro.confinement, Confinement::Sandboxed);
+        assert!(
+            ro.output.contains("BLOCKED"),
+            "ro-bind not enforced: {}",
+            ro.output
+        );
+        assert!(!std::path::Path::new("/usr/coxn_stream_probe").exists());
+
+        let net = run_streaming(
+            &dir,
+            "getent hosts example.com >/dev/null 2>&1 && echo UP || echo DOWN",
+            false,
+            true,
+            &mut sink,
+        )
+        .await;
+        assert!(
+            net.output.contains("DOWN"),
+            "network not blocked: {}",
+            net.output
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- StreamCap unit tests ------------------------------------------------
+
+    #[test]
+    fn stream_cap_short_output_passes_through() {
+        let mut cap = StreamCap::new();
+        cap.push("a");
+        cap.push("b");
+        cap.push("c");
+        let out = cap.into_string();
+        assert!(out.contains("a"), "missing 'a': {out}");
+        assert!(out.contains("b"), "missing 'b': {out}");
+        assert!(out.contains("c"), "missing 'c': {out}");
+        assert!(!out.contains("omitted"), "unexpected elision: {out}");
+    }
+
+    #[test]
+    fn stream_cap_elides_the_middle_of_long_output() {
+        let mut cap = StreamCap::new();
+        let total = HEAD_LINES + TAIL_LINES + 10;
+        for i in 0..total {
+            cap.push(&format!("line{i}"));
+        }
+        let out = cap.into_string();
+        // Head lines present.
+        assert!(out.contains("line0"), "head missing: {out:.200}");
+        // Tail lines present.
+        assert!(
+            out.contains(&format!("line{}", total - 1)),
+            "tail missing: {out:.200}"
+        );
+        // Elision marker present with correct count.
+        let omitted = total - HEAD_LINES - TAIL_LINES;
+        assert!(
+            out.contains(&format!("({omitted} lines omitted)")),
+            "elision marker missing: {out:.200}"
+        );
+    }
+
+    #[test]
+    fn stream_cap_head_and_tail_preserved_correctly() {
+        let mut cap = StreamCap::new();
+        // Exactly one line more than head+tail to trigger elision.
+        let total = HEAD_LINES + TAIL_LINES + 1;
+        for i in 0..total {
+            cap.push(&format!("{i}"));
+        }
+        let out = cap.into_string();
+        // First head lines must be in order.
+        assert!(out.starts_with("0\n"), "head[0] missing: {out:.80}");
+        assert!(
+            out.contains(&format!("{}", HEAD_LINES - 1)),
+            "head last missing"
+        );
+        // Last tail line (the very last pushed) must appear.
+        assert!(out.contains(&format!("{}", total - 1)), "tail last missing");
+        // The line that would fall in the elided middle must NOT appear as a
+        // standalone value (it's inside the marker text range).
+        assert!(
+            out.contains("(1 lines omitted)"),
+            "expected 1-line elision: {out:.200}"
+        );
+    }
+
+    // ---- run_streaming integration tests -------------------------------------
+
+    #[tokio::test]
+    async fn run_streaming_collects_lines_and_reports_exit_zero() {
+        let dir = std::env::temp_dir();
+        let mut lines: Vec<String> = Vec::new();
+        let outcome = run_streaming(&dir, "printf 'a\\nb\\nc'", false, false, &mut |line| {
+            lines.push(line.to_string());
+            true
+        })
+        .await;
+        // The on_line closure received all three lines.
+        assert_eq!(lines, vec!["a", "b", "c"], "lines: {lines:?}");
+        // The returned output also contains them.
+        assert!(outcome.output.contains("a"), "output: {}", outcome.output);
+        assert!(outcome.output.contains("b"), "output: {}", outcome.output);
+        assert!(outcome.output.contains("c"), "output: {}", outcome.output);
+        assert_eq!(outcome.exit_code, Some(0), "exit: {:?}", outcome.exit_code);
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.confinement, Confinement::Unsandboxed);
+    }
+
+    #[tokio::test]
+    async fn run_streaming_reports_nonzero_exit() {
+        let dir = std::env::temp_dir();
+        let outcome = run_streaming(&dir, "exit 7", false, false, &mut |_line| true).await;
+        assert_eq!(outcome.exit_code, Some(7), "exit: {:?}", outcome.exit_code);
+        assert!(!outcome.timed_out);
     }
 }
