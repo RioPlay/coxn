@@ -1,6 +1,6 @@
 [package]
 name = "coxn"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A lean, provider-agnostic terminal harness that drives an LLM which drives aden."
 authors = ["RioPlay <rioplay@rioplay.dev>"]
