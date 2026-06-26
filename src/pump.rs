@@ -194,7 +194,7 @@ impl<M: Model> Pump<M> {
 
     /// A human-readable listing of the aden tools the model can discover.
     pub fn tool_catalog(&self) -> String {
-        self.tools.discover("")
+        self.tools.aden_catalog()
     }
 
     /// The conversation so far, for rendering the transcript.
