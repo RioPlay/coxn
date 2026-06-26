@@ -19,6 +19,7 @@
 #![allow(dead_code)]
 
 use std::io;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -82,8 +83,9 @@ pub struct View {
     /// Saved draft while browsing history -- restored when the user returns past
     /// the oldest entry.
     pub hist_draft: String,
-    /// True while a model turn is in progress; drives the activity indicator.
-    pub pending: bool,
+    /// Set to the start time while a model turn is in progress; drives the
+    /// live spinner + elapsed display. `None` when idle.
+    pub pending_since: Option<Instant>,
     /// Kill ring: text cut by Ctrl-K / Ctrl-U, newest last; Ctrl-Y yanks the
     /// most recent. A simple stack (no yank-pop) -- enough to reuse cut text.
     pub kill_ring: Vec<String>,
@@ -386,15 +388,18 @@ fn wrapped_line_count(text: &str, width: usize) -> usize {
 fn role_style(prefix: &str) -> Style {
     match prefix {
         "you:" => Style::default().fg(Color::LightGreen),
-        "coxn:" => Style::default().fg(Color::LightCyan),
+        "coxn:" => Style::default().fg(Color::White),
         "tool:" => Style::default().fg(Color::Yellow),
+        "cmd:" => Style::default().fg(Color::LightBlue),
+        "ok:" => Style::default().fg(Color::Green),
+        "err:" => Style::default().fg(Color::LightRed),
         "sys:" => Style::default().fg(Color::DarkGray),
         _ => Style::default().fg(Color::LightRed), // error / unknown
     }
 }
 
-/// Known role prefixes, longest-match order (tool: before t, etc.).
-const ROLE_PREFIXES: &[&str] = &["coxn:", "tool:", "you:", "sys:"];
+/// Known role prefixes, longest-match order (longest first to avoid prefix collisions).
+const ROLE_PREFIXES: &[&str] = &["coxn:", "tool:", "you:", "sys:", "cmd:", "ok:", "err:"];
 
 /// Convert a plain-text transcript (with `you:` / `coxn:` / `tool:` / `sys:`
 /// prefixes) into a ratatui [`Text`] with per-role colors. Lines that do not
@@ -461,10 +466,18 @@ pub fn render(frame: &mut Frame, view: &View) {
         .wrap(Wrap { trim: false })
         .scroll((scroll_row, 0));
 
-    // Activity indicator: append a blinking caret to status when a turn is
-    // in progress. Simple, visible, no extra state.
-    let status_text = if view.pending {
-        format!("{}  [...]", view.status)
+    // Activity indicator: live spinner + elapsed seconds when a turn is in
+    // progress. The TICK (100ms) event loop redraws fast enough to animate it.
+    const SPIN: &[&str] = &["-", "\\", "|", "/"];
+    let status_text = if let Some(since) = view.pending_since {
+        let e = since.elapsed();
+        let frame = SPIN[(e.as_millis() / 250) as usize % SPIN.len()];
+        format!(
+            "{}  {} {}s  (Ctrl-C cancel)",
+            view.status,
+            frame,
+            e.as_secs()
+        )
     } else {
         view.status.clone()
     };
@@ -1056,13 +1069,16 @@ mod tests {
     fn render_shows_activity_indicator_when_pending() {
         let mut view = View::new();
         view.set_status("ready");
-        view.pending = true;
+        view.pending_since = Some(Instant::now());
         let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test backend");
         terminal
             .draw(|frame| render(frame, &view))
             .expect("draw succeeds");
         let text = buffer_text(&terminal);
-        assert!(text.contains("[...]"), "activity indicator: {text:?}");
+        // The elapsed marker "s" (e.g. "0s") must appear in the status row.
+        assert!(text.contains("0s"), "activity indicator elapsed: {text:?}");
+        // "Ctrl-C cancel" hint must also appear.
+        assert!(text.contains("Ctrl-C"), "cancel hint: {text:?}");
     }
 
     #[test]

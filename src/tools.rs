@@ -656,20 +656,29 @@ impl Tool for RunTool {
     }
 }
 
-/// Render a command's outcome as the text fed back to the model: a sandbox
-/// warning when it ran unconfined, the exit status, then the (capped) output.
+/// Render a command's outcome as the text fed back to the model. The first line
+/// starts with "cmd:" so the transcript can identify it as a command result and
+/// render it with a distinct style. Format:
+///
+/// - Header line: `cmd: sandboxed` or `cmd: NO SANDBOX (approval was the only gate)`
+/// - Exit line: `ok: exit 0` / `err: exit N` / `err: timed out` / `err: killed by signal`
+/// - Then the output (or `(no output)`)
 pub(crate) fn format_run(outcome: &crate::sandbox::RunOutcome) -> String {
     let mut s = String::new();
+    // Header line (always starts with "cmd:").
     if outcome.confinement == crate::sandbox::Confinement::Unsandboxed {
-        s.push_str("WARNING: bwrap not found; command ran WITHOUT sandbox isolation (approval was the only gate).\n");
+        s.push_str("cmd: NO SANDBOX (approval was the only gate)\n");
+    } else {
+        s.push_str("cmd: sandboxed\n");
     }
+    // Exit / status line.
     if outcome.timed_out {
-        s.push_str("[command timed out and was killed]\n");
+        s.push_str("err: timed out\n");
     } else {
         match outcome.exit_code {
-            Some(0) => s.push_str("exit 0\n"),
-            Some(code) => s.push_str(&format!("exit {code}\n")),
-            None => s.push_str("[killed by signal]\n"),
+            Some(0) => s.push_str("ok: exit 0\n"),
+            Some(code) => s.push_str(&format!("err: exit {code}\n")),
+            None => s.push_str("err: killed by signal\n"),
         }
     }
     if outcome.output.is_empty() {
@@ -920,10 +929,13 @@ mod tests {
         // bwrap=false exercises the portable direct-exec path (no sandbox dep).
         let tool = RunTool::new(std::env::temp_dir(), false);
         let out = tool.run(r#"{"command":"printf hello"}"#).expect("runs");
+        // "ok: exit 0" contains "exit 0".
         assert!(out.contains("exit 0"), "{out}");
         assert!(out.contains("hello"), "{out}");
-        assert!(out.contains("WITHOUT sandbox"), "fallback warns: {out}");
+        // New header for the unsandboxed path.
+        assert!(out.contains("NO SANDBOX"), "fallback warns: {out}");
         let bad = tool.run(r#"{"command":"exit 7"}"#).expect("runs");
+        // "err: exit 7" contains "exit 7".
         assert!(bad.contains("exit 7"), "{bad}");
     }
 
