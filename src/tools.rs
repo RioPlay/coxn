@@ -104,7 +104,7 @@ pub const DISCOVER: &str = "aden_tools";
 /// A thin registry with deferred disclosure: `active` tools are advertised in
 /// every request's tool list; `latent` tools are discoverable via the [`DISCOVER`]
 /// seam and dispatchable once the model knows their name, but are not advertised
-/// up front. This is what keeps the default context free of tool bloat — the
+/// up front. This is what keeps the default context free of tool bloat -- the
 /// model pulls the schema it needs by intent instead of being shown all of them.
 #[derive(Default)]
 pub struct ToolRegistry {
@@ -154,7 +154,7 @@ impl ToolRegistry {
     }
 
     /// Search latent tools by intent/name for `query` (empty lists all),
-    /// returning `name — intent` lines for the model to act on.
+    /// returning `name - intent` lines for the model to act on.
     pub fn discover(&self, query: &str) -> String {
         let q = query.trim().to_lowercase();
         let mut hits: Vec<String> = self
@@ -165,10 +165,28 @@ impl ToolRegistry {
                     || t.name().to_lowercase().contains(&q)
                     || t.intent().to_lowercase().contains(&q)
             })
-            .map(|t| format!("{} — {}", t.name(), t.intent()))
+            .map(|t| format!("{} - {}", t.name(), t.intent()))
             .collect();
         if hits.is_empty() {
             return format!("no aden tools match '{query}'");
+        }
+        hits.sort();
+        hits.join("\n")
+    }
+
+    /// A human listing of the active aden context tools, for `/tools`. aden
+    /// tools are registered active only when aden is detected at boot, so an
+    /// empty set means aden is not present, and the note says so honestly.
+    pub fn aden_catalog(&self) -> String {
+        let mut hits: Vec<String> = self
+            .active
+            .iter()
+            .filter(|t| t.name().starts_with("aden_"))
+            .map(|t| format!("{} - {}", t.name(), t.intent()))
+            .collect();
+        if hits.is_empty() {
+            return "no aden tools (aden not detected; run with aden on PATH to amplify)"
+                .to_string();
         }
         hits.sort();
         hits.join("\n")
