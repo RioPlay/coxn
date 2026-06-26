@@ -1,14 +1,14 @@
-= coxn: a lean directional harness for aden
+= coxn: a lean gated harness for coding LLMs
 :author: Ernest Hamblen
-:revdate: 2026-06-24
+:revdate: 2026-06-25
 :toc: left
 :toclevels: 3
 :icons: font
-:status: DESIGN (pre-implementation); derived from design conversation 2026-06-24
+:status: DESIGN (implemented through Phase 4); derived from design conversation 2026-06-24, updated 2026-06-25
 :sectnums:
 
 [.lead]
-coxn is a deliberately minimal, provider-agnostic terminal harness that drives an LLM, which in turn drives `aden`. It is a "dumb pump": it steers and sets pace, and carries no intelligence of its own. All durable judgement lives in aden (the offline graph director) and in the model (the actor). coxn is the thin seam that connects them.
+coxn is a deliberately minimal, provider-agnostic terminal harness that drives an LLM with a human approval gate, a bwrap sandbox for shell commands, and an optional aden amplifier. It is a "dumb pump": it steers and sets pace, and carries no intelligence of its own. All durable judgement lives in the model (the actor) and, when present, in aden (the offline graph director). coxn is the thin seam that connects them and the boundary that keeps every action gated.
 
 The name is the naval shorthand for *coxswain* (`cox'n`): the person who steers the boat and calls the stroke cadence, and never pulls an oar. That role is the architecture in one word.
 
@@ -17,40 +17,46 @@ The name is the naval shorthand for *coxswain* (`cox'n`): the person who steers 
 coxn IS:
 
 * A small Rust + `ratatui` terminal driver (single binary, terminal-native: SSH, CI, containers, remote dev).
-* A loop that calls a model, dispatches tools, enforces aden's gate, and records savings.
-* Provider-agnostic by construction: one `call_model()` seam, no provider lock-in.
+* A complete standalone coding agent: human-approval gate + bwrap sandbox + file and command tools. No aden required to get value.
+* Provider-agnostic by construction: one `call_model()` seam, no provider lock-in. Any OpenAI-compatible endpoint works.
 * Zero-default-context: the model runs on its own bare system prompt, and nothing about aden enters the context window until it is explicitly pulled in or defined by an aden scope manifest.
+* Aden-amplified when aden is present: five additional tools (structure-aware search, blast-radius scope checking, task partitioning) and a hard revert gate on file edits.
 
 coxn IS NOT:
 
-* An agent runtime that reasons about code. That is aden's job, and aden never calls a model or touches the network.
+* An agent runtime that requires aden to function. aden is an optional amplifier; the status line is honest about which mode is active (`scope: <task>` vs `ungated`).
+* An agent runtime that reasons about code. The model acts; coxn enforces boundaries.
 * A graph viewer. aden already ships that as `aden view` (browser-native force-graph). coxn does not re-render the graph.
-* A from-scratch multi-provider platform. The provider abstraction is the commodity, high-maintenance part; coxn keeps it to a single seam and reuses existing loops where it can.
-* A TUI that competes feature-for-feature with Claude Code / opencode / Codex. It competes on one axis only: the aden-directed context step.
+* A from-scratch multi-provider platform. The provider abstraction is the commodity, high-maintenance part; coxn keeps it to a single seam.
+* A TUI that competes feature-for-feature with Claude Code / opencode / Codex. It competes on one axis only: a gated + sandboxed harness that can be amplified by aden's context step.
 
 == First principles (non-negotiable)
 
-. *aden directs and gates; the LLM acts; coxn steers.* This line is inherited from aden's own design law (`research/topics/aden-roadmap/aden-as-directional-harness.adoc`). aden is deterministic, offline, side-effect-free: it emits manifests, orderings, and gate verdicts. coxn must never push intelligence down into the pump or up into aden.
+. *The LLM acts; coxn steers and gates.* coxn must never push intelligence down into the pump. Every mutating action is gated before it takes effect: a human approval prompt for all tools, the bwrap sandbox for commands, and (when aden is present with a task scope) aden's blast-radius revert gate for file edits.
+. *aden-optional, aden-amplified.* coxn stands alone: human approval + sandbox is a complete boundary. When aden is present, five more tools become active and file edits are additionally gated by `aden impact-diff --scope`. The status line records which mode is active.
 . *Provider-agnostic.* aden is not Claude-centric and neither is coxn. The model is swappable behind `call_model()`. Anthropic-specific features (prompt caching, task budgets, effort) are one provider profile, not the design center.
 . *Minimalism is the product.* The pump should add no more to the model's context than the model's own default system prompt, unless something is specifically defined. A bare loop is ~150 to 600 lines; the engineering value is in keeping it that small, not in growing it.
-. *aden is the bloat arbiter.* "Unless specifically defined" resolves to "unless aden's scope manifest defines it." No task means a bare prompt; a named task means `aden scope <task>` deterministically defines the exact token-budgeted context and tools to load. coxn never guesses what is worth its tokens.
-. *The differentiator is the context step, not the loop.* The loop, tool dispatch, permissions, session, provider glue, and TUI chrome are all commodity. Context assembly (aden graph + blast-radius gate replacing naive file-read / RAG) is the only part worth owning, and aden already owns it.
+. *aden is the bloat arbiter (when present).* No task means a bare prompt; a named task means `aden scope <task>` deterministically defines the exact token-budgeted context and tools to load. coxn never guesses what is worth its tokens.
+. *The differentiator is gated context, not the loop.* The loop, tool dispatch, permissions, session, provider glue, and TUI chrome are all commodity. The safety boundary (approval + sandbox) and the optional context assembly (aden graph + blast-radius gate) are the parts worth owning.
 
 == Architecture
 
 === Three layers
 
 ----
-coxn (pump / TUI)        steers + sets pace, zero intelligence
+coxn (pump / TUI)        steers + gates, zero intelligence
    |
    v  drives
-the LLM                  acts: reads, writes, reasons
+the LLM                  acts: reads, writes, reasons, runs commands
    |
-   v  consults (offline, deterministic)
-aden                     directs + gates: graph, scope, blast-radius, savings
+   v  consults (optional, offline, deterministic)
+aden (optional)          amplifies: graph, scope, blast-radius, task partitioning
 ----
 
-coxn is Rust, same language as aden, so it can link `aden-core` crates directly rather than shelling out to the `aden` binary. That lets the gate verdict and scope manifest render inline (for example, a blast-radius warning in the status line) with no IPC.
+coxn shells out to the `aden` binary as a subprocess (no linked crate, to keep
+the dependency budget at six). When aden is absent every aden operation degrades
+gracefully: file tools are approval-gated only, the status line says `ungated`,
+and the five aden tools are not registered.
 
 === Zero-default-context via progressive disclosure
 
@@ -62,7 +68,42 @@ The default context is the model's own system prompt plus essentially nothing. T
 
 === The gate as a hard contract
 
-Before coxn accepts an edit, it runs `aden impact-diff --scope <manifest>` and obeys the exit code: in-scope (proceed), scope-escape or blast-leak (block, surface the verdict). Today this gate is advisory (it lives in aden's MCP server instructions and `AGENTS.md` as a workflow norm). For coxn to actually *drive* a model rather than *suggest to* one, the gate must be promoted to a hard, parseable exit-code contract. See <<prereqs>>.
+Before coxn accepts an edit, it runs `aden impact-diff --scope <manifest>` and obeys the exit code: in-scope (proceed), scope-escape or blast-leak (block, surface the verdict, revert the file). This gate fires only when aden is present and a task scope is active; without aden, file edits are gated by the human approval prompt only, and the status line records that honestly. See <<prereqs>> for the aden-side promotion from advisory to exit-code contract.
+
+== Command execution and the sandbox
+
+Running a shell command is the riskiest capability coxn exposes. The boundary is layered: the human approves first, then the sandbox confines the execution.
+
+=== Approval
+
+Every `run_command` call shows an approval prompt before the command runs. Unlike file-tool approvals (which can be session-approved by tool name), `run_command` session approval is keyed on the *exact command string*. Approving `cargo test` for the session does not pre-approve `cargo test --workspace`; each distinct command must be approved at least once.
+
+The approval prompt labels the confinement level -- `[sandbox]` when bwrap is available, `[NO SANDBOX]` when it is not -- so the user knows the isolation level before approving.
+
+=== bwrap sandbox (when present)
+
+When `bwrap` is available (probed once at startup), `run_command` runs the command via `bwrap --unshare-all` with these properties:
+
+* *Filesystem.* The project root is bound read-write; the rest of the host filesystem is read-only. Writes outside the root are blocked at the namespace level.
+* *Network.* Off by default (a fresh, empty net namespace). The model can request `network: true`; that re-shares the host network for that one run.
+* *Environment.* Cleared entirely, then re-populated from a fixed whitelist (PATH, HOME, USER, TERM, LANG, CARGO_HOME, RUSTUP_HOME, plus optional toolchain overrides). API keys and other parent-process secrets cannot leak in by construction.
+* *Session isolation.* `--new-session` closes the TIOCSTI terminal-injection vector. `--die-with-parent` tears the sandbox down if coxn exits.
+
+The toolchain cache (`~/.cargo`, `~/.rustup`) is bound read-only so that `cargo` and `rustc` can resolve dependencies without letting the model tamper with the host cache.
+
+When `bwrap` is absent, the command runs directly with the same cleared-and-whitelisted environment and the working directory pinned to the project root. The approval prompt is then the only isolation boundary.
+
+=== Output and timeout
+
+Output (stdout + stderr merged) is capped: 120 head lines + 120 tail lines, with the middle elided, and a 60 000-character hard backstop. This prevents a noisy build from flooding the model's context window.
+
+A wall-clock timeout (default 300 s, overridable with `COXN_RUN_TIMEOUT_SECS`) kills the command via `timeout` when available. Ctrl-C during a streaming run kills the child immediately.
+
+Output streams live to the TUI line by line as the command runs.
+
+=== Gate degradation for commands
+
+The aden blast-radius gate applies to *file edits* only, because coxn can snapshot a single file before applying an edit and restore it if the gate blocks the change. A command's effects are arbitrary and cannot be snapshot-reverted. For commands, when a task scope is active, the gate degrades: it detects and reports scope impact rather than reverting. The warning is fed back to the model in the tool result; the human approval prompt (which fires before the command runs) remains the primary boundary.
 
 == Surfaces: two products, opposite answers
 
