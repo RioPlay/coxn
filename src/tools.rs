@@ -153,13 +153,17 @@ impl ToolRegistry {
         defs
     }
 
-    /// Search latent tools by intent/name for `query` (empty lists all),
-    /// returning `name - intent` lines for the model to act on.
+    /// Search the aden tools by intent/name for `query` (empty lists all),
+    /// returning `name - intent` lines for the model to act on. Searches both
+    /// latent tools and the active aden tools (which is where they live once
+    /// aden is detected at boot), so the seam never false-negatives an aden tool
+    /// that is in fact available.
     pub fn discover(&self, query: &str) -> String {
         let q = query.trim().to_lowercase();
         let mut hits: Vec<String> = self
             .latent
             .iter()
+            .chain(self.active.iter().filter(|t| t.name().starts_with("aden_")))
             .filter(|t| {
                 q.is_empty()
                     || t.name().to_lowercase().contains(&q)
@@ -782,6 +786,24 @@ mod tests {
 
         // A non-match is reported, not an error.
         assert!(r.discover("nope").contains("no aden tools match"));
+    }
+
+    #[test]
+    fn discover_finds_active_aden_tools() {
+        // Once aden is detected, its tools are registered active (not latent).
+        // The discovery seam must still find them, not false-negative.
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(AdenTool::grep(PathBuf::from("."))));
+        r.register(Box::new(ReadFileTool::new(PathBuf::from("."))));
+        let hits = r
+            .dispatch(&call(DISCOVER, "search"))
+            .expect("discover runs");
+        assert!(
+            hits.contains("aden_grep"),
+            "active aden tool not found: {hits}"
+        );
+        // A non-aden active tool is not surfaced by the aden discovery seam.
+        assert!(!hits.contains("read_file"), "non-aden tool leaked: {hits}");
     }
 
     #[test]

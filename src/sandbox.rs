@@ -450,12 +450,15 @@ impl StreamCap {
         if self.over_budget {
             return;
         }
-        self.total_lines += 1;
-        self.chars += line.len() + 1; // +1 for the newline
-        if self.chars > OUTPUT_CHAR_CAP {
+        // Check the char cap before counting this line, so a line dropped by the
+        // cap is not also counted in the elided-middle total (no off-by-one, no
+        // double truncation notice).
+        if self.chars + line.len() + 1 > OUTPUT_CHAR_CAP {
             self.over_budget = true;
             return;
         }
+        self.total_lines += 1;
+        self.chars += line.len() + 1; // +1 for the newline
         if self.head.len() < HEAD_LINES {
             self.head.push(line.to_string());
         } else {

@@ -1018,6 +1018,9 @@ async fn drive(
                                 } else {
                                     persisted = messages.len();
                                     pump.load_conversation(messages);
+                                    // Switching sessions resets session-scoped approvals.
+                                    approvals.clear();
+                                    approved_commands.clear();
                                     session = session::Session::open(&value);
                                     view.output = transcript(pump.messages());
                                     view.set_status(status_line(
@@ -1158,6 +1161,9 @@ async fn drive(
                                     } else {
                                         let n = messages.len();
                                         pump.load_conversation(messages);
+                                        // Switching sessions resets session-scoped approvals.
+                                        approvals.clear();
+                                        approved_commands.clear();
                                         session = session::Session::open(&slug);
                                         persisted = n;
                                         let out = transcript(pump.messages());
