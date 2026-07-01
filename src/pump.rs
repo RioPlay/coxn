@@ -85,6 +85,43 @@ impl TurnIo for SilentIo {
     }
 }
 
+/// Batch collector [`TurnIo`] for autonomous sub-agent execution (Phase 5).
+/// Always approves mutations (the per-sub AdenGate + user-initiated task scope
+/// are the safety boundary). Accumulates streamed deltas and run_command output
+/// into `transcript`. A sub-agent "dense result" is the final transcript content
+/// (not the full chat history). Usable from tests or a /run-agents path.
+#[allow(dead_code)] // prepared for sub-agent runner; constructed in batch tests + future /execute
+pub struct BatchIo {
+    pub transcript: String,
+}
+
+#[allow(dead_code)]
+impl BatchIo {
+    pub fn new() -> Self {
+        Self {
+            transcript: String::new(),
+        }
+    }
+    pub fn result(&self) -> String {
+        self.transcript.clone()
+    }
+}
+
+impl TurnIo for BatchIo {
+    fn on_delta(&mut self, delta: &str) -> bool {
+        self.transcript.push_str(delta);
+        true
+    }
+    fn approve(&mut self, _call: &ToolCall) -> Approval {
+        Approval::Allow
+    }
+    fn on_run_output(&mut self, line: &str) -> bool {
+        self.transcript.push_str(line);
+        self.transcript.push('\n');
+        true
+    }
+}
+
 /// Dispatch a tool call, flattening the result/error into the text fed back to
 /// the model (an unknown tool or a tool error is information, not a failure).
 fn dispatch_result(tools: &ToolRegistry, call: &ToolCall) -> String {
@@ -106,9 +143,11 @@ pub struct Pump<M: Model> {
     tools: ToolRegistry,
     system: String,
     messages: Vec<Message>,
-    /// The blast-radius gate that judges a mutating tool's edit. None = no scope
-    /// active, so edits are refused (never applied ungated); Some = aden directs
-    /// edits, accepting or reverting each.
+    /// The blast-radius gate (optional) that judges a mutating tool's edit.
+    /// None = no scope active: the human approval from TurnIo is the *only* gate
+    /// and approved mutations stand (the "ungated" path). Some = aden's
+    /// `impact-diff --scope` additionally gates: the edit is applied first (so
+    /// aden sees the working-tree diff) then reverted on block.
     gate: Option<Box<dyn Gate>>,
     /// The most recent gate block, for the TUI to surface as a modal.
     last_block: Option<GateOutcome>,
@@ -195,6 +234,12 @@ impl<M: Model> Pump<M> {
     /// A human-readable listing of the aden tools the model can discover.
     pub fn tool_catalog(&self) -> String {
         self.tools.aden_catalog()
+    }
+
+    /// Mutable access to the tool registry, so the caller can hot-register tools
+    /// (e.g. aden's context tools once aden becomes available) without a reboot.
+    pub fn registry_mut(&mut self) -> &mut ToolRegistry {
+        &mut self.tools
     }
 
     /// The conversation so far, for rendering the transcript.
@@ -983,5 +1028,22 @@ mod tests {
             .expect("tool ran");
         assert_eq!(tool_msg.content, "ping");
         assert!(pump.take_block().is_none());
+    }
+
+    #[test]
+    fn batch_io_collects_and_always_allows_for_subs() {
+        // BatchIo is the collector for autonomous sub-agent pumps (Phase 5).
+        // Always allows (gate is the enforcer); transcript is the dense result.
+        let mut io = BatchIo::new();
+        let _ = io.on_delta("sub result part A");
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "edit".into(),
+            arguments: "{}".into(),
+        };
+        assert_eq!(io.approve(&call), Approval::Allow);
+        let _ = io.on_run_output("ran ls");
+        assert!(io.result().contains("sub result part A"));
+        assert!(io.result().contains("ran ls"));
     }
 }
