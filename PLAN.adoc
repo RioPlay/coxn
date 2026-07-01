@@ -84,7 +84,7 @@ verified against a real third-party codebase.
 
 * [x] P4.1 Action tools: `edit` (replace an exact unique string) and `write_file` (create/overwrite, makes parent dirs). Both `mutates() == true` and declare `target_path` so the pump can snapshot.
 * [x] P4.2 Apply -> gate -> revert: per DESIGN, aden reads the working-tree diff, so the pump applies the edit, runs `impact-diff --scope`, and on scope-escape/blast-leak reverts only that file (restore bytes / remove a new file) and feeds the verdict back. In-scope edits persist. No git, no new deps. Unit-tested (revert/persist/no-gate) + live.
-* [x] P4.3 Editing requires a scope: no task -> no gate -> mutating tools refused (never ungated), and the action tools are registered only when the scope actually gated.
+* [x] P4.3 Editing model: action tools are always advertised (model discovers them); every mutation requires explicit user approval (TurnIo). With scope: aden gate on top (approve -> apply for diff -> impact-diff --scope -> revert on escape/leak). Without scope ("ungated"): approval is the only gate and effects stand. (Superseded by actual F4 implementation; see note below.)
 * [x] P4.4 Task-mode operating preamble (`AGENT_PREAMBLE`): one sanctioned nudge so a weak model with the empty default prompt actually calls the action tools (gpt-oss-20b otherwise answers "I can't edit files"). Added only when gated.
 * [x] P4.5 Boot UX: paint a frame before the slow aden subprocess calls; defer the cosmetic savings probe off the boot path. No more blank/frozen terminal on a large repo.
 * [x] P4.6 README.md: quickstart, model selection, task mode, slash commands, the aden seam.
@@ -124,6 +124,7 @@ commits; 101 tests green, clippy/fmt clean, still six deps):
 == Notes / decisions
 
 * Live validation (against a real third-party codebase, 42k-contract aden store): the full aden seam -- `scope`, `impact-diff --scope` (in-scope AND scope-escape on a dirty tree), `asm` (bare seeds resolve), `status` savings, `config` -- all confirmed against real aden 0.2.0. The TUI loop confirmed against LM Studio gpt-oss-20b: auto-detect, grounded reply on a real symbol, tool-calling round-trip.
+* Added vim-native aden symbol navigation (K / gd for Understand; ga for asm; gi for impact; gv for view; / for grep) + ex commands :view, :viz/:mermaid/:gm, :doctor, :impact. Pull::Impact via `aden query --impact`. Non-blocking spawn for view; full graceful degrade; 234 tests + fmt/clippy green. Directly advances the "vim motions + visual layer + self-audit" items.
 * Gated editing confirmed live on a throwaway repo: model called `edit` with correct JSON, coxn applied + gated in-scope, the change persisted on disk.
 * Known constraint: `impact-diff` judges the WHOLE working-tree diff vs HEAD, so a tree already dirty outside the scope mandate blocks every edit. coxn effectively expects a tree scoped to the task.
 * Open: merge the aden `feat/coxn-directional-prereqs` branch (PoC gate now satisfied) -- outward-facing, awaiting the user. Streaming/Ollama-native and sub-agents remain.
