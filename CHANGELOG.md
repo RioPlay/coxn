@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed / Fixed (audit hygiene)
+
+- Clarified "ungated" vs gated semantics in Pump docs, boot/status line, approval prompts, and command output labels ("ungated (human approval only)", "NO SANDBOX (human approval is the only gate)").
+- Replaced `.expect` panics in sandbox lib paths (argv, stdout pipe) with proper error `RunOutcome`s.
+- Corrected stale Pump struct documentation describing gate=None behavior (matches reality and tests: approval is the gate; effects stand when no scope).
+- Updated PLAN.adoc P4.3 description for accuracy (superseded semantics).
+
 ## [0.2.0] - 2026-06-25
 
 ### Added
