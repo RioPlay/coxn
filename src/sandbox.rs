@@ -295,7 +295,17 @@ pub fn run(root: &Path, command: &str, network: bool, use_bwrap: bool) -> RunOut
         &cargo_home,
         &rustup_home,
     );
-    let (prog, rest) = argv.split_first().expect("argv is non-empty");
+    let (prog, rest) = match argv.split_first() {
+        Some(pair) => pair,
+        None => {
+            return RunOutcome {
+                confinement,
+                exit_code: Some(127),
+                timed_out: false,
+                output: "internal: empty argv".to_string(),
+            };
+        }
+    };
     let mut cmd = Command::new(prog);
     cmd.args(rest);
     if !use_bwrap {
@@ -376,7 +386,17 @@ pub async fn run_streaming(
         &cargo_home,
         &rustup_home,
     );
-    let (prog, rest) = argv.split_first().expect("argv is non-empty");
+    let (prog, rest) = match argv.split_first() {
+        Some(pair) => pair,
+        None => {
+            return RunOutcome {
+                confinement,
+                exit_code: Some(127),
+                timed_out: false,
+                output: "internal: empty argv".to_string(),
+            };
+        }
+    };
 
     let mut cmd = TokioCommand::new(prog);
     cmd.args(rest);
@@ -403,7 +423,18 @@ pub async fn run_streaming(
         }
     };
 
-    let stdout = child.stdout.take().expect("stdout was piped");
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            child.start_kill().ok();
+            return RunOutcome {
+                confinement,
+                exit_code: None,
+                timed_out: false,
+                output: "internal: failed to capture stdout pipe".to_string(),
+            };
+        }
+    };
     let mut reader = tokio::io::BufReader::new(stdout).lines();
     let mut cap = StreamCap::new();
 
