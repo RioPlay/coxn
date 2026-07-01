@@ -178,6 +178,12 @@ impl ToolRegistry {
         hits.join("\n")
     }
 
+    /// Whether any aden context tool is active. Used to hot-register aden's
+    /// tools exactly once when aden appears mid-session (idempotent refresh).
+    pub fn has_aden(&self) -> bool {
+        self.active.iter().any(|t| t.name().starts_with("aden_"))
+    }
+
     /// A human listing of the active aden context tools, for `/tools`. aden
     /// tools are registered active only when aden is detected at boot, so an
     /// empty set means aden is not present, and the note says so honestly.
@@ -682,14 +688,14 @@ impl Tool for RunTool {
 /// starts with "cmd:" so the transcript can identify it as a command result and
 /// render it with a distinct style. Format:
 ///
-/// - Header line: `cmd: sandboxed` or `cmd: NO SANDBOX (approval was the only gate)`
+/// - Header line: `cmd: sandboxed` or `cmd: NO SANDBOX (human approval is the only gate)`
 /// - Exit line: `ok: exit 0` / `err: exit N` / `err: timed out` / `err: killed by signal`
 /// - Then the output (or `(no output)`)
 pub(crate) fn format_run(outcome: &crate::sandbox::RunOutcome) -> String {
     let mut s = String::new();
     // Header line (always starts with "cmd:").
     if outcome.confinement == crate::sandbox::Confinement::Unsandboxed {
-        s.push_str("cmd: NO SANDBOX (approval was the only gate)\n");
+        s.push_str("cmd: NO SANDBOX (human approval is the only gate)\n");
     } else {
         s.push_str("cmd: sandboxed\n");
     }

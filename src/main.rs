@@ -13,13 +13,14 @@ mod sandbox;
 mod session;
 mod tools;
 mod tui;
+mod vim;
 
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
 use pump::{Approval, Pump, TurnIo};
@@ -27,6 +28,7 @@ use tools::{AdenTool, EditTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
 use tui::{
     Action, Menu, MenuItem, MenuKind, Tui, View, map_input_key, map_menu_key, map_modal_key,
 };
+use vim::{Outcome, Scroll};
 
 /// How long the event loop waits for a key before redrawing.
 const TICK: Duration = Duration::from_millis(100);
@@ -44,33 +46,67 @@ const RETRY_BACKOFF_SECS: [u64; MAX_RETRIES as usize] = [2, 4, 8];
 /// When `available` is true, each tool is registered as active so the model can
 /// use dense aden retrieval from turn one. When false, nothing is registered;
 /// the `aden_tools` discovery seam will report an empty catalog, which is honest.
-fn register_aden_tools(tools: &mut ToolRegistry, dir: &std::path::Path, available: bool) {
-    if !available {
-        return;
+///
+/// Idempotent: if aden tools are already active, it does nothing. This lets the
+/// discovery refresh ([`refresh_discovery`]) call it whenever aden might have
+/// appeared mid-session without ever double-registering. Returns `true` only
+/// when it actually added the tools (so the caller can announce the hot-load).
+fn register_aden_tools(tools: &mut ToolRegistry, dir: &std::path::Path, available: bool) -> bool {
+    if !available || tools.has_aden() {
+        return false;
     }
     tools.register(Box::new(AdenTool::asm(dir.to_path_buf())));
     tools.register(Box::new(AdenTool::understand(dir.to_path_buf())));
     tools.register(Box::new(AdenTool::grep(dir.to_path_buf())));
     tools.register(Box::new(AdenTool::ask(dir.to_path_buf())));
     tools.register(Box::new(AdenTool::locate(dir.to_path_buf())));
+    true
 }
 
-/// A ship's wheel (the coxswain's helm): coxn steers, aden sets the heading.
-/// Shown in the output pane at startup and after `/clear`, until the first turn.
-const LOGO: &str = r#"
-              .    |    .
-          '.   \   |   /   .'
-        '-._  \  \ | /  /  _.-'
-      (==========( (o) )==========)
-        '-._  /  / | \  \  _.-'
-          .'   /   |   \   '.
-              '    |    '
-                   coxn
-"#;
+/// Re-discover capabilities that may have come online since boot, with no
+/// reboot: a model backend (LM Studio/Ollama started, an endpoint exported) and
+/// aden's context tools (aden installed / a graph generated). Returns a short
+/// note naming what was hot-loaded, or `None` when nothing changed.
+///
+/// Cost discipline: shelling `aden --version` and probing endpoints is not free,
+/// so unless `force` is set (an explicit `/model` / `/tools` / `/agents`), it
+/// only probes while a model is still missing. Once a provider is resolved the
+/// per-turn path returns immediately, so steady-state turns pay nothing.
+fn refresh_discovery(
+    dir: &Path,
+    pump: &mut Pump<AnyModel>,
+    sel: &mut ModelSel,
+    force: bool,
+) -> Option<String> {
+    let need_model = sel.endpoint.is_none();
+    if !force && !need_model {
+        return None;
+    }
+    let caps = aden::probe(dir);
+    let mut notes: Vec<String> = Vec::new();
+    if need_model {
+        let (model, new_sel) = resolve_model(&caps);
+        if new_sel.endpoint.is_some() {
+            pump.set_model(model);
+            *sel = new_sel;
+            notes.push(format!("model {}", sel.name));
+        }
+    }
+    if register_aden_tools(pump.registry_mut(), dir, caps.available) {
+        notes.push("aden tools".to_string());
+    }
+    (!notes.is_empty()).then(|| format!("hot-loaded: {}", notes.join(" + ")))
+}
 
-/// The startup splash: the logo plus a one-line hint.
-fn welcome() -> String {
-    format!("{LOGO}\n  you steer; aden sets the heading.  type a message, or /help")
+/// The startup greeting, shown until the first turn and after `/clear`. A single
+/// `sys:` line so it renders in the transcript's own voice -- no ASCII art.
+fn welcome(aden_active: bool) -> String {
+    if aden_active {
+        "sys: coxn ready. ADEN cockpit: graph-powered terminal. Tab for palette (symbols+actions). Ctrl+L on words for context. ? for help.".to_string()
+    } else {
+        "sys: coxn ready. Simple chat with LLM + tools. Type to talk, / for commands, ? for help."
+            .to_string()
+    }
 }
 
 /// Format the conversation into the output pane text. An assistant turn that
@@ -108,7 +144,9 @@ fn transcript(messages: &[Message]) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        // A blank line between turns gives the transcript vertical rhythm instead
+        // of a wall of text; styled_output renders the empty line with the rule.
+        .join("\n\n")
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -146,13 +184,14 @@ async fn main() -> io::Result<()> {
     // (model resolution, scope, asm context) run -- which can take several
     // seconds on a large repo.
     let mut view = View::new();
-    view.output = welcome();
+    view.output = welcome(caps.available);
     view.set_status("starting coxn...".to_string());
+    view.refresh_suggestion();
     let mut tui = Tui::new()?;
     tui.draw(&view)?;
 
     let (model, mut sel) = resolve_model(&caps);
-    view.set_status(format!("{}  |  loading...", sel.label()));
+    view.set_status(format!("{}  |  loading...", sel.name));
     tui.draw(&view)?;
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: the gate
@@ -169,7 +208,7 @@ async fn main() -> io::Result<()> {
     // A savings-free status at boot: the `aden status` call it would make is the
     // slowest aden spawn and is purely cosmetic, so defer it to the first
     // post-turn refresh and let the user reach the prompt sooner.
-    view.set_status(boot_status(&sel.label(), &task.status));
+    view.set_status(boot_status(&sel.name, &task.status, caps.available));
     // When no model was detected, nudge the user with a one-line hint so the
     // stub is not silently confusing.
     if sel.name == "stub" {
@@ -196,25 +235,35 @@ async fn main() -> io::Result<()> {
 /// the event loop so the slow savings probe does not delay the first prompt; the
 /// savings appear on the first post-turn [`status_line`] refresh.
 ///
-/// When no task is active the detail reads `"ungated  /help"` to make explicit
-/// that edits are not scope-governed. A non-empty `task` string carries its own
-/// mode annotation (e.g. "gated" or "ungated, no aden").
-fn boot_status(model_label: &str, task: &str) -> String {
-    let detail = if task.is_empty() {
-        "ungated  /help".to_string()
+/// When no task is active the detail reads `"ungated (human approval only)  /help"`
+/// to make explicit that only the human gate (via approval prompt) is active.
+/// A non-empty `task` string carries its own mode annotation.
+/// When aden active, appends a compact vim ADEN hint for discoverability.
+fn boot_status(model_label: &str, task: &str, aden_active: bool) -> String {
+    let mut detail = if task.is_empty() {
+        "ungated (human approval only)  /help".to_string()
     } else {
         format!("{task}  /help")
     };
+    if aden_active {
+        detail.push_str("  K/gd ?");
+    }
     format!("{model_label}  |  {detail}")
 }
 
 /// The status line: the active model, then aden's savings estimate when there
 /// is one (else the task + `/help` hint), then the context meter once a turn has
 /// reported token usage.
-fn status_line(dir: &Path, model_label: &str, task: &str, usage: Option<Usage>) -> String {
+fn status_line(
+    dir: &Path,
+    model_label: &str,
+    task: &str,
+    usage: Option<Usage>,
+    aden_active: bool,
+) -> String {
     let base = match aden::savings(dir) {
         Some(savings) => format!("{model_label}  |  {savings}"),
-        None => boot_status(model_label, task),
+        None => boot_status(model_label, task, aden_active),
     };
     match usage {
         Some(u) if u.prompt_tokens > 0 => format!("{base}  |  {}", ctx_meter(u.prompt_tokens)),
@@ -229,6 +278,20 @@ fn ctx_meter(prompt_tokens: u32) -> String {
         format!("~{:.1}k ctx", prompt_tokens as f64 / 1000.0)
     } else {
         format!("~{prompt_tokens} ctx")
+    }
+}
+
+/// Append ADEN result using "aden: " prefix so the transcript renderer gives it
+/// a dedicated ⊙ sigil and distinct color. Makes the graph actions visually
+/// stand out for better scannability and user feedback.
+fn append_aden(view: &mut View, label: &str, content: &str) {
+    view.snap_to_bottom();
+    view.output.push('\n');
+    let c = content.trim();
+    if c.is_empty() {
+        view.output.push_str(&format!("aden: {}", label));
+    } else {
+        view.output.push_str(&format!("aden: {}\n{}", label, c));
     }
 }
 
@@ -420,7 +483,7 @@ fn longest_common_prefix(items: &[&str]) -> String {
 /// Tab-complete a slash-command input: the command verb, or a `/resume` slug.
 /// Returns the completed line, or `None` when there is nothing to add. Model
 /// names are completed via the `/model` picker, not here.
-fn complete_input(input: &str) -> Option<String> {
+pub(crate) fn complete_input(input: &str) -> Option<String> {
     let rest = input.strip_prefix('/')?;
     match rest.split_once(' ') {
         // Completing the command verb.
@@ -519,6 +582,102 @@ fn session_menu() -> Option<Menu> {
     })
 }
 
+/// Simple command palette for discoverability (average users). Tab on empty input or / opens this.
+/// Selecting sets the input line (user presses Enter to run).
+fn commands_menu() -> Option<Menu> {
+    let mut items: Vec<MenuItem> = vec![];
+
+    // ADEN cockpit items first for quick access to graph power.
+    items.push(MenuItem {
+        label: "ADEN: communities".to_string(),
+        value: "ADEN_COMMUNITIES".to_string(),
+    });
+    items.push(MenuItem {
+        label: "ADEN: doctor".to_string(),
+        value: "ADEN_DOCTOR".to_string(),
+    });
+    items.push(MenuItem {
+        label: "ADEN: audit".to_string(),
+        value: "ADEN_AUDIT".to_string(),
+    });
+
+    // Perfect ADEN harness: pull live graph symbols into the palette.
+    // Selecting executes directly (e.g. understand, view, impact) for instant
+    // graph steering. This turns aden symbols into first-class cockpit controls.
+    if let Ok(syms) = aden::list_symbols(std::path::Path::new("."), Some("fn-*|mod-*")) {
+        for sym in syms.lines().take(3).filter(|l| !l.trim().is_empty()) {
+            let s = sym.trim().to_string();
+            // Short label for UI, full for value
+            let short = s.split('/').next_back().unwrap_or(&s).to_string();
+            items.push(MenuItem {
+                label: format!("ADEN: {} understand", short),
+                value: format!("ADEN_UNDERSTAND:{}", s),
+            });
+            items.push(MenuItem {
+                label: format!("ADEN: {} view", short),
+                value: format!("ADEN_VIEW:{}", s),
+            });
+            items.push(MenuItem {
+                label: format!("ADEN: {} impact", short),
+                value: format!("ADEN_IMPACT:{}", s),
+            });
+        }
+    }
+
+    // Regular commands and tips.
+    items.push(MenuItem {
+        label: "/help - this help".to_string(),
+        value: "/help ".to_string(),
+    });
+    items.push(MenuItem {
+        label: "/model - list/switch models".to_string(),
+        value: "/model ".to_string(),
+    });
+    items.push(MenuItem {
+        label: "/tools - list active (aden) tools".to_string(),
+        value: "/tools ".to_string(),
+    });
+    items.push(MenuItem {
+        label: "/agents - task partition (if scoped)".to_string(),
+        value: "/agents ".to_string(),
+    });
+    items.push(MenuItem {
+        label: "/session - list saved".to_string(),
+        value: "/session ".to_string(),
+    });
+    items.push(MenuItem {
+        label: "/clear - new chat".to_string(),
+        value: "/clear ".to_string(),
+    });
+    items.push(MenuItem {
+        label: ":view [sym] - launch aden graph view".to_string(),
+        value: ":view ".to_string(),
+    });
+    items.push(MenuItem {
+        label: ":gm [sym] - insert mermaid from aden".to_string(),
+        value: ":gm ".to_string(),
+    });
+    items.push(MenuItem {
+        label: ":doctor - env health".to_string(),
+        value: ":doctor ".to_string(),
+    });
+    items.push(MenuItem {
+        label: "TIP: Ctrl+L on word pulls context (works in Insert!)".to_string(),
+        value: "".to_string(),
+    });
+    items.push(MenuItem {
+        label: "TIP: Tab for command palette, mouse wheel to scroll".to_string(),
+        value: "".to_string(),
+    });
+
+    Some(Menu {
+        kind: MenuKind::Commands,
+        title: "commands (Tab or type /) — for everyone".to_string(),
+        items,
+        selected: 0,
+    })
+}
+
 /// Read the task config from the environment: `(name, seeds, budget)`. `None`
 /// when no task is set. Shared by the boot path and `/agents`.
 fn task_config() -> Option<(String, Vec<String>, u64)> {
@@ -570,7 +729,9 @@ fn agents_listing(dir: &Path, caps: &aden::AdenCaps) -> String {
         };
         out.push_str(&format!("  {} [{}] -> {model}{after}\n", s.id, s.role));
     }
-    out.push_str("(plan only; the sub-agent runner is not yet wired)");
+    out.push_str(
+        "(partition ready; BatchIo + per-Pump execution substrate added; runner wiring next)",
+    );
     out
 }
 
@@ -669,7 +830,12 @@ browse code with read_file and run_command (e.g. grep).\n\n",
     }
 
     let status = if gated {
-        format!("task '{name}' ({} seed(s), gated)", seeds.len())
+        let b = if budget == 8192 {
+            String::new()
+        } else {
+            format!(", budget {}", budget)
+        };
+        format!("task '{name}' ({} seed(s){}, gated)", seeds.len(), b)
     } else if caps.available {
         // aden is present but produced no gate (no seeds, or scope failed).
         format!("task '{name}' (ungated)")
@@ -683,32 +849,6 @@ browse code with read_file and run_command (e.g. grep).\n\n",
         context: Some(context),
     }
 }
-
-/// Help shown by `/help`.
-const HELP: &str = "commands:\n  \
-/help            show this help\n  \
-/model           list available models (* = active, [loaded] = hot)\n  \
-/model <name|#>  switch the active model\n  \
-/model @<role>   switch to the model mapped for a role (route.<role> config)\n  \
-/tools           list the aden tools the model can discover\n  \
-/think <level>   reasoning effort: off | low | med | high\n  \
-/agents          show the task partition (sub-scopes + routed models)\n  \
-/session         list saved sessions\n  \
-/resume <slug>   load a saved session\n  \
-/edit [path]     open the last-edited file (or path) in $EDITOR\n  \
-/clear           clear the conversation (keeps the task scope)\n  \
-/quit            leave coxn\n\
-/model and /session open an arrow-navigable picker (Up/Down, Enter, Esc).\n\
-keys:\n  \
-Enter            send         Ctrl-C   cancel a turn / quit when idle\n  \
-Tab              complete a command or /resume slug\n  \
-Up/Down          scroll chat  PgUp/Dn  scroll a page\n  \
-Ctrl-P/Ctrl-N    input history             Ctrl-W   delete word\n  \
-Ctrl-K/Ctrl-U    cut to end/start          Ctrl-Y   yank (paste)\n  \
-Left/Right Home/End  move cursor\n\
-anything else is sent to the model.\n\
-the model can run shell commands (sandboxed; network off by default); you \
-approve each one at the prompt.";
 
 /// A slash command typed into the input line.
 #[derive(Debug, PartialEq, Eq)]
@@ -752,6 +892,89 @@ fn parse_command(input: &str) -> Command {
     }
 }
 
+/// An ex-style command (`:cmd`) parsed from the vim command line.
+///
+/// Keeps model/aden dispatch separate from the slash-command path so the two
+/// can evolve independently. Every variant corresponds to a single user intent;
+/// the `drive` loop calls existing functions to satisfy each one.
+#[derive(Debug, PartialEq)]
+enum ExCmd {
+    /// `:q` / `:quit` — exit coxn.
+    Quit,
+    /// `:h` / `:help` — show the help text.
+    Help,
+    /// `:model [name]` — list (no arg) or switch model.
+    Model(Option<String>),
+    /// `:tools` — list active tools.
+    Tools,
+    /// `:clear` / `:new` — clear the conversation and start fresh.
+    Clear,
+    /// `:understand <sym>` — run `aden understand` and append the result.
+    Understand(String),
+    /// `:grep <pattern>` — run `aden grep` and append the result.
+    Grep(String),
+    /// `:ask <text>` — run `aden ask` and append the result.
+    Ask(String),
+    /// `:view [anchor]` — launch aden browser view (centered on anchor if given).
+    View(Option<String>),
+    /// `:viz [anchor]` or `:mermaid [anchor]` — export Mermaid diagram text.
+    Viz(Option<String>),
+    /// `:doctor` — run aden doctor for env + repo diagnostics.
+    Doctor,
+    /// `:impact <sym>` — blast radius / downstream via aden query (gi style).
+    Impact(String),
+    /// `:communities` — list functional communities from aden.
+    Communities,
+    /// `:audit` — aden security audit.
+    Audit,
+    /// Unknown command — append a notice.
+    Unknown(String),
+}
+
+/// Parse a `:command` string (already without the leading colon) into an
+/// [`ExCmd`]. Pure and unit-testable; contains no side effects.
+fn parse_ex_command(input: &str) -> ExCmd {
+    let trimmed = input.trim();
+    let mut words = trimmed.splitn(2, char::is_whitespace);
+    let verb = words.next().unwrap_or("");
+    // The rest after the verb, trimmed of leading whitespace.
+    let rest = words.next().map(|s| s.trim()).unwrap_or("");
+    let arg = if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    };
+    match verb {
+        "q" | "quit" => ExCmd::Quit,
+        "h" | "help" => ExCmd::Help,
+        "model" => ExCmd::Model(arg),
+        "tools" => ExCmd::Tools,
+        "clear" | "new" => ExCmd::Clear,
+        "understand" => match arg {
+            Some(sym) => ExCmd::Understand(sym),
+            None => ExCmd::Unknown("understand requires a symbol name".to_string()),
+        },
+        "grep" => match arg {
+            Some(pat) => ExCmd::Grep(pat),
+            None => ExCmd::Unknown("grep requires a pattern".to_string()),
+        },
+        "ask" => match arg {
+            Some(text) => ExCmd::Ask(text),
+            None => ExCmd::Unknown("ask requires a question".to_string()),
+        },
+        "view" => ExCmd::View(arg),
+        "viz" | "mermaid" | "gm" => ExCmd::Viz(arg),
+        "doctor" => ExCmd::Doctor,
+        "impact" => match arg {
+            Some(sym) => ExCmd::Impact(sym),
+            None => ExCmd::Unknown("impact requires a symbol".to_string()),
+        },
+        "communities" => ExCmd::Communities,
+        "audit" => ExCmd::Audit,
+        other => ExCmd::Unknown(other.to_string()),
+    }
+}
+
 /// Wait before retrying a transient model error, showing a per-second countdown
 /// in the status line. Returns `true` if the user pressed Ctrl-C to give up.
 fn retry_wait(tui: &mut Tui, view: &mut View, attempt: u32, secs: u64) -> io::Result<bool> {
@@ -775,11 +998,11 @@ fn retry_wait(tui: &mut Tui, view: &mut View, attempt: u32, secs: u64) -> io::Re
 }
 
 /// The output pane's (width, height), for wrapping and PageUp/PageDown scroll
-/// amounts. Height excludes the status and input rows. Falls back to (80, 1) if
-/// the terminal size cannot be determined.
+/// amounts. Height excludes the separator, status, and input rows. Falls back to
+/// (80, 1) if the terminal size cannot be determined.
 fn pane_dims(tui: &Tui) -> (u16, u16) {
     tui.size()
-        .map(|s| (s.width.max(1), s.height.saturating_sub(2).max(1)))
+        .map(|s| (s.width.max(1), s.height.saturating_sub(3).max(1)))
         .unwrap_or((80, 1))
 }
 
@@ -852,10 +1075,12 @@ impl DriveIo<'_> {
     /// Repaint the output pane with the current assistant text and any live
     /// run_command output appended below it.
     fn repaint(&mut self) {
+        // A blank line before the live coxn turn matches the inter-turn rhythm
+        // of transcript() (messages joined with a blank line).
         self.view.output = if self.run_buf.is_empty() {
-            format!("{}\ncoxn: {}", self.prior, self.buf)
+            format!("{}\n\ncoxn: {}", self.prior, self.buf)
         } else {
-            format!("{}\ncoxn: {}\n{}", self.prior, self.buf, self.run_buf)
+            format!("{}\n\ncoxn: {}\n{}", self.prior, self.buf, self.run_buf)
         };
         let _ = self.tui.draw(self.view);
     }
@@ -948,7 +1173,7 @@ impl TurnIo for DriveIo<'_> {
 
 /// The event loop: draw, read a key, route it by mode (modal vs input), and run
 /// a turn on submit. Carries no intelligence; it only paces and shuttles.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
 async fn drive(
     tui: &mut Tui,
     view: &mut View,
@@ -967,17 +1192,57 @@ async fn drive(
     let mut approvals: HashSet<String> = HashSet::new();
     // Exact command strings approved for the session via run_command [s].
     let mut approved_commands: HashSet<String> = HashSet::new();
+    // One-time tip for average users the first time they trigger an ADEN action.
+    let mut aden_tip_shown = false;
     loop {
+        // Keep the aden badge on the status line in sync with caps each frame.
+        view.aden_active = caps.available;
+        if caps.available && !aden_tip_shown {
+            view.output.push('\n');
+            view.output.push_str("sys: tip — aden active for smart context. Ctrl+L (or K in Normal) on symbol words. Tab for commands. ? help.");
+            aden_tip_shown = true;
+        }
+        view.refresh_suggestion();
+
         tui.draw(view)?;
 
         if !event::poll(TICK)? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let ev = event::read()?;
+        // Mouse scroll for average users who don't (yet) use vim keys
+        if let Event::Mouse(me) = ev {
+            let (w, h) = pane_dims(tui);
+            match me.kind {
+                MouseEventKind::ScrollUp => view.scroll_up(SCROLL_STEP, view.max_scroll(w, h)),
+                MouseEventKind::ScrollDown => view.scroll_down(SCROLL_STEP),
+                _ => {}
+            }
+            continue;
+        }
+        let Event::Key(key) = ev else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
             continue;
+        }
+
+        // Help overlay: Esc, q, or ? are the close keys and are consumed.
+        // Any other key (including Ctrl-C) closes the overlay and falls through
+        // to normal routing, so Ctrl-C always quits and other keys are not lost.
+        if view.show_help {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _)
+                | (KeyCode::Char('q'), KeyModifiers::NONE)
+                | (KeyCode::Char('?'), _) => {
+                    view.close_help();
+                    continue;
+                }
+                _ => {
+                    view.close_help();
+                    // fall through — key routes normally below
+                }
+            }
         }
 
         // A modal grabs input until answered.
@@ -1006,9 +1271,10 @@ async fn drive(
                                 view.output = switch_model(pump, sel, &value);
                                 view.set_status(status_line(
                                     dir,
-                                    &sel.label(),
+                                    &sel.name,
                                     task,
                                     pump.last_usage(),
+                                    view.aden_active,
                                 ));
                             }
                             MenuKind::Session => {
@@ -1025,10 +1291,137 @@ async fn drive(
                                     view.output = transcript(pump.messages());
                                     view.set_status(status_line(
                                         dir,
-                                        &sel.label(),
+                                        &sel.name,
                                         task,
                                         pump.last_usage(),
+                                        view.aden_active,
                                     ));
+                                }
+                            }
+                            MenuKind::Commands => {
+                                if value.starts_with("ADEN_UNDERSTAND:") {
+                                    let sym = value.strip_prefix("ADEN_UNDERSTAND:").unwrap_or("");
+                                    if pump.registry_mut().has_aden() {
+                                        match aden::pull(dir, aden::Pull::Understand(sym)) {
+                                            Ok(out) => {
+                                                append_aden(
+                                                    view,
+                                                    &format!("understand '{}'", sym),
+                                                    &out,
+                                                );
+                                                view.last_aden =
+                                                    Some(format!("understand '{}'", sym));
+                                            }
+                                            Err(e) => view.output.push_str(&format!(
+                                                "\naden: understand failed: {e}"
+                                            )),
+                                        }
+                                    } else {
+                                        view.output.push_str(&format!(
+                                            "\naden: (not present) would understand: {}",
+                                            sym
+                                        ));
+                                    }
+                                    view.snap_to_bottom();
+                                } else if value.starts_with("ADEN_VIEW:") {
+                                    let sym = value.strip_prefix("ADEN_VIEW:").unwrap_or("");
+                                    if pump.registry_mut().has_aden() {
+                                        match aden::launch_view(dir, Some(sym)) {
+                                            Ok(()) => {
+                                                view.output.push_str(&format!(
+                                                    "\naden: launched view for '{}'",
+                                                    sym
+                                                ));
+                                                view.last_aden = Some(format!("view '{}'", sym));
+                                            }
+                                            Err(e) => view
+                                                .output
+                                                .push_str(&format!("\naden: view failed: {e}")),
+                                        }
+                                    } else {
+                                        view.output.push_str(&format!(
+                                            "\naden: (not present) would view: {}",
+                                            sym
+                                        ));
+                                    }
+                                    view.snap_to_bottom();
+                                } else if value.starts_with("ADEN_IMPACT:") {
+                                    let sym = value.strip_prefix("ADEN_IMPACT:").unwrap_or("");
+                                    if pump.registry_mut().has_aden() {
+                                        match aden::pull(dir, aden::Pull::Impact(sym)) {
+                                            Ok(out) => {
+                                                append_aden(
+                                                    view,
+                                                    &format!("impact '{}'", sym),
+                                                    &out,
+                                                );
+                                                view.last_aden = Some(format!("impact '{}'", sym));
+                                            }
+                                            Err(e) => view
+                                                .output
+                                                .push_str(&format!("\naden: impact failed: {e}")),
+                                        }
+                                    } else {
+                                        view.output.push_str(&format!(
+                                            "\naden: (not present) would impact: {}",
+                                            sym
+                                        ));
+                                    }
+                                    view.snap_to_bottom();
+                                } else if value == "ADEN_COMMUNITIES" {
+                                    if pump.registry_mut().has_aden() {
+                                        match aden::communities(dir) {
+                                            Ok(out) => {
+                                                append_aden(view, "communities", &out);
+                                                view.last_aden = Some("communities".to_string());
+                                            }
+                                            Err(e) => view.output.push_str(&format!(
+                                                "\naden: communities failed: {e}"
+                                            )),
+                                        }
+                                    } else {
+                                        view.output.push_str(
+                                            "\naden: (not present) would show communities",
+                                        );
+                                    }
+                                    view.snap_to_bottom();
+                                } else if value == "ADEN_DOCTOR" {
+                                    if pump.registry_mut().has_aden() {
+                                        match aden::doctor(dir) {
+                                            Ok(out) => {
+                                                append_aden(view, "doctor", &out);
+                                                view.last_aden = Some("doctor".to_string());
+                                            }
+                                            Err(e) => view
+                                                .output
+                                                .push_str(&format!("\naden: doctor failed: {e}")),
+                                        }
+                                    } else {
+                                        view.output
+                                            .push_str("\naden: (not present) would run doctor");
+                                    }
+                                    view.snap_to_bottom();
+                                } else if value == "ADEN_AUDIT" {
+                                    if pump.registry_mut().has_aden() {
+                                        match aden::audit(dir) {
+                                            Ok(out) => {
+                                                append_aden(view, "audit", &out);
+                                                view.last_aden = Some("audit".to_string());
+                                            }
+                                            Err(e) => view
+                                                .output
+                                                .push_str(&format!("\naden: audit failed: {e}")),
+                                        }
+                                    } else {
+                                        view.output
+                                            .push_str("\naden: (not present) would run audit");
+                                    }
+                                    view.snap_to_bottom();
+                                } else {
+                                    // default: set input for / or : commands
+                                    view.input = value;
+                                    view.cursor_end();
+                                    view.refresh_suggestion();
                                 }
                             }
                         }
@@ -1039,18 +1432,466 @@ async fn drive(
             continue;
         }
 
-        match map_input_key(key) {
+        // Route the key through the vim modal engine first. In Insert mode
+        // (the default) nearly every key returns Pass, so existing emacs
+        // bindings and plain typing are completely unaffected. Only Esc
+        // (mode change), Normal-mode motions/operators, and scroll bindings
+        // are ever consumed before the map_input_key path sees them.
+        let vim_outcome = view.vim.handle(&mut view.input, &mut view.cursor, key);
+
+        // Resolve a vim-level Scroll before potentially falling through to the
+        // map_input_key path so the arms below stay symmetric.
+        if let Outcome::Scroll(dir) = vim_outcome {
+            let (w, h) = pane_dims(tui);
+            match dir {
+                // j/k are single-line motions; only PageUp/Down use SCROLL_STEP.
+                Scroll::LineUp => view.scroll_up(1, view.max_scroll(w, h)),
+                Scroll::LineDown => view.scroll_down(1),
+                Scroll::HalfPageUp => view.scroll_up(h / 2, view.max_scroll(w, h)),
+                Scroll::HalfPageDown => view.scroll_down(h / 2),
+                Scroll::Top => view.scroll_up(view.max_scroll(w, h), view.max_scroll(w, h)),
+                Scroll::Bottom => view.scroll_down(view.max_scroll(w, h)),
+            }
+            continue;
+        }
+        // A counted scroll (e.g. `3j`): the host applies the step `n` times so
+        // `3j` scrolls exactly 3 lines (not 3 * SCROLL_STEP).
+        if let Outcome::ScrollN(dir, n) = vim_outcome {
+            let (w, h) = pane_dims(tui);
+            for _ in 0..n {
+                match dir {
+                    Scroll::LineUp => view.scroll_up(1, view.max_scroll(w, h)),
+                    Scroll::LineDown => view.scroll_down(1),
+                    Scroll::HalfPageUp => view.scroll_up(h / 2, view.max_scroll(w, h)),
+                    Scroll::HalfPageDown => view.scroll_down(h / 2),
+                    Scroll::Top => view.scroll_up(view.max_scroll(w, h), view.max_scroll(w, h)),
+                    Scroll::Bottom => view.scroll_down(view.max_scroll(w, h)),
+                }
+            }
+            continue;
+        }
+
+        if vim_outcome == Outcome::Consumed {
+            // Vim mutated the buffer; just redraw — do NOT also run map_input_key.
+            continue;
+        }
+
+        // `?` in Normal mode: toggle the help overlay.
+        if vim_outcome == Outcome::ToggleHelp {
+            view.toggle_help();
+            continue;
+        }
+
+        // Vim-native aden symbol navigation: K or gd on a word at input cursor.
+        if let Outcome::AdenLookup(ref sym) = vim_outcome {
+            if sym.is_empty() {
+                view.output.push('\n');
+                view.output.push_str(
+                    "aden: place cursor on a symbol word in the input (or use :understand <sym>)",
+                );
+                continue;
+            }
+            if pump.registry_mut().has_aden() {
+                match aden::pull(dir, aden::Pull::Understand(sym)) {
+                    Ok(out) => {
+                        append_aden(view, &format!("understand '{}'", sym), &out);
+                        view.last_aden = Some(format!("understand '{}'", sym));
+                    }
+                    Err(e) => {
+                        view.output.push('\n');
+                        view.output
+                            .push_str(&format!("aden: understand '{}' failed: {e}", sym));
+                    }
+                }
+            } else {
+                view.output.push('\n');
+                view.output
+                    .push_str(&format!("aden: (not present) would understand: {}", sym));
+            }
+            continue;
+        }
+        // ga : assemble context for symbol at cursor.
+        if let Outcome::AdenAsm(ref sym) = vim_outcome {
+            if sym.is_empty() {
+                view.output.push('\n');
+                view.output.push_str(
+                    "aden: place cursor on a symbol word in the input (or use :asm via understand)",
+                );
+                continue;
+            }
+            if pump.registry_mut().has_aden() {
+                match aden::pull(dir, aden::Pull::Asm(sym)) {
+                    Ok(out) => {
+                        append_aden(view, &format!("asm '{}'", sym), &out);
+                        view.last_aden = Some(format!("asm '{}'", sym));
+                    }
+                    Err(e) => {
+                        view.output.push('\n');
+                        view.output
+                            .push_str(&format!("aden: asm '{}' failed: {e}", sym));
+                    }
+                }
+            } else {
+                view.output.push('\n');
+                view.output
+                    .push_str(&format!("aden: (not present) would asm: {}", sym));
+            }
+            continue;
+        }
+
+        // gi : impact / blast radius.
+        if let Outcome::AdenImpact(ref sym) = vim_outcome {
+            if sym.is_empty() {
+                view.output.push('\n');
+                view.output.push_str(
+                    "aden: place cursor on a symbol word in the input (or use :impact <sym>)",
+                );
+                continue;
+            }
+            if pump.registry_mut().has_aden() {
+                match aden::pull(dir, aden::Pull::Impact(sym)) {
+                    Ok(out) => append_aden(view, &format!("impact '{}'", sym), &out),
+                    Err(e) => {
+                        view.output.push('\n');
+                        view.output
+                            .push_str(&format!("aden: impact '{}' failed: {e}", sym));
+                    }
+                }
+            } else {
+                view.output.push('\n');
+                view.output
+                    .push_str(&format!("aden: (not present) would impact: {}", sym));
+            }
+            continue;
+        }
+
+        // gv : launch aden view for symbol at cursor.
+        if let Outcome::AdenView(ref sym) = vim_outcome {
+            if sym.is_empty() {
+                view.output.push('\n');
+                view.output
+                    .push_str("aden: place cursor on a symbol word (or use :view [sym])");
+                continue;
+            }
+            if pump.registry_mut().has_aden() {
+                match aden::launch_view(dir, Some(sym)) {
+                    Ok(()) => {
+                        view.snap_to_bottom();
+                        view.output.push('\n');
+                        view.output
+                            .push_str(&format!("aden: launched view for '{}'", sym));
+                        view.last_aden = Some(format!("view '{}'", sym));
+                    }
+                    Err(e) => {
+                        view.output.push('\n');
+                        view.output
+                            .push_str(&format!("aden: view '{}' failed: {e}", sym));
+                    }
+                }
+            } else {
+                view.output.push('\n');
+                view.output
+                    .push_str(&format!("aden: (not present) would view: {}", sym));
+            }
+            continue;
+        }
+
+        // / : aden grep on word at cursor (fuzzy search style).
+        if let Outcome::AdenGrep(ref pat) = vim_outcome {
+            if pat.is_empty() {
+                view.output.push('\n');
+                view.output
+                    .push_str("grep: move cursor over a word or type pattern first");
+                continue;
+            }
+            if pump.registry_mut().has_aden() {
+                match aden::pull(dir, aden::Pull::Grep(pat)) {
+                    Ok(out) => {
+                        append_aden(view, &format!("grep '{}'", pat), &out);
+                        view.last_aden = Some(format!("grep '{}'", pat));
+                    }
+                    Err(e) => {
+                        view.output.push('\n');
+                        view.output
+                            .push_str(&format!("aden: grep '{}' failed: {e}", pat));
+                    }
+                }
+            } else {
+                view.output.push('\n');
+                view.output
+                    .push_str(&format!("(aden not present) would grep: {pat}"));
+            }
+            continue;
+        }
+
+        // ] : communities / graph nav.
+        if let Outcome::AdenCommunities = vim_outcome {
+            if pump.registry_mut().has_aden() {
+                match aden::communities(dir) {
+                    Ok(out) => append_aden(view, "communities", &out),
+                    Err(e) => {
+                        view.output.push('\n');
+                        view.output
+                            .push_str(&format!("aden: communities failed: {e}"));
+                    }
+                }
+            } else {
+                view.output.push('\n');
+                view.output
+                    .push_str("(aden not present) would show communities");
+            }
+            continue;
+        }
+
+        // A completed ex command from Command mode: dispatch it, then redraw.
+        if let Outcome::Command(ref cmd) = vim_outcome {
+            view.snap_to_bottom();
+            match parse_ex_command(cmd) {
+                ExCmd::Quit => return Ok(()),
+                ExCmd::Help => view.toggle_help(),
+                ExCmd::Model(None) => {
+                    refresh_discovery(dir, pump, sel, true);
+                    match model_menu(sel) {
+                        Some(menu) => view.open_menu(menu),
+                        None => view.output = model_listing(sel),
+                    }
+                }
+                ExCmd::Model(Some(target)) => {
+                    view.output = switch_model(pump, sel, &target);
+                    view.set_status(status_line(
+                        dir,
+                        &sel.name,
+                        task,
+                        pump.last_usage(),
+                        view.aden_active,
+                    ));
+                }
+                ExCmd::Tools => {
+                    refresh_discovery(dir, pump, sel, true);
+                    view.output = pump.tool_catalog();
+                }
+                ExCmd::Clear => {
+                    pump.clear_conversation();
+                    view.output = welcome(view.aden_active);
+                    view.last_aden = None;
+                    session = session::Session::create();
+                    persisted = 0;
+                    approvals.clear();
+                    approved_commands.clear();
+                    view.set_status(status_line(
+                        dir,
+                        &sel.name,
+                        task,
+                        pump.last_usage(),
+                        view.aden_active,
+                    ));
+                }
+                ExCmd::Understand(sym) => {
+                    if pump.registry_mut().has_aden() {
+                        match aden::pull(dir, aden::Pull::Understand(&sym)) {
+                            Ok(out) => {
+                                append_aden(view, &format!("understand '{}'", sym), &out);
+                                view.last_aden = Some(format!("understand '{}'", sym));
+                            }
+                            Err(e) => {
+                                view.output.push('\n');
+                                view.output
+                                    .push_str(&format!("aden: understand '{}' error: {e}", sym));
+                            }
+                        }
+                    } else {
+                        view.output.push('\n');
+                        view.output
+                            .push_str("aden not available (install aden and generate a graph)");
+                    }
+                }
+                ExCmd::Grep(pat) => {
+                    if pump.registry_mut().has_aden() {
+                        match aden::pull(dir, aden::Pull::Grep(&pat)) {
+                            Ok(out) => append_aden(view, &format!("grep '{}'", pat), &out),
+                            Err(e) => {
+                                view.output.push('\n');
+                                view.output
+                                    .push_str(&format!("aden: grep '{}' error: {e}", pat));
+                            }
+                        }
+                    } else {
+                        view.output.push('\n');
+                        view.output
+                            .push_str("aden not available (install aden and generate a graph)");
+                    }
+                }
+                ExCmd::Ask(question) => {
+                    if pump.registry_mut().has_aden() {
+                        match aden::pull(dir, aden::Pull::Ask(&question)) {
+                            Ok(out) => append_aden(view, &format!("ask '{}'", question), &out),
+                            Err(e) => {
+                                view.output.push('\n');
+                                view.output.push_str(&format!("aden: ask error: {e}"));
+                            }
+                        }
+                    } else {
+                        view.output.push('\n');
+                        view.output
+                            .push_str("aden not available (install aden and generate a graph)");
+                    }
+                }
+                ExCmd::View(anchor) => {
+                    if pump.registry_mut().has_aden() {
+                        match aden::launch_view(dir, anchor.as_deref()) {
+                            Ok(()) => {
+                                let label = anchor.as_deref().unwrap_or("<root>");
+                                view.output.push('\n');
+                                view.output.push_str(&format!(
+                                    "aden: launched view for {} (see browser)",
+                                    label
+                                ));
+                            }
+                            Err(e) => {
+                                view.output.push('\n');
+                                view.output.push_str(&format!("aden: view failed: {e}"));
+                            }
+                        }
+                    } else {
+                        view.output.push('\n');
+                        view.output.push_str("aden not available for :view");
+                    }
+                }
+                ExCmd::Viz(anchor) => {
+                    if pump.registry_mut().has_aden() {
+                        match aden::diagram(dir, anchor.as_deref()) {
+                            Ok(out) => {
+                                view.output.push('\n');
+                                view.output.push_str("aden: mermaid\n```mermaid\n");
+                                view.output.push_str(out.trim());
+                                view.output.push_str("\n```");
+                            }
+                            Err(e) => {
+                                view.output.push('\n');
+                                view.output.push_str(&format!("aden: viz failed: {e}"));
+                            }
+                        }
+                    } else {
+                        view.output.push('\n');
+                        view.output
+                            .push_str("aden not available for :viz/:mermaid/:gm");
+                    }
+                }
+                ExCmd::Doctor => {
+                    if pump.registry_mut().has_aden() {
+                        match aden::doctor(dir) {
+                            Ok(out) => append_aden(view, "doctor", &out),
+                            Err(e) => {
+                                view.output.push('\n');
+                                view.output.push_str(&format!("aden: doctor failed: {e}"));
+                            }
+                        }
+                    } else {
+                        view.output.push('\n');
+                        view.output.push_str("aden not available for :doctor");
+                    }
+                }
+                ExCmd::Impact(sym) => {
+                    if pump.registry_mut().has_aden() {
+                        // Use query impact or understand (understand already includes downstream).
+                        // For explicit, fall back to understand for now (rich output).
+                        match aden::pull(dir, aden::Pull::Impact(&sym)) {
+                            Ok(out) => append_aden(view, &format!("impact '{}'", sym), &out),
+                            Err(e) => {
+                                view.output.push('\n');
+                                view.output
+                                    .push_str(&format!("aden: impact '{}' failed: {e}", sym));
+                            }
+                        }
+                    } else {
+                        view.output.push('\n');
+                        view.output.push_str("aden not available for :impact");
+                    }
+                }
+                ExCmd::Communities => {
+                    if pump.registry_mut().has_aden() {
+                        match aden::communities(dir) {
+                            Ok(out) => append_aden(view, "communities", &out),
+                            Err(e) => {
+                                view.output.push('\n');
+                                view.output
+                                    .push_str(&format!("aden: communities failed: {e}"));
+                            }
+                        }
+                    } else {
+                        view.output.push('\n');
+                        view.output.push_str("aden not available for :communities");
+                    }
+                }
+                ExCmd::Audit => {
+                    if pump.registry_mut().has_aden() {
+                        match aden::audit(dir) {
+                            Ok(out) => append_aden(view, "audit", &out),
+                            Err(e) => {
+                                view.output.push('\n');
+                                view.output.push_str(&format!("aden: audit failed: {e}"));
+                            }
+                        }
+                    } else {
+                        view.output.push('\n');
+                        view.output.push_str("aden not available for :audit");
+                    }
+                }
+                ExCmd::Unknown(s) => {
+                    if s.is_empty() {
+                        // Bare ':' + Enter with no text: silently ignore.
+                    } else {
+                        view.output.push('\n');
+                        view.output.push_str(&format!("not a command: {s}"));
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Outcome::Submit (Normal-mode Enter) or Outcome::Pass (Insert typing).
+        // Map Pass through the existing input-key table; treat Submit the same
+        // as Action::Submit so both paths share one submit block.
+        let action = if vim_outcome == Outcome::Submit {
+            Some(Action::Submit)
+        } else {
+            map_input_key(key)
+        };
+
+        match action {
             Some(Action::Quit) => return Ok(()),
             Some(Action::Complete) => {
-                if let Some(completed) = complete_input(&view.input) {
+                // For average users: if no specific completion (empty or bare / or ambiguous), open friendly command palette.
+                // Otherwise do inline complete (with ghost text).
+                let trimmed = view.input.trim();
+                if trimmed.is_empty() || (trimmed == "/" && complete_input(&view.input).is_none()) {
+                    if let Some(menu) = commands_menu() {
+                        view.open_menu(menu);
+                    }
+                } else if let Some(completed) = complete_input(&view.input) {
                     view.input = completed;
                     view.cursor_end();
+                } else if trimmed.starts_with('/') {
+                    // still open palette for / if no exact
+                    if let Some(menu) = commands_menu() {
+                        view.open_menu(menu);
+                    }
                 }
             }
             Some(Action::Append(c)) => view.input_push(c),
             Some(Action::Backspace) => view.input_backspace(),
             Some(Action::CursorLeft) => view.cursor_left(),
-            Some(Action::CursorRight) => view.cursor_right(),
+            Some(Action::CursorRight) => {
+                if view.cursor == view.input.len() {
+                    if let Some(sugg) = &view.suggestion {
+                        view.input.push_str(sugg);
+                        view.cursor_end();
+                        // suggestion will be refreshed on next draw
+                        continue;
+                    }
+                }
+                view.cursor_right();
+            }
             Some(Action::CursorHome) => view.cursor_home(),
             Some(Action::CursorEnd) => view.cursor_end(),
             Some(Action::WordDelete) => view.word_delete(),
@@ -1072,6 +1913,101 @@ async fn drive(
                 let (_, h) = pane_dims(tui);
                 view.scroll_down(h);
             }
+            // ADEN actions via Ctrl shortcuts (available in Insert mode too).
+            // Lets "average joe" use powerful context without learning Normal vim mode.
+            Some(Action::AdenUnderstand) => {
+                let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
+                if sym.is_empty() {
+                    view.output.push('\n');
+                    view.output.push_str(
+                        "aden: no word at cursor for understand (Ctrl-L or :understand sym)",
+                    );
+                } else if pump.registry_mut().has_aden() {
+                    match aden::pull(dir, aden::Pull::Understand(&sym)) {
+                        Ok(out) => {
+                            append_aden(view, &format!("understand '{}'", sym), &out);
+                            view.last_aden = Some(format!("understand '{}'", sym));
+                        }
+                        Err(e) => view
+                            .output
+                            .push_str(&format!("\naden: understand failed: {e}")),
+                    }
+                } else {
+                    view.output.push('\n');
+                    view.output
+                        .push_str(&format!("aden: (not present) would understand: {}", sym));
+                }
+            }
+            Some(Action::AdenAsm) => {
+                let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
+                if sym.is_empty() {
+                    view.output.push('\n');
+                    view.output
+                        .push_str("aden: no word at cursor for asm (Ctrl-A)");
+                } else if pump.registry_mut().has_aden() {
+                    match aden::pull(dir, aden::Pull::Asm(&sym)) {
+                        Ok(out) => append_aden(view, &format!("asm '{}'", sym), &out),
+                        Err(e) => view.output.push_str(&format!("\naden: asm failed: {e}")),
+                    }
+                } else {
+                    view.output.push('\n');
+                    view.output
+                        .push_str(&format!("aden: (not present) would asm: {}", sym));
+                }
+            }
+            Some(Action::AdenImpact) => {
+                let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
+                if sym.is_empty() {
+                    view.output.push('\n');
+                    view.output
+                        .push_str("aden: no word at cursor for impact (Ctrl-I or :impact sym)");
+                } else if pump.registry_mut().has_aden() {
+                    match aden::pull(dir, aden::Pull::Impact(&sym)) {
+                        Ok(out) => append_aden(view, &format!("impact '{}'", sym), &out),
+                        Err(e) => view.output.push_str(&format!("\naden: impact failed: {e}")),
+                    }
+                } else {
+                    view.output.push('\n');
+                    view.output
+                        .push_str(&format!("aden: (not present) would impact: {}", sym));
+                }
+            }
+            Some(Action::AdenView) => {
+                let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
+                if sym.is_empty() {
+                    view.output.push('\n');
+                    view.output
+                        .push_str("aden: no word at cursor for view (Ctrl-V or :view sym)");
+                } else if pump.registry_mut().has_aden() {
+                    match aden::launch_view(dir, Some(&sym)) {
+                        Ok(()) => view
+                            .output
+                            .push_str(&format!("\naden: launched view for '{}'", sym)),
+                        Err(e) => view.output.push_str(&format!("\naden: view failed: {e}")),
+                    }
+                } else {
+                    view.output.push('\n');
+                    view.output
+                        .push_str(&format!("aden: (not present) would view: {}", sym));
+                }
+            }
+            Some(Action::AdenGrep) => {
+                let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
+                if sym.is_empty() {
+                    view.output.push('\n');
+                    view.output
+                        .push_str("aden: no word at cursor for grep (Ctrl-G or :grep pat)");
+                } else if pump.registry_mut().has_aden() {
+                    match aden::pull(dir, aden::Pull::Grep(&sym)) {
+                        Ok(out) => append_aden(view, &format!("grep '{}'", sym), &out),
+                        Err(e) => view.output.push_str(&format!("\naden: grep failed: {e}")),
+                    }
+                } else {
+                    view.output.push('\n');
+                    view.output
+                        .push_str(&format!("aden: (not present) would grep: {}", sym));
+                }
+            }
             Some(Action::Submit) => {
                 let text = view.take_input();
                 if text.trim().is_empty() {
@@ -1083,11 +2019,16 @@ async fn drive(
                 if text.trim_start().starts_with('/') {
                     match parse_command(text.trim()) {
                         Command::Quit => return Ok(()),
-                        Command::Help => view.output = HELP.to_string(),
-                        Command::Model(None) => match model_menu(sel) {
-                            Some(menu) => view.open_menu(menu),
-                            None => view.output = model_listing(sel),
-                        },
+                        Command::Help => view.toggle_help(),
+                        Command::Model(None) => {
+                            // Re-discover first: a backend started after boot is
+                            // selectable now, no reboot.
+                            refresh_discovery(dir, pump, sel, true);
+                            match model_menu(sel) {
+                                Some(menu) => view.open_menu(menu),
+                                None => view.output = model_listing(sel),
+                            }
+                        }
                         Command::Model(Some(target)) => {
                             // `@role` resolves through the [route] table; anything
                             // else is a model name or index.
@@ -1105,16 +2046,28 @@ async fn drive(
                                     view.output = switch_model(pump, sel, &model);
                                     view.set_status(status_line(
                                         dir,
-                                        &sel.label(),
+                                        &sel.name,
                                         task,
                                         pump.last_usage(),
+                                        view.aden_active,
                                     ));
                                 }
                                 Err(msg) => view.output = msg,
                             }
                         }
-                        Command::Tools => view.output = pump.tool_catalog(),
-                        Command::Agents => view.output = agents_listing(dir, caps),
+                        Command::Tools => {
+                            // Pick up aden tools that came online since boot.
+                            refresh_discovery(dir, pump, sel, true);
+                            view.output = pump.tool_catalog();
+                        }
+                        Command::Agents => {
+                            refresh_discovery(dir, pump, sel, true);
+                            // Re-probe aden so the listing reflects any tools
+                            // that came online after boot (stale `caps` has
+                            // available=false until we re-check).
+                            let live_caps = aden::probe(dir);
+                            view.output = agents_listing(dir, &live_caps);
+                        }
                         Command::Think(arg) => {
                             view.output = match arg.as_deref().map(ThinkingLevel::parse) {
                                 Some(Some(level)) => {
@@ -1169,9 +2122,10 @@ async fn drive(
                                         let out = transcript(pump.messages());
                                         view.set_status(status_line(
                                             dir,
-                                            &sel.label(),
+                                            &sel.name,
                                             task,
                                             pump.last_usage(),
+                                            view.aden_active,
                                         ));
                                         out
                                     }
@@ -1181,7 +2135,7 @@ async fn drive(
                         }
                         Command::Clear => {
                             pump.clear_conversation();
-                            view.output = welcome();
+                            view.output = welcome(view.aden_active);
                             // A cleared conversation starts a fresh session file
                             // and forgets session-level tool approvals.
                             session = session::Session::create();
@@ -1190,9 +2144,10 @@ async fn drive(
                             approved_commands.clear();
                             view.set_status(status_line(
                                 dir,
-                                &sel.label(),
+                                &sel.name,
                                 task,
                                 pump.last_usage(),
+                                view.aden_active,
                             ));
                         }
                         Command::Unknown(c) => {
@@ -1203,6 +2158,11 @@ async fn drive(
                 }
                 // Record in history before submitting.
                 view.push_history(text.clone());
+                // Hot-plug: if no model was up at boot, a backend started since is
+                // found now (and aden tools registered) so this very turn uses it.
+                if let Some(note) = refresh_discovery(dir, pump, sel, false) {
+                    view.set_status(note);
+                }
                 pump.push_user(text);
                 // Stream the reply: render the transcript so far plus the
                 // assistant text as it arrives, repainting per fragment. The
@@ -1246,12 +2206,21 @@ async fn drive(
                     result = r;
                     break;
                 }
-                view.pending_since = None;
+                // Capture the turn's duration before clearing the pending mark,
+                // so completed turns carry their timing in the transcript.
+                let turn_elapsed = view.pending_since.take().map(|s| s.elapsed());
                 match result {
                     Ok(_) => {
                         view.output = transcript(pump.messages());
+                        // A quiet per-turn timing footer in the transcript -- the
+                        // record keeps it after the live status bar moves on.
+                        if let Some(e) = turn_elapsed.filter(|_| !cancelled) {
+                            view.output
+                                .push_str(&format!("\nsys: done in {:.1}s", e.as_secs_f64()));
+                        }
                         // Refresh the model + savings + context status after the turn.
-                        let status = status_line(dir, &sel.label(), task, pump.last_usage());
+                        let status =
+                            status_line(dir, &sel.name, task, pump.last_usage(), view.aden_active);
                         view.set_status(if cancelled {
                             format!("{status}  (cancelled)")
                         } else {
@@ -1312,7 +2281,7 @@ mod tests {
             Message::new(Role::User, "hi"),
             Message::new(Role::Assistant, "stub: hi"),
         ];
-        assert_eq!(transcript(&messages), "you: hi\ncoxn: stub: hi");
+        assert_eq!(transcript(&messages), "you: hi\n\ncoxn: stub: hi");
     }
 
     #[test]
@@ -1332,7 +2301,7 @@ mod tests {
         ];
         assert_eq!(
             transcript(&messages),
-            "you: go\ncoxn: → aden_asm({})\ntool: result"
+            "you: go\n\ncoxn: → aden_asm({})\n\ntool: result"
         );
     }
 
@@ -1443,16 +2412,16 @@ mod tests {
 
     #[test]
     fn boot_status_ungated_when_no_task() {
-        // No task -> detail must contain "ungated".
-        let s = boot_status("stub-model", "");
-        assert!(s.contains("ungated"), "expected 'ungated' in: {s}");
-        assert!(!s.contains("/help") || s.contains("ungated"), "{s}");
+        // No task -> must explicitly surface that only human approval gates edits.
+        let s = boot_status("stub-model", "", false);
+        assert!(s.contains("ungated (human approval only)"), "expected explicit ungated text in: {s}");
+        assert!(s.contains("/help"), "{s}");
     }
 
     #[test]
     fn boot_status_task_text_when_task_set() {
         // A non-empty task string appears in the status line.
-        let s = boot_status("stub-model", "task 'foo' (1 seed(s), gated)");
+        let s = boot_status("stub-model", "task 'foo' (1 seed(s), gated)", false);
         assert!(s.contains("task 'foo'"), "expected task text in: {s}");
         // Should not inject "ungated" when the task string is already set.
         assert!(!s.starts_with("ungated"), "{s}");
@@ -1479,6 +2448,35 @@ mod tests {
                 "missing {expected} in {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn register_aden_tools_is_idempotent_and_reports_change() {
+        // The hot-plug refresh may call this every time aden might have appeared;
+        // it must add the tools exactly once and report whether it did.
+        let mut tools = ToolRegistry::new();
+        assert!(
+            register_aden_tools(&mut tools, std::path::Path::new("."), true),
+            "first registration should report a change"
+        );
+        let count = tools.advertised_defs().len();
+        assert!(
+            !register_aden_tools(&mut tools, std::path::Path::new("."), true),
+            "second registration is a no-op"
+        );
+        assert_eq!(
+            tools.advertised_defs().len(),
+            count,
+            "no duplicate aden tools on refresh"
+        );
+        // An unavailable probe never registers and never reports a change.
+        let mut empty = ToolRegistry::new();
+        assert!(!register_aden_tools(
+            &mut empty,
+            std::path::Path::new("."),
+            false
+        ));
+        assert!(!empty.has_aden());
     }
 
     #[test]
@@ -1517,6 +2515,117 @@ mod tests {
         assert!(
             AGENT_PREAMBLE_ADEN.contains("aden"),
             "AGENT_PREAMBLE_ADEN must mention aden"
+        );
+    }
+
+    // -- parse_ex_command tests -----------------------------------------------
+
+    #[test]
+    fn ex_quit_aliases() {
+        assert_eq!(parse_ex_command("q"), ExCmd::Quit);
+        assert_eq!(parse_ex_command("quit"), ExCmd::Quit);
+    }
+
+    #[test]
+    fn ex_help_aliases() {
+        assert_eq!(parse_ex_command("h"), ExCmd::Help);
+        assert_eq!(parse_ex_command("help"), ExCmd::Help);
+    }
+
+    #[test]
+    fn ex_model_no_arg_and_with_arg() {
+        assert_eq!(parse_ex_command("model"), ExCmd::Model(None));
+        assert_eq!(
+            parse_ex_command("model gpt-4"),
+            ExCmd::Model(Some("gpt-4".to_string()))
+        );
+        assert_eq!(
+            parse_ex_command("model 2"),
+            ExCmd::Model(Some("2".to_string()))
+        );
+    }
+
+    #[test]
+    fn ex_tools() {
+        assert_eq!(parse_ex_command("tools"), ExCmd::Tools);
+    }
+
+    #[test]
+    fn ex_clear_and_new() {
+        assert_eq!(parse_ex_command("clear"), ExCmd::Clear);
+        assert_eq!(parse_ex_command("new"), ExCmd::Clear);
+    }
+
+    #[test]
+    fn ex_understand_with_and_without_arg() {
+        assert_eq!(
+            parse_ex_command("understand Vim"),
+            ExCmd::Understand("Vim".to_string())
+        );
+        // No arg: yields Unknown with a hint message.
+        assert!(matches!(parse_ex_command("understand"), ExCmd::Unknown(_)));
+    }
+
+    #[test]
+    fn ex_grep_with_and_without_arg() {
+        assert_eq!(
+            parse_ex_command("grep fn drive"),
+            ExCmd::Grep("fn drive".to_string())
+        );
+        assert!(matches!(parse_ex_command("grep"), ExCmd::Unknown(_)));
+    }
+
+    #[test]
+    fn ex_ask_with_and_without_arg() {
+        assert_eq!(
+            parse_ex_command("ask how does the pump work"),
+            ExCmd::Ask("how does the pump work".to_string())
+        );
+        assert!(matches!(parse_ex_command("ask"), ExCmd::Unknown(_)));
+    }
+
+    #[test]
+    fn ex_view_viz_doctor() {
+        assert_eq!(parse_ex_command("view"), ExCmd::View(None));
+        assert_eq!(
+            parse_ex_command("view Foo"),
+            ExCmd::View(Some("Foo".to_string()))
+        );
+        assert_eq!(parse_ex_command("viz"), ExCmd::Viz(None));
+        assert_eq!(
+            parse_ex_command("mermaid Bar"),
+            ExCmd::Viz(Some("Bar".to_string()))
+        );
+        assert_eq!(parse_ex_command("gm"), ExCmd::Viz(None));
+        assert_eq!(parse_ex_command("doctor"), ExCmd::Doctor);
+        assert_eq!(
+            parse_ex_command("impact Foo"),
+            ExCmd::Impact("Foo".to_string())
+        );
+        assert!(matches!(parse_ex_command("impact"), ExCmd::Unknown(_)));
+        assert_eq!(parse_ex_command("communities"), ExCmd::Communities);
+        assert_eq!(parse_ex_command("audit"), ExCmd::Audit);
+    }
+
+    #[test]
+    fn ex_unknown_and_empty() {
+        assert!(matches!(
+            parse_ex_command("bogus"),
+            ExCmd::Unknown(s) if s == "bogus"
+        ));
+        // Empty input (bare ':' + Enter) yields Unknown("").
+        assert!(matches!(
+            parse_ex_command(""),
+            ExCmd::Unknown(s) if s.is_empty()
+        ));
+    }
+
+    #[test]
+    fn ex_leading_trailing_spaces_are_trimmed() {
+        assert_eq!(parse_ex_command("  quit  "), ExCmd::Quit);
+        assert_eq!(
+            parse_ex_command("  model   some-model  "),
+            ExCmd::Model(Some("some-model".to_string()))
         );
     }
 }
