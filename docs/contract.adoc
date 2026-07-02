@@ -23,6 +23,8 @@ minimum of aden 0.2.0; an older aden that lacks these commands degrades to the
 standalone path (the affected calls return errors coxn already tolerates).
 ====
 
+[[_scope_manifest]]
+
 == Scope manifest
 
 aden emits one JSON *scope manifest* per task. coxn consumes it verbatim: it is
