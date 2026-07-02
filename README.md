@@ -16,6 +16,18 @@ The split:
 The name is coxswain shorthand (`cox'n`): the cox steers the boat and calls the
 cadence but never rows. See `DESIGN.adoc` for the full design and laws.
 
+## Prerequisites
+
+1. **A model** — Ollama/LM Studio running locally, or `COXN_MODEL_BASE_URL` + `COXN_MODEL_KEY`
+2. **Optional:** `bwrap` for sandboxed `run_command` (Linux)
+3. **Optional:** `aden` ≥ 0.2.0 for blast-radius scope gate
+
+```sh
+coxn doctor   # one-screen health check
+```
+
+Install: see [INSTALL.md](INSTALL.md). `cargo install --path .` from this repo.
+
 ## Quickstart
 
 ### Standalone (no aden needed)
@@ -162,6 +174,20 @@ status line is honest about which mode is active.
 /edit [path]     open the last-edited file (or path) in $EDITOR
 /clear           clear the conversation (keeps the task scope)
 /quit            leave coxn
+/scope           show active task scope (COXN_TASK_*)
+/trust           toggle read_file session-auto approval
+/copy            save transcript to ~/.local/share/coxn/last-transcript.txt
+/execute         run aden task partition sequentially
+```
+
+CLI:
+
+```
+coxn doctor              health check
+coxn once -p "prompt"    headless turn (COXN_AUTO_APPROVE=1)
+```
+
+Use `@path/to/file` in messages to inject file contents (up to 3 files).
 ```
 
 `/model` and `/session` open an arrow-navigable picker (Up/Down, Enter, Esc).
