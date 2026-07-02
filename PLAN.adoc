@@ -117,9 +117,45 @@ commits; 101 tests green, clippy/fmt clean, still six deps):
 
 == Phase 5 (later): multi-model workflows and sub-agents
 
-* [~] Sub-agent = pump instance (model by role + `aden scope` context + tool subset + budget); returns a dense result, not a transcript. PARTITION CONSUMPTION DONE: `agents.rs` parses aden's `scope --agents` index + orders by dependency; `/agents` shows the plan with per-role routed models (live-verified). The autonomous runner (one pump per sub-scope, auto-approved, dense-merge) is the remaining step -- gated on aden non-degenerate partitions + multiple loadable role-models to validate.
-* [ ] Execute `aden scope` manifests + overlap/order; coxn spawns/paces/merges. No planner in coxn (aden owns the partition).
-* [ ] Token-efficiency discipline: disjoint scopes, pull + dense-merge, cheap/local fan-out, one-model-per-subtask for cache, per-agent budgets + adaptive stopping. (Parallelism buys wall-clock, not tokens.)
+* [~] Sub-agent = pump instance (model by role + `aden scope` context + tool subset + budget); returns a dense result, not a transcript. PARTITION CONSUMPTION DONE: `agents.rs` parses aden's `scope --agents` index + orders by dependency; `/agents` shows the plan with per-role routed models (live-verified).
+* [x] Sequential runner: `/execute` spawns one `Pump` per sub-scope in dependency order, `BatchIo` auto-approve, dense merge upstream (`execute_partition` in main.rs). Live validation on real partitions still open.
+* [ ] Per-role tool subsets + per-scope token budgets + adaptive stopping.
+* [ ] Parallel execution (sequential first per routing.adoc).
+
+== Phase G (adoption): distribution and first-run -- DONE
+
+* [x] G1 CLI: `coxn --version`, `--help`, `coxn doctor` (`src/doctor.rs`)
+* [x] G2 Stub gate: offline stub blocks chat, `[r]` retry / `[q]` quit
+* [x] G3 Default preamble ungated (`AGENT_PREAMBLE_BASE` unless `COXN_BARE=1`)
+* [x] G4 crates.io metadata + GitHub Actions CI/release workflow
+* [x] G5 INSTALL.md + README prerequisites
+
+== Phase H (ergonomics): daily UX -- MOSTLY DONE
+
+* [x] Trust tiers: session-auto `read_file`, `/trust` toggle (`src/trust.rs`)
+* [x] `@path` input expansion (3 files, 8k cap)
+* [x] Native `grep` / `glob` tools (`src/tools.rs`)
+* [x] `/scope`, `/copy`
+* [~] Simple mode: vim defaults Insert; `COXN_VIM` opt-in deferred
+
+== Phase I (wedge visibility): gate demo -- PARTIAL
+
+* [x] Gate revert banner + confirm modal with verdict label
+* [x] Dirty-tree boot warning when task scope active
+* [x] `scripts/demo-sandbox.sh`
+* [ ] `scripts/demo-scope-escape.sh` + README GIF
+
+== Phase J (provider): Ollama native -- OPEN
+
+* [ ] `OllamaModel` `/api/chat` profile (streaming + tools on `:11434`)
+
+== Phase K (architecture): extract app.rs -- OPEN
+
+* [ ] Move `drive` + command parsing out of `main.rs` (< 400 LOC target)
+
+== Phase M (automation): headless -- DONE
+
+* [x] `coxn once -p` with `COXN_AUTO_APPROVE=1` + `BatchIo`
 
 == Notes / decisions
 
