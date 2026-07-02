@@ -1,5 +1,5 @@
 = coxn TUI Frictionless Overhaul — Design Note
-:status: draft, pending /plan-eng-review
+:status: implemented (M1–M6 shipped on feat/tui-frictionless)
 :date: 2026-07-02
 :audience: /plan-eng-review skill, then implementer
 :parent: DESIGN.adoc, PLAN.adoc
