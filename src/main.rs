@@ -160,6 +160,12 @@ async fn main() -> io::Result<()> {
     // `caps`; nothing shells out to aden a second time for the same question.
     let caps = aden::probe(&dir);
 
+    // Coxn owns the write path: one quiet gen at boot, then every read sets
+    // ADEN_SKIP_AUTO_GEN so aden grep/asm/scope never fight the store lock.
+    if caps.available {
+        let _ = aden::ensure_indexed(&dir);
+    }
+
     // When aden is present, register its five read tools as active so the model
     // uses dense retrieval immediately. When absent, register none; the discovery
     // seam reports an empty catalog, which is honest.
@@ -2414,7 +2420,10 @@ mod tests {
     fn boot_status_ungated_when_no_task() {
         // No task -> must explicitly surface that only human approval gates edits.
         let s = boot_status("stub-model", "", false);
-        assert!(s.contains("ungated (human approval only)"), "expected explicit ungated text in: {s}");
+        assert!(
+            s.contains("ungated (human approval only)"),
+            "expected explicit ungated text in: {s}"
+        );
         assert!(s.contains("/help"), "{s}");
     }
 

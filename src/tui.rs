@@ -5,6 +5,15 @@
 //! to a buffer, redraw next frame. No graph rendering; the inspector stays
 //! browser-native (`aden view`).
 //!
+//! Visual language ("Ledger"): the transcript is set like a typeset column --
+//! a continuous left rule (the pane's `Borders::LEFT`) with a per-turn role
+//! sigil in the gutter, warm off-white text, and a single slate-blue accent.
+//! All motion is a pure function of the elapsed-millis phase, redrawn each
+//! 100ms tick (no threads): a braille spinner, a cosine "breath" on the
+//! separator, a brightened live line, and a blinking scroll marker. Truecolor
+//! (`Color::Rgb`) that degrades to nearest-ANSI; role identity is carried by
+//! the sigil glyph, not hue alone, so it survives a 16-color terminal.
+//!
 //! Alt-screen tradeoff: coxn runs full-screen for layout (the status line needs
 //! it), which loses native terminal scrollback. This is the one real TUI
 //! tradeoff called out in DESIGN.adoc; raw-append is the alternative if
@@ -14,19 +23,24 @@
 //! `TestBackend`; terminal lifecycle and event polling are the thin, untested
 //! edges.
 
-// View::push is the streaming-append API exercised by tests and used once a
-// provider streams (Phase 3); allow it ahead of that consumer.
-#![allow(dead_code)]
-
 use std::io;
 use std::time::Instant;
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+
+use crate::vim::{Mode, Vim};
+
+/// Columns the output gutter consumes: the left rule (`Block` border) plus one
+/// column of padding. Subtracted from the pane width when computing wrap/scroll
+/// so the math matches what the [`Paragraph`] actually lays out inside the block.
+pub const PANE_GUTTER: u16 = 2;
 
 /// What a [`Menu`] selects, so the event loop knows how to act on Enter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +49,8 @@ pub enum MenuKind {
     Model,
     /// Resume the selected session slug.
     Session,
+    /// Command palette / slash commands (sets the input line).
+    Commands,
 }
 
 /// One selectable row: the `value` acted on, and the `label` shown.
@@ -92,15 +108,35 @@ pub struct View {
     /// An active picker overlay (e.g. `/model`, `/session`). When set, keys
     /// navigate it instead of editing the input line.
     pub menu: Option<Menu>,
+    /// Vim modal editor state. Insert is the default, so typing and the
+    /// existing emacs-style keys keep working untouched when in Insert mode.
+    pub vim: Vim,
+    /// Whether the help overlay is currently shown. Toggled by `?` in Normal
+    /// mode or `:help` / `/help`. Closed by `Esc`, `q`, or a second `?`.
+    pub show_help: bool,
+    /// Whether aden is active this session. Drives the status-line badge.
+    /// Set by the event loop each time capabilities are (re-)probed.
+    pub aden_active: bool,
+    /// Last ADEN action performed (for cockpit status feel, e.g. "understand 'drive'").
+    pub last_aden: Option<String>,
+    /// Inline ghost-text suggestion (dim) for /commands as you type (Tab or
+    /// Right to accept). Populated live for better discoverability of commands.
+    pub suggestion: Option<String>,
 }
 
 impl View {
     /// An empty view.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            vim: Vim::new(),
+            last_aden: None,
+            suggestion: None,
+            ..Self::default()
+        }
     }
 
     /// Append streamed text to the output pane.
+    #[allow(dead_code)]
     pub fn push(&mut self, chunk: &str) {
         self.output.push_str(chunk);
     }
@@ -133,6 +169,16 @@ impl View {
         self.menu = None;
     }
 
+    /// Toggle the help overlay on or off.
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
+    /// Close the help overlay.
+    pub fn close_help(&mut self) {
+        self.show_help = false;
+    }
+
     /// Move the picker selection by `delta` (wraps at the ends).
     pub fn menu_move(&mut self, delta: i32) {
         if let Some(menu) = &mut self.menu {
@@ -144,6 +190,7 @@ impl View {
     }
 
     /// The selected menu item, if a picker is open.
+    #[allow(dead_code)]
     pub fn menu_selected(&self) -> Option<&MenuItem> {
         self.menu.as_ref().and_then(|m| m.items.get(m.selected))
     }
@@ -264,10 +311,14 @@ impl View {
     /// Take the input line, leaving it empty (on submit). Resets cursor and
     /// history navigation.
     pub fn take_input(&mut self) -> String {
+        self.suggestion = None;
         let line = std::mem::take(&mut self.input);
         self.cursor = 0;
         self.hist_pos = None;
         self.hist_draft.clear();
+        // Submitting clears modal state: the next line starts fresh in Insert,
+        // and no stale Visual anchor can survive into a now-empty buffer.
+        self.vim = Vim::new();
         line
     }
 
@@ -320,6 +371,23 @@ impl View {
         self.scroll_offset = 0;
     }
 
+    /// Update inline suggestion (ghost text) for / slash commands based on
+    /// current input. Called after any input edit so typing /hel immediately
+    /// shows the dim "p " completion.
+    pub fn refresh_suggestion(&mut self) {
+        self.suggestion = if self.input.starts_with('/') {
+            super::complete_input(&self.input).and_then(|full| {
+                if full.len() > self.input.len() && full.starts_with(&self.input) {
+                    Some(full[self.input.len()..].to_string())
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+    }
+
     /// Scroll the output pane up (back) by `amount` lines, clamped to `max` (the
     /// available scrollback for the current pane, from [`View::max_scroll`]).
     pub fn scroll_up(&mut self, amount: u16, max: u16) {
@@ -336,7 +404,8 @@ impl View {
     /// output pane `width` columns wide and `pane_height` rows tall: the number
     /// of wrapped lines that do not fit. Lets the caller clamp [`View::scroll_up`].
     pub fn max_scroll(&self, width: u16, pane_height: u16) -> u16 {
-        let total = wrapped_line_count(&self.output, width as usize);
+        let content = width.saturating_sub(PANE_GUTTER);
+        let total = wrapped_line_count(&self.output, content as usize);
         total.saturating_sub(pane_height as usize) as u16
     }
 }
@@ -382,41 +451,137 @@ fn wrapped_line_count(text: &str, width: usize) -> usize {
     total
 }
 
-// -- Role color helpers ---------------------------------------------------
+// -- Ledger palette -------------------------------------------------------
+//
+// Truecolor (Color::Rgb). On a 16-color terminal these degrade to the nearest
+// ANSI color; role distinction survives because the gutter *sigil* carries it,
+// not the hue alone. No background is forced, so the theme sits on whatever
+// field the user's terminal provides.
 
-/// Style for the prefix label of a role.
-fn role_style(prefix: &str) -> Style {
+/// Warm off-white: primary body text (the first line of each turn).
+const PRIMARY: Color = Color::Rgb(212, 201, 176);
+/// A gentle step down: wrapped continuation and non-role lines.
+const SECONDARY: Color = Color::Rgb(168, 158, 138);
+/// Brighter than primary: the live line, only while a turn streams.
+const SHIMMER: Color = Color::Rgb(238, 231, 212);
+/// The gutter rule and separator at rest.
+const RULE: Color = Color::Rgb(58, 53, 48);
+/// The single accent (spinner, caret, key hints, overlay borders): slate blue.
+const ACCENT: Color = Color::Rgb(91, 127, 166);
+/// Receding text: status, hints, the elapsed counter, the scroll marker.
+const DIM: Color = Color::Rgb(107, 100, 88);
+/// Settled-success color (a `ok:` outcome): sage, reads as data not alarm.
+const OK: Color = Color::Rgb(122, 158, 126);
+/// Settled-failure color (an `err:` outcome): terracotta, not alarm-red.
+const ERR: Color = Color::Rgb(196, 123, 90);
+/// The user's voice in the gutter: warm sand.
+const SAND: Color = Color::Rgb(139, 115, 85);
+/// Tool/cmd voice in the gutter: dusty mauve.
+const MAUVE: Color = Color::Rgb(155, 142, 160);
+/// sys: voice: one step above the rule, very quiet.
+const QUIET: Color = Color::Rgb(90, 82, 72);
+
+/// Known role prefixes, longest-match order (longest first to avoid prefix collisions).
+const ROLE_PREFIXES: &[&str] = &[
+    "aden:", "coxn:", "tool:", "you:", "sys:", "cmd:", "ok:", "err:",
+];
+
+/// The single-cell gutter sigil that stands in for a role's text prefix.
+fn role_sigil(prefix: &str) -> &'static str {
     match prefix {
-        "you:" => Style::default().fg(Color::LightGreen),
-        "coxn:" => Style::default().fg(Color::White),
-        "tool:" => Style::default().fg(Color::Yellow),
-        "cmd:" => Style::default().fg(Color::LightBlue),
-        "ok:" => Style::default().fg(Color::Green),
-        "err:" => Style::default().fg(Color::LightRed),
-        "sys:" => Style::default().fg(Color::DarkGray),
-        _ => Style::default().fg(Color::LightRed), // error / unknown
+        "aden:" => "⊙",
+        "you:" => "▸",
+        "coxn:" => "♦", // U+2666: a diamond that is always one cell wide (U+25C6 ◆ is ambiguous)
+        "tool:" | "cmd:" => "▪",
+        "ok:" => "✓",
+        "err:" => "✗",
+        "sys:" => "·",
+        _ => "·", // unknown
     }
 }
 
-/// Known role prefixes, longest-match order (longest first to avoid prefix collisions).
-const ROLE_PREFIXES: &[&str] = &["coxn:", "tool:", "you:", "sys:", "cmd:", "ok:", "err:"];
+/// The accent color for a role's sigil. Color lives only here in the gutter.
+fn role_color(prefix: &str) -> Color {
+    match prefix {
+        "aden:" => ACCENT,         // structural graph actions
+        "you:" => SAND,            // the human voice
+        "coxn:" => ACCENT,         // slate: the model voice
+        "tool:" | "cmd:" => MAUVE, // dusty mauve
+        "ok:" => OK,               // sage
+        "err:" => ERR,             // terracotta
+        _ => QUIET,                // sys: and unknown, very quiet
+    }
+}
+
+/// Body-text color per role, so the sigil and the line it labels agree. The
+/// model's voice is brightest (the live content); the user's prompt recedes one
+/// step; tool outcomes settle into their semantic color (sage ok / terracotta
+/// err); tool/sys lines stay quiet. This is the change that turns a monochrome
+/// transcript into a scannable record without adding any new hue.
+fn role_body_color(prefix: &str) -> Color {
+    match prefix {
+        "aden:" => SECONDARY,    // ADEN graph results are informative but secondary
+        "coxn:" => PRIMARY,      // brightest: the model's voice
+        "you:" => SECONDARY,     // the human voice, one step down
+        "tool:" | "cmd:" => DIM, // subordinate machine steps, below the human
+        "ok:" => OK,             // settled outcomes leave the brightness axis
+        "err:" => ERR,           // for their semantic color
+        "sys:" => QUIET,         // recede furthest, matching the · sigil's depth
+        _ => SECONDARY,          // unknown
+    }
+}
+
+/// A cosine "breath" between [`RULE`] and a brighter rule, on a 4s cycle, so the
+/// separator gently pulses while a turn runs. Pure: phase is the elapsed millis
+/// passed in. Returns the static [`RULE`] when idle (no motion at rest). The
+/// bright target is wide enough (a ~50-step delta) to be perceptible on average
+/// terminals -- a narrower range reads as no motion at all.
+fn rule_breath(elapsed_ms: u128, pending: bool) -> Color {
+    if !pending {
+        return RULE;
+    }
+    let phase = (elapsed_ms % 4000) as f64;
+    let t = (1.0 + (phase * std::f64::consts::TAU / 4000.0).cos()) / 2.0;
+    let lerp = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
+    Color::Rgb(lerp(58, 110), lerp(53, 100), lerp(48, 88))
+}
 
 /// Convert a plain-text transcript (with `you:` / `coxn:` / `tool:` / `sys:`
-/// prefixes) into a ratatui [`Text`] with per-role colors. Lines that do not
-/// start with a known prefix get the error/unknown style.
-fn styled_output(output: &str) -> Text<'static> {
+/// prefixes) into a styled [`Text`]: a per-role sigil in the gutter, the role's
+/// text in its body color. Continuation lines (a turn's later paragraphs, code,
+/// raw output) inherit the *owning* turn's body color, so a multi-paragraph
+/// `coxn:` answer stays PRIMARY throughout while raw `tool:` output recedes to
+/// DIM -- the brightness follows the voice, not the line shape. While `pending`,
+/// the final line is brightened to [`SHIMMER`] so streaming output reads as live.
+fn styled_output(output: &str, pending: bool) -> Text<'static> {
+    let last = output.lines().count().saturating_sub(1);
+    // The body color of the turn currently being rendered; continuation lines
+    // adopt it until the next role line changes it.
+    let mut owner_body = SECONDARY;
     let lines: Vec<Line<'static>> = output
         .lines()
-        .map(|raw| {
+        .enumerate()
+        .map(|(idx, raw)| {
+            let live = pending && idx == last;
             if let Some(prefix) = ROLE_PREFIXES.iter().find(|&&p| raw.starts_with(p)) {
-                let rest = &raw[prefix.len()..];
+                owner_body = role_body_color(prefix);
+                let after = &raw[prefix.len()..];
+                let rest = after.strip_prefix(' ').unwrap_or(after);
+                let body = if live { SHIMMER } else { owner_body };
                 Line::from(vec![
-                    Span::styled(prefix.to_string(), role_style(prefix)),
-                    Span::raw(rest.to_string()),
+                    Span::styled(
+                        format!("{} ", role_sigil(prefix)),
+                        Style::default().fg(role_color(prefix)),
+                    ),
+                    Span::styled(rest.to_string(), Style::default().fg(body)),
                 ])
             } else {
-                // Not a role line (continuation from wrap, error message, etc.)
-                Line::from(vec![Span::raw(raw.to_string())])
+                // Continuation: aligned under the role text, inheriting its color.
+                let body = if live { SHIMMER } else { owner_body };
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(raw.to_string(), Style::default().fg(body)),
+                ])
             }
         })
         .collect();
@@ -439,21 +604,28 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 // -- Render ---------------------------------------------------------------
 
-/// Render one frame: an output pane above a one-row status line and a one-row
-/// input prompt, with the confirm modal overlaid when active. Pure in `view`;
-/// testable with `TestBackend`.
+/// Render one frame: a ruled output pane, a hairline separator, a one-row status
+/// line, and a one-row input prompt, with the confirm modal or picker overlaid
+/// when active. Pure in `view`; testable with `TestBackend`.
 pub fn render(frame: &mut Frame, view: &View) {
     let areas = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(1), // separator
+        Constraint::Length(1), // status
+        Constraint::Length(1), // input
     ])
     .split(frame.area());
     let pane = areas[0];
 
-    // -- Output pane: wrapped, role-colored, scrollable ---
-    let output_text = styled_output(&view.output);
-    let total_lines = wrapped_line_count(&view.output, pane.width as usize);
+    // Animation phase: every motion below is a pure function of elapsed millis,
+    // redrawn each 100ms tick. Idle (no turn in flight) means no motion.
+    let elapsed = view.pending_since.map(|since| since.elapsed());
+    let pending = elapsed.is_some();
+    let elapsed_ms = elapsed.map(|e| e.as_millis()).unwrap_or(0);
+
+    // -- Output pane: ruled gutter, sigils, wrapped, scrollable ---
+    let content_width = pane.width.saturating_sub(PANE_GUTTER);
+    let total_lines = wrapped_line_count(&view.output, content_width as usize);
     let pane_height = pane.height as usize;
 
     // scroll_offset is distance-from-bottom: 0 pins to the bottom (show the last
@@ -462,92 +634,453 @@ pub fn render(frame: &mut Frame, view: &View) {
     let from_bottom = view.scroll_offset.min(max_scrollback);
     let scroll_row = max_scrollback - from_bottom;
 
-    let output_widget = Paragraph::new(output_text)
+    // The left rule is the Block border; one column of padding sets text off it.
+    let output_widget = Paragraph::new(styled_output(&view.output, pending))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(RULE))
+                .padding(Padding::new(1, 0, 0, 0)),
+        )
         .wrap(Wrap { trim: false })
         .scroll((scroll_row, 0));
 
-    // Activity indicator: live spinner + elapsed seconds when a turn is in
-    // progress. The TICK (100ms) event loop redraws fast enough to animate it.
-    const SPIN: &[&str] = &["-", "\\", "|", "/"];
-    let status_text = if let Some(since) = view.pending_since {
-        let e = since.elapsed();
-        let frame = SPIN[(e.as_millis() / 250) as usize % SPIN.len()];
-        format!(
-            "{}  {} {}s  (Ctrl-C cancel)",
-            view.status,
-            frame,
-            e.as_secs()
-        )
+    // -- Separator: a hairline that breathes while a turn runs ---
+    // A `└` corner on the first column joins the left rule to the hairline so the
+    // two read as one continuous frame element rather than an abrupt tee.
+    let sep_w = areas[1].width as usize;
+    let sep = if sep_w > 0 {
+        format!("└{}", "─".repeat(sep_w - 1))
     } else {
-        view.status.clone()
+        String::new()
     };
+    let separator = Paragraph::new(Line::from(Span::styled(
+        sep,
+        Style::default().fg(rule_breath(elapsed_ms, pending)),
+    )));
 
-    // Input prompt with the cursor drawn as a reverse-video cell over the
-    // character it sits on (or a trailing space at end-of-line), so it never
-    // collides with literal text the user typed.
-    let before = &view.input[..view.cursor];
-    let (cursor_cell, after) = match view.input[view.cursor..].chars().next() {
-        Some(c) => (c.to_string(), &view.input[view.cursor + c.len_utf8()..]),
-        None => (" ".to_string(), ""),
+    // -- Status line: spinner + elapsed + status, blinking scroll marker ---
+    // 10-frame braille sweep at 80ms/frame: a smooth ~0.8s rotation.
+    const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut status_spans: Vec<Span<'static>> = Vec::new();
+    if pending {
+        let frame = SPIN[(elapsed_ms / 80) as usize % SPIN.len()];
+        status_spans.push(Span::styled(
+            format!("{frame} "),
+            Style::default().fg(ACCENT),
+        ));
+        // Tenths so the counter joins the spinner's motion from the first frame
+        // (not frozen at "0s" for a second). SECONDARY: live data, not metadata.
+        status_spans.push(Span::styled(
+            format!("{}.{}s ", elapsed_ms / 1000, (elapsed_ms % 1000) / 100),
+            Style::default().fg(SECONDARY),
+        ));
+    }
+    // Vim mode tag: always shown so the user always knows which mode is active.
+    // Non-Insert modes render in ACCENT (an actionable state the user entered
+    // intentionally); Insert renders in DIM so it recedes in steady-state typing.
+    {
+        let tag = format!("-- {} -- ", view.vim.mode.tag());
+        let color = if view.vim.mode == Mode::Insert {
+            DIM
+        } else {
+            ACCENT
+        };
+        status_spans.push(Span::styled(tag, Style::default().fg(color)));
+    }
+    // Status fields, segmented by meaning so the row is readable at a glance.
+    // main.rs joins fields with "  |  "; splitting here is the seam between data
+    // and presentation. The model name leads in SECONDARY; the cancel hint comes
+    // *before* the receding savings/ctx so it survives a narrow terminal (it is
+    // the only way to abort a running turn); the rest recede in DIM behind a
+    // faint middot (QUIET sits below DIM on a dark field, so it recedes furthest).
+    let segs: Vec<&str> = view
+        .status
+        .split("  |  ")
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Some(model) = segs.first() {
+        status_spans.push(Span::styled(
+            model.to_string(),
+            Style::default().fg(SECONDARY),
+        ));
+    }
+    // Aden activity badge: "aden" in ACCENT when active, a dim "·" placeholder
+    // when absent so the slot is always visible and the layout stable.
+    status_spans.push(Span::styled("  ", Style::default().fg(QUIET)));
+    if view.aden_active {
+        status_spans.push(Span::styled("aden-cockpit", Style::default().fg(ACCENT)));
+        status_spans.push(Span::styled(
+            " ⊙K/gd/Ctrl+L ga / ?",
+            Style::default().fg(QUIET),
+        ));
+        if let Some(last) = &view.last_aden {
+            let display = if last.len() > 15 {
+                format!("{}...", &last[..12])
+            } else {
+                last.clone()
+            };
+            status_spans.push(Span::styled(
+                format!(" last: {}", display),
+                Style::default().fg(QUIET),
+            ));
+        }
+    } else {
+        status_spans.push(Span::styled("·", Style::default().fg(QUIET)));
+    }
+    if pending {
+        // Same doctrine as the overlay hints: the key (Ctrl-C) in ACCENT, the
+        // verb in DIM. Ordered before the receding savings/ctx so it survives a
+        // narrow terminal -- it is the only way to abort a running turn.
+        status_spans.push(Span::styled("  (", Style::default().fg(DIM)));
+        status_spans.push(Span::styled("Ctrl-C", Style::default().fg(ACCENT)));
+        status_spans.push(Span::styled(" cancel)", Style::default().fg(DIM)));
+    }
+    for seg in segs.iter().skip(1) {
+        status_spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        status_spans.push(Span::styled(seg.to_string(), Style::default().fg(DIM)));
+    }
+    // Scroll marker: a right-aligned ▾ that blinks while a turn runs (and shows
+    // steady when idle). ACCENT, not DIM: it is the one actionable affordance on
+    // the row (scroll back to live), matching the spinner/caret/prompt accent.
+    if view.scroll_offset > 0 && (!pending || (elapsed_ms % 1000) < 600) {
+        // All status content is ASCII / EAW=N, so chars().count() == display width.
+        // If a CJK model name ever lands here, switch to unicode-width (a ratatui dep).
+        let used: usize = status_spans.iter().map(|s| s.content.chars().count()).sum();
+        let width = areas[2].width as usize;
+        if width > used + 1 {
+            status_spans.push(Span::raw(" ".repeat(width - used - 1)));
+            status_spans.push(Span::styled("▾", Style::default().fg(ACCENT)));
+        }
+    }
+
+    // -- Input prompt: accent chevron, block caret, optional visual highlight --
+    // In Command mode the whole row is replaced by the ex-style `:cmdline`.
+    // In Visual mode, the selection range is highlighted with reversed video in
+    // the ACCENT color. In Normal mode the existing reverse-video block caret
+    // marks the position. Insert mode is unchanged.
+    let prompt_line = if view.vim.mode == Mode::Command {
+        // Ledger-styled command line: ':' in ACCENT, cmdline text in SECONDARY,
+        // a reverse-video block cursor cell at the end (where the next char goes).
+        let cmdline = view.vim.cmdline.clone();
+        Line::from(vec![
+            Span::styled(":".to_string(), Style::default().fg(ACCENT)),
+            Span::styled(cmdline, Style::default().fg(SECONDARY)),
+            Span::styled(
+                " ".to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED),
+            ),
+        ])
+    } else {
+        let sel = view.vim.selection(view.cursor);
+        let input = &view.input;
+        let cursor = view.cursor;
+
+        let before = &input[..cursor];
+        let (cursor_ch, after_start) = match input[cursor..].chars().next() {
+            Some(c) => (c, cursor + c.len_utf8()),
+            None => (' ', cursor),
+        };
+        let cursor_cell = cursor_ch.to_string();
+        let after = &input[after_start..];
+
+        // Build the input spans. When a Visual selection covers the cursor (or any
+        // part of the line), we split the line into up to five segments:
+        //   pre-selection | selection-before-cursor | cursor | selection-after-cursor | post-selection
+        // Char boundary safety: sel bounds come from the Vim engine, which only
+        // ever sets them at char boundaries via prev_boundary / next_boundary.
+        let prompt_spans: Vec<Span<'static>> = if let Some((sel_lo, sel_hi)) = sel {
+            // Clamp both bounds into the buffer before slicing. The engine only
+            // emits char-boundary offsets, but a stale selection could outrun a
+            // now-shorter buffer; clamping keeps every slice below in range.
+            // After length-clamping we also snap to a char boundary: if the
+            // buffer shrank mid-char the clamped index may land inside a
+            // multi-byte sequence, making text[sel_hi..] a non-boundary slice.
+            let sel_hi = crate::vim::snap_boundary_down(input, sel_hi.min(input.len()));
+            let sel_lo = crate::vim::snap_boundary_down(input, sel_lo.min(input.len()));
+            // Inclusive end: extend hi to include the char under it.
+            let sel_end = input[sel_hi..]
+                .chars()
+                .next()
+                .map_or(sel_hi, |c| sel_hi + c.len_utf8())
+                .min(input.len());
+            debug_assert!(
+                input.is_char_boundary(sel_lo) && input.is_char_boundary(sel_end),
+                "visual selection must slice on char boundaries"
+            );
+
+            // Segment the input around the selection, guarding all slices.
+            let pre_sel = &input[..sel_lo];
+            // `>` not `>=`: at cursor == sel_lo this segment is empty (the cursor
+            // cell renders that position), which also avoids a backward slice.
+            let sel_before_cursor = if cursor > sel_lo {
+                &input[sel_lo..cursor.min(sel_end)]
+            } else {
+                ""
+            };
+            let sel_after_cursor = if after_start < sel_end {
+                &input[after_start..sel_end]
+            } else {
+                ""
+            };
+            let post_sel = if sel_end < input.len() {
+                &input[sel_end..]
+            } else {
+                ""
+            };
+
+            let sel_style = Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED);
+            let cur_style = Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED);
+
+            let chevron = if view.aden_active { "⊙ " } else { "› " };
+            vec![
+                Span::styled(chevron.to_string(), Style::default().fg(ACCENT)),
+                Span::styled(pre_sel.to_string(), Style::default().fg(SECONDARY)),
+                Span::styled(sel_before_cursor.to_string(), sel_style),
+                Span::styled(cursor_cell, cur_style),
+                Span::styled(sel_after_cursor.to_string(), sel_style),
+                Span::styled(post_sel.to_string(), Style::default().fg(SECONDARY)),
+            ]
+        } else {
+            // Normal / Insert: accent chevron + reverse-video block caret.
+            // Typed text in SECONDARY (the composing voice), matching `you:` record
+            // lines -- so the draft never outshines coxn's PRIMARY responses.
+            // If cursor at end and we have a suggestion (for /commands), append
+            // it dim as ghost text so it "auto populates" as you type.
+            {
+                let chevron = if view.aden_active { "⊙ " } else { "› " };
+                let mut spans = vec![
+                    Span::styled(chevron.to_string(), Style::default().fg(ACCENT)),
+                    Span::styled(before.to_string(), Style::default().fg(SECONDARY)),
+                    Span::styled(
+                        cursor_cell,
+                        Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED),
+                    ),
+                    Span::styled(after.to_string(), Style::default().fg(SECONDARY)),
+                ];
+                if cursor == input.len()
+                    && let Some(sugg) = &view.suggestion
+                {
+                    spans.push(Span::styled(sugg.clone(), Style::default().fg(DIM)));
+                }
+                spans
+            }
+        };
+
+        Line::from(prompt_spans)
     };
-    let prompt_line = Line::from(vec![
-        Span::raw("> "),
-        Span::raw(before.to_string()),
-        Span::styled(
-            cursor_cell,
-            Style::default().add_modifier(Modifier::REVERSED),
-        ),
-        Span::raw(after.to_string()),
-    ]);
 
     frame.render_widget(output_widget, pane);
-    frame.render_widget(Paragraph::new(status_text.as_str()), areas[1]);
-    frame.render_widget(Paragraph::new(prompt_line), areas[2]);
+    frame.render_widget(separator, areas[1]);
+    frame.render_widget(Paragraph::new(Line::from(status_spans)), areas[2]);
+    frame.render_widget(Paragraph::new(prompt_line), areas[3]);
 
     if let Some(prompt) = &view.modal {
         let hint = "[y] proceed   [n] block";
-        let inner_width = prompt.chars().count().max(hint.len()) as u16;
-        let area = centered_rect(inner_width + 4, 4, frame.area());
-        let block = Block::default().borders(Borders::ALL).title("confirm");
+        // Floor the inner width so the hint line is never truncated on a narrow
+        // terminal (the hint is the modal's critical affordance).
+        let inner_width = prompt.chars().count().max(hint.chars().count()).max(40) as u16;
+        let area = centered_rect(inner_width + 4, 5, frame.area());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .padding(Padding::horizontal(1))
+            .title(Line::from(Span::styled(
+                " confirm ",
+                Style::default().fg(DIM),
+            )));
+        let body = Text::from(vec![
+            Line::from(Span::styled(prompt.clone(), Style::default().fg(PRIMARY))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("[y]", Style::default().fg(ACCENT)),
+                Span::styled(" proceed   ", Style::default().fg(DIM)),
+                Span::styled("[n]", Style::default().fg(ACCENT)),
+                Span::styled(" block", Style::default().fg(DIM)),
+            ]),
+        ]);
         frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(format!("{prompt}\n{hint}")).block(block),
-            area,
-        );
+        frame.render_widget(Paragraph::new(body).block(block), area);
     } else if let Some(menu) = &view.menu {
-        // The picker overlay: one row per item, the selected one reverse-video.
-        let hint = "Up/Down select - Enter choose - Esc cancel";
+        // The picker overlay: one row per item; the selected one gets a ›
+        // marker and bold primary text rather than raw reverse-video.
+        let hint = "↑↓ select  Enter choose  Esc cancel";
         let width = menu
             .items
             .iter()
             .map(|i| i.label.chars().count())
-            .chain([menu.title.chars().count(), hint.len()])
+            .chain([menu.title.chars().count(), hint.chars().count()])
             .max()
             .unwrap_or(0) as u16;
-        let lines: Vec<Line<'static>> = menu
+        let mut lines: Vec<Line<'static>> = menu
             .items
             .iter()
             .enumerate()
             .map(|(i, item)| {
-                let style = if i == menu.selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                if i == menu.selected {
+                    Line::from(vec![
+                        Span::styled("› ", Style::default().fg(ACCENT)),
+                        Span::styled(
+                            item.label.clone(),
+                            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
+                        ),
+                    ])
                 } else {
-                    Style::default()
-                };
-                Line::from(Span::styled(format!(" {} ", item.label), style))
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(item.label.clone(), Style::default().fg(SECONDARY)),
+                    ])
+                }
             })
-            .chain([Line::from(Span::styled(
-                format!(" {hint} "),
-                Style::default().fg(Color::DarkGray),
-            ))])
             .collect();
+        lines.push(Line::from(""));
+        // Same ACCENT-key / DIM-verb split the modal hint uses, so both overlays
+        // treat affordances identically. `hint` above still sizes the box.
+        lines.push(Line::from(vec![
+            Span::styled("↑↓", Style::default().fg(ACCENT)),
+            Span::styled(" select  ", Style::default().fg(DIM)),
+            Span::styled("Enter", Style::default().fg(ACCENT)),
+            Span::styled(" choose  ", Style::default().fg(DIM)),
+            Span::styled("Esc", Style::default().fg(ACCENT)),
+            Span::styled(" cancel", Style::default().fg(DIM)),
+        ]));
         let height = lines.len() as u16 + 2;
-        let area = centered_rect(width + 4, height, frame.area());
+        let area = centered_rect(width + 6, height, frame.area());
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(menu.title.clone());
+            .border_style(Style::default().fg(ACCENT))
+            .padding(Padding::horizontal(1))
+            .title(Line::from(Span::styled(
+                format!(" {} ", menu.title),
+                Style::default().fg(DIM),
+            )));
         frame.render_widget(Clear, area);
         frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    // Help overlay: Ledger-styled cheatsheet, topmost so it renders over any
+    // other overlay. Closed by Esc / q / ? (wired in the event loop).
+    if view.show_help {
+        let help_lines: Vec<Line<'static>> = [
+            // COCKPIT - ADEN graph harness for high velocity coding
+            ("COCKPIT (ADEN graph)", None),
+            ("Tab", Some("palette: ADEN symbols+actions first")),
+            (
+                "ADEN items",
+                Some("direct: understand/view/impact + comms/doctor/audit"),
+            ),
+            ("Ctrl+L etc", Some("ADEN ops from Insert mode")),
+            ("last: in status", Some("tracks last graph action")),
+            ("", None),
+            // BEGINNER section first for average users (power users scroll past)
+            ("BEGINNER (no vim needed)", None),
+            ("type normally to chat", Some("")),
+            (
+                "Ctrl+L on a word",
+                Some("pulls ADEN context (also Ctrl+A/I/V/G)"),
+            ),
+            ("Tab", Some("opens command palette / suggestions")),
+            ("? or /help", Some("this help")),
+            ("mouse wheel", Some("scrolls transcript")),
+            ("", None),
+            // Section: modes
+            ("MODES", None),
+            ("i", Some("Insert — type freely")),
+            ("a", Some("Insert after cursor")),
+            ("Esc", Some("Normal mode")),
+            ("v", Some("Visual mode")),
+            (":", Some("Command mode")),
+            ("", None),
+            // Section: motions
+            ("MOTIONS", None),
+            ("h l", Some("left / right")),
+            ("0  $", Some("line start / end")),
+            ("w  e  b", Some("word forward / end / back")),
+            ("j  k", Some("scroll line down / up")),
+            ("gg  G", Some("top / bottom of transcript")),
+            ("[n]motion", Some("repeat motion n times")),
+            ("", None),
+            // Section: operators
+            ("OPERATORS", None),
+            ("d{m}  c{m}  y{m}", Some("delete/change/yank to motion")),
+            ("dd  cc  yy", Some("linewise delete/change/yank")),
+            ("x", Some("delete char under cursor")),
+            ("D  C", Some("delete/change to end of line")),
+            ("r{c}", Some("replace char under cursor")),
+            ("p  P", Some("paste after / before cursor")),
+            ("", None),
+            // Section: commands
+            ("COMMANDS", None),
+            (":q", Some("quit")),
+            (":help  ?", Some("this overlay")),
+            ("Tab", Some("palette (ADEN symbols + actions)")),
+            (":model", Some("switch model")),
+            (":tools", Some("list active tools")),
+            (":clear", Some("new conversation")),
+            (":understand {sym}", Some("aden: explain a symbol")),
+            (":grep {pat}", Some("aden: search codebase")),
+            (":ask {q}", Some("aden: architectural query")),
+            (":view [sym]", Some("aden: launch browser view")),
+            (":viz/:gm [sym]", Some("aden: insert mermaid diagram")),
+            (":doctor", Some("aden: env + health diagnostics")),
+            (":impact {sym}", Some("aden: blast radius")),
+            (":communities", Some("aden: code clusters")),
+            (":audit", Some("aden: security audit")),
+            ("K / gd / Ctrl+L", Some("aden understand on word at cursor")),
+            ("ga / Ctrl+A", Some("aden asm on word at cursor")),
+            ("gi / Ctrl+I", Some("aden impact on word at cursor")),
+            ("gv / Ctrl+V", Some("aden view on word at cursor")),
+            ("/ / Ctrl+G", Some("aden grep on word at cursor")),
+            ("]", Some("aden communities / graph nav")),
+            (
+                "Tab",
+                Some("ADEN symbol actions (understand/view/impact + more)"),
+            ),
+            ("", None),
+            ("Esc  q  ?", Some("close this overlay")),
+        ]
+        .iter()
+        .map(|(key, desc)| {
+            if key.is_empty() {
+                // blank separator row
+                Line::from("")
+            } else if let Some(d) = desc {
+                // key in ACCENT, separator in QUIET, description in DIM
+                Line::from(vec![
+                    Span::styled(format!("{key:<18}"), Style::default().fg(ACCENT)),
+                    Span::styled(d.to_string(), Style::default().fg(DIM)),
+                ])
+            } else {
+                // section header in SECONDARY (slightly brighter than DIM)
+                Line::from(Span::styled(
+                    key.to_string(),
+                    Style::default().fg(SECONDARY),
+                ))
+            }
+        })
+        .collect();
+
+        // Width: widest line content (key col + desc col) or a floor of 44.
+        let content_width: u16 = help_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.chars().count())
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(44)
+            .max(44) as u16;
+        let height = help_lines.len() as u16 + 2; // +2 for the block border
+        let area = centered_rect(content_width + 4, height, frame.area());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .padding(Padding::horizontal(1))
+            .title(Line::from(Span::styled(" help ", Style::default().fg(DIM))));
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(help_lines).block(block), area);
     }
 }
 
@@ -606,6 +1139,16 @@ pub enum Action {
     Confirm,
     /// Answer a confirm modal: block.
     Cancel,
+    /// ADEN understand on word at cursor (Ctrl-L; works from Insert for casual users).
+    AdenUnderstand,
+    /// ADEN asm on word at cursor (Ctrl-A).
+    AdenAsm,
+    /// ADEN impact on word at cursor (Ctrl-I).
+    AdenImpact,
+    /// ADEN view launch on word at cursor (Ctrl-V).
+    AdenView,
+    /// ADEN grep on word at cursor (Ctrl-G).
+    AdenGrep,
 }
 
 /// Map a key event while typing. Up/Down scroll the transcript (so a mouse
@@ -628,6 +1171,12 @@ pub fn map_input_key(key: KeyEvent) -> Option<Action> {
         // Input history lives on Ctrl-P / Ctrl-N so the arrows can scroll.
         (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(Action::HistoryPrev),
         (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(Action::HistoryNext),
+        // ADEN power keys as Ctrl shortcuts (work in Insert mode too, for users who don't want to learn Normal mode).
+        (KeyCode::Char('l'), KeyModifiers::CONTROL) => Some(Action::AdenUnderstand),
+        (KeyCode::Char('a'), KeyModifiers::CONTROL) => Some(Action::AdenAsm),
+        (KeyCode::Char('i'), KeyModifiers::CONTROL) => Some(Action::AdenImpact),
+        (KeyCode::Char('v'), KeyModifiers::CONTROL) => Some(Action::AdenView),
+        (KeyCode::Char('g'), KeyModifiers::CONTROL) => Some(Action::AdenGrep),
         (KeyCode::Up, _) => Some(Action::ScrollUp),
         (KeyCode::Down, _) => Some(Action::ScrollDown),
         (KeyCode::PageUp, _) => Some(Action::PageUp),
@@ -677,9 +1226,10 @@ impl Tui {
     /// Fails gracefully without panicking when there is no terminal (CI,
     /// containers, pipes), which coxn is meant to run in.
     pub fn new() -> io::Result<Self> {
-        Ok(Self {
-            terminal: ratatui::try_init()?,
-        })
+        let terminal = ratatui::try_init()?;
+        // Enable mouse so average users can scroll the transcript with wheel
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+        Ok(Self { terminal })
     }
 
     /// Draw one frame of the view.
@@ -693,8 +1243,10 @@ impl Tui {
     /// full-screen program and come back cleanly.
     pub fn run_external<F: FnOnce()>(&mut self, f: F) -> io::Result<()> {
         ratatui::try_restore().ok();
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
         f();
         self.terminal = ratatui::try_init()?;
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
         Ok(())
     }
 
@@ -706,6 +1258,7 @@ impl Tui {
 
 impl Drop for Tui {
     fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
         ratatui::try_restore().ok();
     }
 }
@@ -1032,7 +1585,9 @@ mod tests {
         let mut view = View::new();
         view.push("hello");
         view.set_status("ready");
-        let mut terminal = Terminal::new(TestBackend::new(12, 4)).expect("test backend");
+        // Width must be wide enough for the always-present mode tag plus "ready".
+        // "-- INSERT -- ready  ·" is ~24 chars minimum.
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).expect("test backend");
         terminal
             .draw(|frame| render(frame, &view))
             .expect("draw succeeds");
@@ -1121,11 +1676,327 @@ mod tests {
 
     #[test]
     fn styled_output_labels_prefixes() {
-        let text = styled_output("you: hello\ncoxn: world\ntool: ok\nsys: info\nunknown");
+        let text = styled_output(
+            "you: hello\ncoxn: world\ntool: ok\nsys: info\nunknown",
+            false,
+        );
         assert_eq!(text.lines.len(), 5);
-        // Each role line has a styled span followed by the rest.
+        // Role lines: a gutter sigil span, then the role text (prefix stripped).
         assert_eq!(text.lines[0].spans.len(), 2);
-        assert_eq!(text.lines[0].spans[0].content, "you:");
-        assert_eq!(text.lines[4].spans[0].content, "unknown");
+        assert_eq!(text.lines[0].spans[0].content, "▸ ");
+        assert_eq!(text.lines[0].spans[1].content, "hello");
+        assert_eq!(text.lines[1].spans[0].content, "♦ ");
+        // Non-role lines: a blank gutter span, then the raw content.
+        assert_eq!(text.lines[4].spans[0].content, "  ");
+        assert_eq!(text.lines[4].spans[1].content, "unknown");
+    }
+
+    #[test]
+    fn styled_output_shimmers_last_line_when_pending() {
+        // While pending, the final line is brightened to SHIMMER; not otherwise.
+        let pending = styled_output("coxn: a\ncoxn: b", true);
+        assert_eq!(pending.lines[1].spans[1].style.fg, Some(SHIMMER));
+        assert_eq!(pending.lines[0].spans[1].style.fg, Some(PRIMARY));
+        let idle = styled_output("coxn: a\ncoxn: b", false);
+        assert_eq!(idle.lines[1].spans[1].style.fg, Some(PRIMARY));
+    }
+
+    // -- vim wiring-seam tests -----------------------------------------------
+    // These tests drive Vim::handle through a View so the integration seam is
+    // covered: mode transitions, text mutations, and scroll outcomes all go
+    // through the same path that drive() uses.
+
+    fn esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    }
+    fn k(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn vim_esc_enters_normal_mode() {
+        use crate::vim::{Mode, Outcome};
+        let mut view = View::new();
+        for c in "hello".chars() {
+            view.input_push(c);
+        }
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        assert_eq!(out, Outcome::Consumed);
+        assert_eq!(view.vim.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn vim_j_k_in_normal_produce_scroll() {
+        use crate::vim::{Outcome, Scroll};
+        let mut view = View::new();
+        // Enter Normal first.
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        let down = view.vim.handle(&mut view.input, &mut view.cursor, k('j'));
+        assert_eq!(down, Outcome::Scroll(Scroll::LineDown));
+        let up = view.vim.handle(&mut view.input, &mut view.cursor, k('k'));
+        assert_eq!(up, Outcome::Scroll(Scroll::LineUp));
+    }
+
+    #[test]
+    fn vim_x_deletes_char_under_cursor() {
+        use crate::vim::Outcome;
+        let mut view = View::new();
+        for c in "hello".chars() {
+            view.input_push(c);
+        }
+        // Normal mode, cursor at start.
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        view.cursor = 0;
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, k('x'));
+        assert_eq!(out, Outcome::Consumed);
+        assert_eq!(view.input, "ello");
+    }
+
+    #[test]
+    fn vim_i_a_return_to_insert() {
+        use crate::vim::Mode;
+        let mut view = View::new();
+        // Go Normal, then back to Insert with 'i'.
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        assert_eq!(view.vim.mode, Mode::Normal);
+        view.vim.handle(&mut view.input, &mut view.cursor, k('i'));
+        assert_eq!(view.vim.mode, Mode::Insert);
+        // Go Normal again, then back to Insert with 'a'.
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        view.vim.handle(&mut view.input, &mut view.cursor, k('a'));
+        assert_eq!(view.vim.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn vim_insert_typing_returns_pass() {
+        use crate::vim::Outcome;
+        let mut view = View::new();
+        // In Insert (the default), ordinary chars return Pass.
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, k('z'));
+        assert_eq!(out, Outcome::Pass);
+        // The buffer is unchanged — the host's input_push is responsible.
+        assert_eq!(view.input, "");
+    }
+
+    #[test]
+    fn vim_insert_typing_inserts_via_host_path() {
+        use crate::vim::Outcome;
+        let mut view = View::new();
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, k('h'));
+        // Pass means the host (input_push) runs next.
+        assert_eq!(out, Outcome::Pass);
+        view.input_push('h'); // simulate what drive() does on Pass
+        assert_eq!(view.input, "h");
+    }
+
+    #[test]
+    fn vim_normal_enter_submits() {
+        use crate::vim::Outcome;
+        let mut view = View::new();
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, enter());
+        assert_eq!(out, Outcome::Submit);
+    }
+
+    #[test]
+    fn vim_ctrl_c_passes_through_in_every_mode() {
+        // Ctrl-C must always reach the host (quit), never be swallowed by a
+        // modal catch-all. Regression for the escape hatch in EVERY mode.
+        use crate::vim::{Mode, Outcome};
+        let cc = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut view = View::new();
+        // Insert (the default).
+        assert_eq!(
+            view.vim.handle(&mut view.input, &mut view.cursor, cc),
+            Outcome::Pass
+        );
+        // Normal.
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        assert_eq!(
+            view.vim.handle(&mut view.input, &mut view.cursor, cc),
+            Outcome::Pass
+        );
+        // Visual.
+        view.vim.handle(&mut view.input, &mut view.cursor, k('v'));
+        assert_eq!(
+            view.vim.handle(&mut view.input, &mut view.cursor, cc),
+            Outcome::Pass
+        );
+        // Command (':' entered from Normal) — the global Ctrl-C guard must fire
+        // before handle_command would otherwise swallow the key.
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        view.vim.handle(&mut view.input, &mut view.cursor, k(':'));
+        assert_eq!(view.vim.mode, Mode::Command);
+        assert_eq!(
+            view.vim.handle(&mut view.input, &mut view.cursor, cc),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn vim_visual_submit_clears_selection_no_stale_anchor() {
+        // Regression for the Visual-submit panic: after selecting and pressing
+        // Enter, take_input() must leave a clean Insert state with no selection
+        // that could slice into the now-empty buffer on the next render.
+        use crate::vim::{Mode, Outcome};
+        let mut view = View::new();
+        for c in "hello".chars() {
+            view.input_push(c);
+        }
+        view.cursor = 0;
+        view.vim.handle(&mut view.input, &mut view.cursor, esc()); // Normal
+        view.vim.handle(&mut view.input, &mut view.cursor, k('v')); // Visual
+        view.vim.handle(&mut view.input, &mut view.cursor, k('l')); // extend
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, enter());
+        assert_eq!(out, Outcome::Submit);
+        let _ = view.take_input();
+        assert_eq!(view.input, "");
+        assert_eq!(view.vim.mode, Mode::Insert);
+        // The crux: no selection survives into the empty buffer.
+        assert_eq!(view.vim.selection(view.cursor), None);
+    }
+
+    // -- help overlay tests -------------------------------------------------
+
+    #[test]
+    fn toggle_help_flips_show_help() {
+        let mut view = View::new();
+        assert!(!view.show_help, "help starts hidden");
+        view.toggle_help();
+        assert!(view.show_help, "toggle once -> shown");
+        view.toggle_help();
+        assert!(!view.show_help, "toggle twice -> hidden");
+    }
+
+    #[test]
+    fn close_help_always_hides() {
+        let mut view = View::new();
+        view.show_help = true;
+        view.close_help();
+        assert!(!view.show_help);
+        // Idempotent.
+        view.close_help();
+        assert!(!view.show_help);
+    }
+
+    #[test]
+    fn vim_question_mark_in_normal_returns_toggle_help() {
+        use crate::vim::Outcome;
+        let mut view = View::new();
+        // Enter Normal mode first.
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, k('?'));
+        assert_eq!(out, Outcome::ToggleHelp);
+    }
+
+    #[test]
+    fn render_help_overlay_shows_cheatsheet_text() {
+        // When show_help is true the rendered frame must contain cheatsheet
+        // keywords that prove the overlay is present.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut view = View::new();
+        view.show_help = true;
+        // Wide enough to accommodate the overlay content.
+        let mut terminal = Terminal::new(TestBackend::new(80, 60)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("MODES"),
+            "help overlay: MODES section: {text:?}"
+        );
+        assert!(
+            text.contains("MOTIONS"),
+            "help overlay: MOTIONS section: {text:?}"
+        );
+        assert!(
+            text.contains("OPERATORS"),
+            "help overlay: OPERATORS section: {text:?}"
+        );
+        assert!(
+            text.contains("COMMANDS"),
+            "help overlay: COMMANDS section: {text:?}"
+        );
+        assert!(
+            text.contains(":help"),
+            "help overlay: :help entry: {text:?}"
+        );
+        assert!(
+            text.contains(":model"),
+            "help overlay: :model entry: {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_help_overlay_hidden_by_default() {
+        // Without show_help the overlay text must not appear in the frame.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let view = View::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        // "MODES" is a section header that only exists inside the help overlay.
+        assert!(!text.contains("MODES"), "overlay must be hidden: {text:?}");
+    }
+
+    // -- status line polish tests -------------------------------------------
+
+    #[test]
+    fn render_status_always_shows_mode_tag() {
+        // The mode tag must appear in the status line regardless of mode.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut view = View::new();
+        view.set_status("my-model");
+        // Default is Insert.
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("INSERT"), "INSERT tag must appear: {text:?}");
+    }
+
+    #[test]
+    fn render_status_shows_aden_active_badge() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut view = View::new();
+        view.set_status("my-model");
+        view.aden_active = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("aden"),
+            "aden badge must appear when active: {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_status_shows_model_name() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut view = View::new();
+        view.set_status("test-model-x");
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("test-model-x"),
+            "model name must appear: {text:?}"
+        );
     }
 }
