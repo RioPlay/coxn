@@ -1,6 +1,6 @@
 = coxn routing and sub-agent contract
 :revdate: 2026-06-25
-:status: design note (pre-implementation)
+:status: implemented for OpenAI-compatible provider instances
 
 Pins the data shapes for runtime model selection, per-role model routing, and the
 aden task partition that sub-agents consume -- so the coxn side (routing seam,
@@ -18,7 +18,7 @@ and the seam is not built twice.
   manifest files, line-oriented indexes), not by pulling a large JSON schema into
   the pump. See the partition encoding below.
 
-== 1. Selection unit: {instance, model}
+== 1. Selection unit: {instance, model} (IMPLEMENTED)
 
 An *instance* is a configured provider connection (coxn already has this shape as
 `Endpoint`):
@@ -39,7 +39,7 @@ Notes:
 * This generalizes today's single active `ModelSel` to a set of named instances
   the router can pick from.
 
-== 2. Role -> model routing table
+== 2. Role -> model routing table (IMPLEMENTED)
 
 Declarative, in `.aden/config.toml`, read by coxn (the existing `aden config`
 seam):

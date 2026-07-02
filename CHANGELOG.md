@@ -5,6 +5,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (next-generation harness)
+
+- **Parallel `/execute`** (opt-in): `COXN_EXECUTE_JOBS` (default `1`, clamped
+  `1..=8`) runs independent read-only sub-scope pumps concurrently on worker
+  threads. Correctness invariant -- `aden impact-diff` judges the whole
+  working tree -- so only read-only scopes run in parallel (their pump never
+  invokes the gate); mutating scopes always serialize on the driving thread.
+  `jobs == 1` and `--resume` take the unchanged sequential path verbatim.
+- **Adaptive stopping**: a configurable per-sub-agent turn cap
+  (`Pump::set_max_turns`, `COXN_SUBAGENT_MAX_TURNS`) bounds a stalling scope
+  tighter than the global hop cap; the repeated-tool-error abort is already in
+  place.
+- **Native Ollama `/api/chat` backend**: `ProviderDriver::Ollama` +
+  `AnyModel::Ollama` (`src/ollama.rs`) -- NDJSON streaming, function tools, usage
+  from `prompt_eval_count`/`eval_count`, and tool-call dedup. `ollama_model`
+  constructor; `/auth` and `/doctor` reachability probes. Fixes streaming-plus-
+  tools for local users (Ollama's OpenAI-compat layer drops tool-call deltas).
+- **Scope-escape demo**: `scripts/demo-scope-escape.sh` -- a deterministic,
+  no-cloud-keys script that builds a throwaway repo and proves an in-scope edit
+  is allowed, an out-of-scope edit is blocked (gate exit 1) and reverted to
+  HEAD, and `coxn doctor` labels the sandbox state. README gained a "Why coxn
+  is different" three-gate wedge section.
+- `src/app.rs`: the model-selection + session-wiring core (`Endpoint`,
+  `ModelSel`, `openai_model`/`ollama_model`, `resolve_instance_from_config`,
+  `resolve_role`, `task_config`, `AGENT_PREAMBLE_*`) extracted out of
+  `main.rs` (2915 -> 2755 lines); `main.rs` is now CLI routing + the TUI drive
+  loop.
+- `run_ledger.rs`: `COXN_RUNS_DIR` override (also a test hook) so ledger tests
+  no longer contend on `XDG_DATA_HOME` with other modules.
+- `aden::files_from_manifest` for the parallel scheduler's disjoint-mandate
+  diagnostic.
+
 ### Changed / Fixed (audit hygiene)
 
 - Clarified "ungated" vs gated semantics in Pump docs, boot/status line, approval prompts, and command output labels ("ungated (human approval only)", "NO SANDBOX (human approval is the only gate)").

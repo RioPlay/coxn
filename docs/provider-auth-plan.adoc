@@ -1,0 +1,422 @@
+= Provider profiles, auth, and cost safety — implementation plan
+:revdate: 2026-07-01
+:status: delegation spec (pre-implementation)
+:audience: implementing agent
+
+Executable plan for another agent. Implements T3 Code–inspired provider piggybacking
+and auth *for coxn* (Track A). Optional appendix covers T3 Code chat visibility and
+background API spend (Track B, separate repo).
+
+Reference repos:
+
+* *coxn* — `/home/unknown/Projects/coxn` (primary)
+* *T3 Code* — `/home/unknown/Projects/t3code` (patterns + optional Track B)
+* *Design contracts* — `docs/routing.adoc`, `DESIGN.adoc`, `PLAN.adoc`
+
+== Laws (do not violate)
+
+From `DESIGN.adoc` and `docs/routing.adoc`:
+
+* *coxn steers and gates; it does not become a provider platform.* Piggyback via
+  subprocess + env + home dirs; do not reimplement OAuth, MCP hosts, or thread
+  orchestration.
+* *Selection is data.* Named `{instance, model}` + `[route]` table; coxn looks up,
+  never infers model from prompt.
+* *Secrets never in committed config.* Keys in env or `~/.config/coxn/secrets/`
+  (mode `0600`), same split as T3's `ServerSecretStore` + redacted settings.
+* *Minimal diff.* No drive-by refactors; keep `main.rs` extraction (Phase K) as a
+  separate batch unless this work forces a small `app.rs` extract for provider only.
+* *Tests hermetic where possible.* Fake subprocess / mock HTTP for probes; live
+  network only in manual verification notes.
+
+== Current state (gap)
+
+| Area | Today | Target |
+|------|-------|--------|
+| Model resolution | Single `ModelSel` via `COXN_MODEL_*` → aden config → auto-detect → stub (`main.rs` `resolve_model`) | Named provider instances + active default + per-role routing |
+| Role routing | `resolve_role()` reads `route.<role>` as *model id on active endpoint only* — no `instance:model` | `route.scout = "local:qwen2.5-coder"` per `routing.adoc` |
+| Auth | `coxn doctor` checks URL/key presence only | `coxn auth status` probes; `coxn auth login` prints native CLI commands |
+| CLI piggyback | None — direct HTTP only | Phase 3 optional `CliPiggyback` backend |
+| Background API spend | N/A (coxn has no text-gen sidecar) | Explicit opt-in for any paid HTTP probe or cloud instance |
+| Sub-agents | `/execute` uses `resolve_role` for display; pump still uses active model | `/execute` uses `resolve_instance(role)` per sub-scope |
+
+T3 patterns to copy (read, do not import TS):
+
+| Pattern | T3 location | coxn adaptation |
+|---------|-------------|-----------------|
+| Driver vs instance | `packages/contracts/src/providerInstance.ts` | `ProviderDriver` enum + `ProviderInstance` struct |
+| Per-instance env | `apps/server/src/provider/ProviderInstanceEnvironment.ts` | `merge_env(base, instance.env)` on spawn |
+| Secrets split | `apps/server/src/serverSettings.ts` + `auth/ServerSecretStore.ts` | `~/.config/coxn/secrets/` + `COXN_KEY_<instance>` |
+| Codex auth probe | `apps/server/src/provider/Layers/CodexProvider.ts` (`account/read`) | `auth status` codex branch |
+| Claude auth probe (no API) | `apps/server/src/provider/Layers/ClaudeProvider.ts` (`probeClaudeCapabilities`) | Document only in `auth login` unless CLI piggyback lands |
+| Shadow home multi-account | `apps/server/src/provider/Drivers/CodexHomeLayout.ts` | Phase 3 codex driver only |
+
+== Track A — coxn implementation
+
+=== Phase A0 — Spec lock (0 code, 1 commit)
+
+* [ ] Re-read `docs/routing.adoc` §1–2 and align this plan if drifted.
+* [ ] Add Phase N bullets to `PLAN.adoc` (checkbox ledger only).
+* [ ] Decision log in this file §Open decisions — resolve defaults below.
+
+*Acceptance:* Plan and `PLAN.adoc` updated; no behavior change.
+
+=== Phase A1 — Provider instance types + config load
+
+*New module:* `src/provider.rs` (or `src/provider/mod.rs` if split early).
+
+*Types:*
+
+[source,rust]
+----
+enum ProviderDriver {
+    OpenAiCompat,  // HTTP chat/completions (today's openai.rs)
+    Stub,
+    // Phase A3: Codex, ClaudeCli — behind feature or cfg if desired
+}
+
+struct ProviderInstance {
+    id: String,           // slug: local, openrouter, codex_work
+    driver: ProviderDriver,
+    display_name: Option<String>,
+    enabled: bool,
+    // OpenAiCompat
+    base_url: Option<String>,
+    // CLI drivers (A3)
+    binary: Option<String>,
+    home_path: Option<String>,      // CODEX_HOME or Claude HOME
+    shadow_home: Option<String>,    // Codex only
+    env: Vec<(String, String)>,   // non-secret overrides
+    secret_env_keys: Vec<String>,   // names resolved from COXN_KEY_<id> or secrets file
+}
+
+struct ModelSelection {
+    instance_id: String,
+    model: String,
+}
+----
+
+*Config file* — prefer extending `.aden/config.toml` (existing `aden config` seam):
+
+[source,toml]
+----
+[provider.local]
+driver = "openai_compat"
+base_url = "http://localhost:11434/v1"
+enabled = true
+
+[provider.openrouter]
+driver = "openai_compat"
+base_url = "https://openrouter.ai/api/v1"
+enabled = false   # off until user opts in
+
+[provider.codex_work]
+driver = "codex"
+binary = "codex"
+codex_home = "~/.codex"
+enabled = false
+
+[route]
+scout = "local:qwen2.5-coder"
+synth = "openrouter:anthropic/claude-sonnet-4"
+orchestrate = "local:llama3"
+active = "local:qwen2.5-coder"   # default when role unmapped
+----
+
+*Loader:* `provider::load_instances(dir) -> Vec<ProviderInstance>` via `aden::config_get`
+or direct TOML parse of `.aden/config.toml` for `[provider.*]` and `[route]` sections
+(if aden config cannot represent maps yet, read file with minimal manual parse —
+match existing aden config patterns in `aden.rs`).
+
+*Backward compat:* If no `[provider.*]` and no `route.active`, behave exactly as today
+(single env/config/auto-detect resolution).
+
+*Tests:* 4+ hermetic tests — parse instances, `instance:model` split, disabled instance
+skipped, legacy fallback unchanged.
+
+*Commit:* `feat(provider): instance types and config load`
+
+=== Phase A2 — Resolution seam + secrets
+
+*Functions:*
+
+* `resolve_instance(dir, caps, instance_id, model) -> (AnyModel, ModelSel)`
+* `resolve_role(dir, caps, role) -> Option<ModelSelection>` — parse `instance:model`
+* `resolve_active(dir, caps) -> ModelSelection` — `route.active` or legacy default
+* `secret_for_instance(id) -> Option<String>` — order: `COXN_KEY_<ID_UPPER>`, then
+  `~/.config/coxn/secrets/<id>.key` (trim, reject empty)
+
+*Env merge helper:* `merge_instance_env(instance, base_env) -> HashMap` for future CLI
+spawn (A3).
+
+*Wire:* Replace direct `resolve_model` usage in `run_tui`, `drive`, `/execute` with
+`resolve_active` / `resolve_role` → `resolve_instance`. Keep `COXN_MODEL_*` as
+override: env still wins over config (document in README).
+
+*Cost safety (coxn-specific):*
+
+* `enabled = false` instances are never selected automatically.
+* Cloud `openai_compat` instances (`base_url` not localhost/127.0.0.1) require either
+  a resolved secret or explicit `COXN_ALLOW_CLOUD=1` — otherwise doctor/auth status
+  reports blocking, pump stays on stub/local.
+* Document: *no background LLM calls in coxn* (unlike T3 text-generation); only
+  user-initiated turns and explicit probes in `auth status`.
+
+*Tests:* resolution order, per-instance key, cloud gate, role fallback to active.
+
+*Commit:* `feat(provider): resolve instance:model and cloud opt-in gate`
+
+=== Phase A3 — Auth CLI (`coxn auth`)
+
+*Subcommands* (add to `main.rs` CLI or `src/auth.rs`):
+
+[source,shell]
+----
+coxn auth status          # all instances: installed, authenticated, email if known
+coxn auth login <id>      # print exact native command; do not run interactively
+coxn auth set-key <id>    # read key from stdin or prompt; write secrets file 0600
+----
+
+*Probes (hermetic + optional live):*
+
+| Driver | Probe | API cost |
+|--------|-------|----------|
+| `openai_compat` | `GET {base}/models` or minimal ping | Only if user runs `auth status`; gate cloud behind `COXN_ALLOW_CLOUD` |
+| `codex` | spawn `codex app-server`, JSON-RPC `account/read` (see T3 `CodexProvider.ts`) | Low; spawn short-lived, timeout 10s |
+| `claude` cli | `claude --version` + optional `claude auth status` if available | No chat API |
+| stub | always offline |
+
+*Extend `coxn doctor`:* one line per enabled instance from same probe helpers.
+
+*Tests:* fake codex binary script for account/read JSON; HTTP mock for openai_compat.
+
+*Commits:*
+
+1. `feat(auth): status and login helpers`
+2. `feat(doctor): per-instance auth rows`
+
+=== Phase A4 — `/model` and `/execute` integration
+
+* `/model` lists models for *active instance*; `/model <instance>/<name>` or
+  `/model <name>` on active instance.
+* `/agents` and `/execute` show and use `resolve_role` → full `ModelSelection`.
+* Status line: `model: {name} @ {base} ({instance}/{source})`.
+
+*Tests:* execute partition picks different models per role when route table set
+(fake models / stub).
+
+*Commit:* `feat(provider): wire model picker and execute to instances`
+
+=== Phase A5 — Docs + presets
+
+* `INSTALL.md` / `README.md` — OpenRouter instance template (T3 Claude doc pattern
+  translated to openai_compat):
+
+[source,bash]
+----
+# Opt in to cloud:
+export COXN_ALLOW_CLOUD=1
+export COXN_KEY_openrouter=sk-or-...
+# in .aden/config.toml: enable [provider.openrouter]
+----
+
+* `docs/routing.adoc` — mark §2 `[route]` instance:model as IMPLEMENTED; close
+  per-instance keys open decision.
+
+* Example `.aden/config.toml.example` in repo (not user's real config).
+
+*Commit:* `docs: provider profiles and cloud opt-in`
+
+=== Phase A6 (optional, defer unless requested) — CLI piggyback backend
+
+*Only after A1–A5 stable.*
+
+* `AnyModel::CliPiggyback` — spawn `codex app-server` or `claude` SDK equivalent;
+  translate events → `Message` / tool calls (narrow MVP: text turns only, no
+  tool parity at first).
+
+* Coxn pump + gate unchanged; CLI is swap-in for `OpenAiCompatModel`.
+
+*High effort; separate milestone. Do not block A1–A5.*
+
+=== T3-derived gap review after first Track A pass
+
+Source files reviewed in `/home/unknown/Projects/t3code`:
+
+* `packages/contracts/src/providerInstance.ts`
+* `apps/server/src/provider/ProviderInstanceEnvironment.ts`
+* `apps/server/src/auth/ServerSecretStore.ts`
+* `apps/server/src/provider/Layers/CodexProvider.ts`
+* `apps/server/src/provider/Layers/ClaudeProvider.ts`
+* `apps/server/src/provider/Drivers/CodexHomeLayout.ts`
+* `apps/server/src/provider/Drivers/ClaudeHome.ts`
+* `docs/providers/codex.md`, `docs/providers/claude.md`
+
+What this revealed:
+
+* *CLI providers are not just auth rows.* T3 treats Codex/Claude as provider
+  drivers with their own runtime adapters and text-generation bridges. coxn's
+  first pass can configure `driver = "codex"` / `driver = "claude_cli"`, but it
+  still cannot use them for `call_model()` until A6 adds a `CliPiggyback` backend.
+* *Codex auth status should use `codex app-server`.* T3 starts `codex
+  app-server`, sends `initialize`, `initialized`, then `account/read`, and only
+  then reports account type/email/auth state. `codex --version` is an install
+  check, not an auth check.
+* *Claude/OpenRouter should be modeled as a Claude environment.* T3's
+  OpenRouter path is a Claude provider with `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_AUTH_TOKEN`, empty `ANTHROPIC_API_KEY`, and optional
+  `ANTHROPIC_DEFAULT_*_MODEL` variables. coxn already parses `env.*`, but cannot
+  execute `claude_cli` yet.
+* *Provider ids and env names need schema-level validation.* T3 restricts
+  provider ids to identifier-like slugs and env vars to real environment
+  variable names. coxn now mirrors this in the parser.
+* *Unknown drivers must be unavailable, not reinterpreted.* T3 preserves unknown
+  driver envelopes and marks them unavailable. coxn now stores
+  `ProviderDriver::Unknown` instead of silently falling back to OpenAI-compatible.
+* *Secret writes should be atomic and permissioned.* T3 writes secrets through a
+  temp file, renames, and applies `0600`; coxn now follows that shape for
+  `coxn auth set-key`.
+
+New follow-up phases:
+
+* [ ] A7 Codex auth probe: spawn `codex app-server`, JSONL request/response
+  `initialize` -> `initialized` -> `account/read`; report account email/type and
+  auth status. Use fake binary tests.
+* [ ] A8 Claude environment presets: document and example-config an
+  OpenRouter-through-Claude profile using `env.ANTHROPIC_*` and a dedicated
+  `home_path`; make `auth login` print the exact HOME-scoped commands.
+* [ ] A9 CLI backend MVP: `AnyModel::CliPiggyback` for Codex first, text-only
+  turns through `codex app-server`, no tool parity. Preserve coxn's approval/gate
+  boundary by keeping coxn tools on the coxn side.
+* [ ] A10 Claude backend MVP: spawn Claude with per-instance `HOME` and env;
+  translate text-only request/reply or use Claude Agent SDK equivalent if a Rust
+  seam is available.
+* [ ] A11 Status snapshots: cache explicit `auth status` results briefly so
+  `/model` and status lines can show instance readiness without background cloud
+  probes.
+
+=== Phase K (parallel-friendly) — `main.rs` extract
+
+Can run in parallel with A4/A5 if touch conflicts are avoided:
+
+* Move `drive`, `resolve_*`, slash commands to `src/app.rs`; `main.rs` < 400 LOC.
+* Required before crates.io if `main.rs` still huge after provider work.
+
+== Track A — verification checklist
+
+Before marking Track A done:
+
+* [ ] `cargo test` — all green; `clippy` clean
+* [ ] `coxn doctor` on project with only local Ollama — exit 0
+* [ ] `coxn doctor` with cloud instance disabled — no cloud probe
+* [ ] `COXN_ALLOW_CLOUD=1` + key + enabled openrouter — doctor passes, one manual turn
+* [ ] `/execute` on partition with scout/synth routes — log shows different instance:model
+* [ ] Legacy env-only `COXN_MODEL_BASE_URL` still works unchanged
+* [ ] Do not commit `.aden/savings.json`, `.aden/project.conf`
+
+== Track B — T3 Code UX visibility + API cost opt-in (optional, other repo)
+
+*Repo:* `/home/unknown/Projects/t3code` — only if product owner wants T3 patches,
+not coxn. T3 is early WIP; confirm contribution policy (`CONTRIBUTING.md`).
+
+=== B1 — Tool visibility (web)
+
+*Problem:* Chat hides most tool activity by design:
+
+* `MAX_VISIBLE_WORK_LOG_ENTRIES = 1` in
+  `apps/web/src/components/chat/MessagesTimeline.logic.ts`
+* Turn folding collapses all work behind "Worked for Xs" (`deriveTurnFolds`)
+* Neutral/in-progress tools filtered (`workEntryIndicatesToolNeutralStatus`)
+
+*Changes:*
+
+* Add Settings toggle: *Verbose tool log* (default off for perf).
+* When on: `MAX_VISIBLE_WORK_LOG_ENTRIES = 8` (or unlimited); default expand turn folds
+  for active thread; show in-progress tools.
+* Persist preference in `ServerSettings` (`packages/contracts/src/settings.ts`) +
+  web settings panel (`SettingsPanels.tsx`).
+
+*Tests:* extend `MessagesTimeline.logic.test.ts` for new cap + setting.
+
+=== B2 — Background API cost opt-in (server)
+
+*Problem:* Hidden LLM spend without user chat:
+
+* `textGenerationModelSelection` defaults to Codex `gpt-5.4-mini` — thread title,
+  branch rename, commit message, PR text (`ProviderCommandReactor.ts`,
+  `CodexTextGeneration.ts`)
+* Provider snapshot refresh every 5 min spawns codex app-server (`CodexDriver.ts`)
+
+*Changes:*
+
+* `allowBackgroundLlmCalls: boolean` in `ServerSettings` (default `false`).
+* Gate: `maybeGenerateThreadTitleForFirstTurn`, `maybeGenerateAndRenameWorktreeBranch`,
+  `GitManager` commit/PR generation — skip when false.
+* Gate: `checkCodexProviderStatus` / grok ACP discovery — status-only `account/read`
+  when false (still check binary exists via `--version`).
+* Settings UI copy: "Allow automatic title/commit generation (uses API credits)".
+
+*Tests:* `serverSettings.test.ts`, `ProviderCommandReactor.test.ts` with flag off.
+
+=== B3 — Docs
+
+* Update `docs/providers/claude.md` cross-link: background generation setting.
+* Short `docs/operations/api-costs.md` listing all spend vectors.
+
+== Open decisions (defaults for implementer)
+
+[cols="1,2,1"]
+|===
+| Question | Default | Override?
+
+| Config location: `.aden/config.toml` vs `~/.config/coxn/providers.toml` | `.aden/config.toml` `[provider.*]` | User preference
+| Secret env naming | `COXN_KEY_<INSTANCE_ID>` uppercase slug | —
+| Cloud opt-in env | `COXN_ALLOW_CLOUD=1` | Could become config key later
+| CLI piggyback in Track A | Defer to A6 | User request only
+| T3 Track B | Skip unless assigned | Separate PRs to pingdotgg/t3code
+|===
+
+== Suggested commit order (Track A)
+
+[cols="1,3"]
+|===
+| # | Commit / PR theme
+
+| 1 | Plan + PLAN.adoc Phase N ledger
+| 2 | `src/provider.rs` types + config load + tests
+| 3 | Resolution + secrets + cloud gate + tests
+| 4 | `coxn auth` + doctor extension
+| 5 | `/model`, `/execute`, status line
+| 6 | Docs + example config
+| 7 | (Optional) `app.rs` extract
+|===
+
+== Files likely touched (Track A)
+
+* `src/provider.rs` (new)
+* `src/auth.rs` (new)
+* `src/main.rs` — CLI subcommands, wire resolution
+* `src/doctor.rs` — instance rows
+* `src/openai.rs` — maybe `list_models` reuse for probe
+* `src/aden.rs` — config_get extensions if needed
+* `docs/routing.adoc`, `PLAN.adoc`, `README.md`, `INSTALL.md`
+* `docs/provider-auth-plan.adoc` (this file) — check off phases as done
+
+== Out of scope
+
+* T3-style WebSocket server, thread resume, MCP platform in coxn
+* Full Codex/Claude tool-call protocol parity in CLI piggyback (A6 MVP is text-only)
+* OAuth implementation in coxn
+* crates.io publish (metadata exists; publish is user-triggered)
+* Ollama native profile (Phase J — separate)
+
+== Handoff prompt (paste to delegate agent)
+
+----
+Implement Track A of docs/provider-auth-plan.adoc in /home/unknown/Projects/coxn
+on branch fix/audit-coxn-hygiene (or new branch off it). Follow laws in DESIGN.adoc.
+Work in commit order §Suggested commit order. Run cargo test && cargo clippy after
+each batch. Do not commit .aden/savings.json or .aden/project.conf. Reference T3
+patterns in ~/Projects/t3code read-only. Track B only if explicitly assigned.
+Mark PLAN.adoc Phase N items as you complete them.
+----
