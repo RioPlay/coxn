@@ -1601,9 +1601,58 @@ async fn drive(
             continue;
         }
 
-        // `?` in Normal mode: toggle the help overlay.
+        // `?` in Normal mode (now `g?`): toggle the help overlay.
         if vim_outcome == Outcome::ToggleHelp {
             view.toggle_help();
+            continue;
+        }
+
+        // Transcript search (M2). `/` and `?` open the search prompt; `n`/
+        // `N` cycle the *active* search. While the search prompt is open
+        // (`view.search_editing()`), keys go into the live query below, not
+        // through the map_input_key path.
+        match vim_outcome {
+            Outcome::SearchForward | Outcome::SearchBackward => {
+                let backward = vim_outcome == Outcome::SearchBackward;
+                view.search_open(backward);
+                continue;
+            }
+            Outcome::SearchNext if view.search.is_some() => {
+                view.search_step(1);
+                continue;
+            }
+            Outcome::SearchPrev if view.search.is_some() => {
+                view.search_step(-1);
+                continue;
+            }
+            _ => {}
+        }
+
+        // Active search-prompt edit: keys route into the live query, not the
+        // map_input_key path. Esc cancels, Backspace edits, Enter commits,
+        // chars push, and Ctrl-C acts as Esc (it does NOT quit while the
+        // search prompt is up).
+        if view.search_editing() {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    view.search_cancel();
+                }
+                (KeyCode::Backspace, _) => view.search_backspace(),
+                (KeyCode::Enter, _) => view.search_commit(),
+                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                    view.search_push(c);
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // A committed search persists across typing so `n`/`N` keep cycling
+        // while the user drafts a new message. `Esc` clears it; any new
+        // prompt opens fresh. Intercept Esc-at-search-state before the
+        // composite action dispatch.
+        if view.search.is_some() && key.code == KeyCode::Esc {
+            view.search_cancel();
             continue;
         }
 
