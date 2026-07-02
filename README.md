@@ -180,6 +180,13 @@ Keys:
 | Ctrl-K / Ctrl-U | Cut to end / cut to start |
 | Ctrl-Y | Yank (paste) |
 | Left/Right Home/End | Move cursor |
+| K / gd | (Normal) aden understand symbol at cursor |
+| ga | (Normal) aden asm context for symbol at cursor |
+| gi | (Normal) aden impact for symbol at cursor |
+| gv | (Normal) launch aden view for symbol at cursor |
+| / | (Normal) aden grep on symbol at cursor |
+
+: ex commands in Normal/Command mode include `:view`, `:gm`/`:viz` (mermaid), `:doctor`, `:impact`, `:understand`, `:grep`, `:ask`.
 
 ## Model routing by role
 
