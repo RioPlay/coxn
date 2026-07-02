@@ -13,6 +13,7 @@ mod pump;
 mod sandbox;
 mod session;
 mod tools;
+mod trust;
 mod tui;
 mod vim;
 
@@ -25,7 +26,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEv
 
 use model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
 use pump::{Approval, Pump, TurnIo};
-use tools::{AdenTool, EditTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
+use tools::{AdenTool, EditTool, GlobTool, GrepTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
+use trust::Trust;
 use tui::{
     Action, Menu, MenuItem, MenuKind, Tui, View, map_input_key, map_menu_key, map_modal_key,
 };
@@ -235,6 +237,8 @@ async fn run_tui(dir: &Path) -> io::Result<()> {
     // model can fetch the exact text to replace.
     let root = dir.to_path_buf();
     tools.register(Box::new(ReadFileTool::new(root.clone())));
+    tools.register(Box::new(GrepTool::new(root.clone())));
+    tools.register(Box::new(GlobTool::new(root.clone())));
     tools.register(Box::new(EditTool::new(root.clone())));
     tools.register(Box::new(WriteTool::new(root.clone())));
     // run_command lets the model close the edit->build->test loop. It is the
@@ -282,6 +286,16 @@ async fn run_tui(dir: &Path) -> io::Result<()> {
         );
         view.set_status("OFFLINE STUB  |  [r] retry  [q] quit".to_string());
     }
+    if std::env::var("COXN_TASK_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some()
+        && doctor::git_dirty(dir)
+    {
+        view.output.push_str(
+            "\nsys: warn — dirty git tree may block scoped edits (commit or stash first)",
+        );
+    }
 
     let result = drive(
         &mut tui,
@@ -327,15 +341,17 @@ fn status_line(
     task: &str,
     usage: Option<Usage>,
     aden_active: bool,
+    trust: &Trust,
 ) -> String {
     let base = match aden::savings(dir) {
         Some(savings) => format!("{model_label}  |  {savings}"),
         None => boot_status(model_label, task, aden_active),
     };
-    match usage {
+    let line = match usage {
         Some(u) if u.prompt_tokens > 0 => format!("{base}  |  {}", ctx_meter(u.prompt_tokens)),
         _ => base,
-    }
+    };
+    format!("{line}  |  {}", trust.status_tag())
 }
 
 /// Format a context-size meter: the prompt tokens sent on the last turn, so the
@@ -946,6 +962,12 @@ enum Command {
     Think(Option<String>),
     /// `/agents` shows the task partition (sub-scopes + routed models).
     Agents,
+    /// `/scope` shows the active task scope from the environment.
+    Scope,
+    /// `/trust` toggles read_file session-auto approval.
+    Trust,
+    /// `/copy` writes the transcript to disk.
+    Copy,
     Unknown(String),
 }
 
@@ -965,7 +987,74 @@ fn parse_command(input: &str) -> Command {
         "edit" => Command::OpenEditor(arg),
         "think" => Command::Think(arg),
         "agents" => Command::Agents,
+        "scope" => Command::Scope,
+        "trust" => Command::Trust,
+        "copy" => Command::Copy,
         other => Command::Unknown(other.to_string()),
+    }
+}
+
+const AT_PATH_MAX_FILES: usize = 3;
+const AT_PATH_MAX_CHARS: usize = 8000;
+
+/// Expand `@path` tokens into inline file blocks before sending to the model.
+fn expand_at_paths(dir: &Path, input: &str) -> String {
+    let mut out = Vec::new();
+    let mut files = 0usize;
+    for word in input.split_whitespace() {
+        if let Some(path) = word.strip_prefix('@')
+            && !path.is_empty()
+            && files < AT_PATH_MAX_FILES
+        {
+            match tools::confine_path(dir, path) {
+                Ok(full) => match std::fs::read_to_string(&full) {
+                    Ok(text) => {
+                        files += 1;
+                        let body: String = text.chars().take(AT_PATH_MAX_CHARS).collect();
+                        let trunc = if text.len() > AT_PATH_MAX_CHARS {
+                            format!("\n[truncated: {path} is {} bytes]", text.len())
+                        } else {
+                            String::new()
+                        };
+                        out.push(format!("<file path=\"{path}\">\n{body}{trunc}\n</file>"));
+                        continue;
+                    }
+                    Err(e) => {
+                        out.push(format!("@{path} (read error: {e})"));
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    out.push(format!("@{path} ({e})"));
+                    continue;
+                }
+            }
+        }
+        out.push(word.to_string());
+    }
+    out.join(" ")
+}
+
+fn scope_listing() -> String {
+    let name = std::env::var("COXN_TASK_NAME").unwrap_or_default();
+    if name.trim().is_empty() {
+        return "no active task scope (ungated — human approval only)\nset COXN_TASK_NAME + COXN_TASK_SEEDS for aden blast-radius gate".to_string();
+    }
+    let seeds = std::env::var("COXN_TASK_SEEDS").unwrap_or_default();
+    let budget = std::env::var("COXN_TASK_BUDGET").unwrap_or_else(|_| "8192".into());
+    format!(
+        "task: {name}\nseeds: {seeds}\nbudget: {budget}\n(gate active when aden produced a manifest at boot)"
+    )
+}
+
+fn copy_transcript(view: &View) -> String {
+    let path = doctor::session_dir().with_file_name("last-transcript.txt");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, &view.output) {
+        Ok(()) => format!("transcript copied to {}", path.display()),
+        Err(e) => format!("copy failed: {e}"),
     }
 }
 
@@ -1269,6 +1358,8 @@ async fn drive(
     let mut approvals: HashSet<String> = HashSet::new();
     // Exact command strings approved for the session via run_command [s].
     let mut approved_commands: HashSet<String> = HashSet::new();
+    let mut trust = Trust::default();
+    trust.seed_approvals(&mut approvals);
     // One-time tip for average users the first time they trigger an ADEN action.
     let mut aden_tip_shown = false;
     loop {
@@ -1376,6 +1467,7 @@ async fn drive(
                                     task,
                                     pump.last_usage(),
                                     view.aden_active,
+                                    &trust,
                                 ));
                             }
                             MenuKind::Session => {
@@ -1396,6 +1488,7 @@ async fn drive(
                                         task,
                                         pump.last_usage(),
                                         view.aden_active,
+                                        &trust,
                                     ));
                                 }
                             }
@@ -1765,6 +1858,7 @@ async fn drive(
                         task,
                         pump.last_usage(),
                         view.aden_active,
+                        &trust,
                     ));
                 }
                 ExCmd::Tools => {
@@ -1785,6 +1879,7 @@ async fn drive(
                         task,
                         pump.last_usage(),
                         view.aden_active,
+                        &trust,
                     ));
                 }
                 ExCmd::Understand(sym) => {
@@ -2151,6 +2246,7 @@ async fn drive(
                                         task,
                                         pump.last_usage(),
                                         view.aden_active,
+                                        &trust,
                                     ));
                                 }
                                 Err(msg) => view.output = msg,
@@ -2218,6 +2314,7 @@ async fn drive(
                                         // Switching sessions resets session-scoped approvals.
                                         approvals.clear();
                                         approved_commands.clear();
+                                        trust.seed_approvals(&mut approvals);
                                         session = session::Session::open(&slug);
                                         persisted = n;
                                         let out = transcript(pump.messages());
@@ -2227,6 +2324,7 @@ async fn drive(
                                             task,
                                             pump.last_usage(),
                                             view.aden_active,
+                                            &trust,
                                         ));
                                         out
                                     }
@@ -2243,14 +2341,35 @@ async fn drive(
                             persisted = 0;
                             approvals.clear();
                             approved_commands.clear();
+                            trust.seed_approvals(&mut approvals);
                             view.set_status(status_line(
                                 dir,
                                 &sel.name,
                                 task,
                                 pump.last_usage(),
                                 view.aden_active,
+                                &trust,
                             ));
                         }
+                        Command::Scope => view.output = scope_listing(),
+                        Command::Trust => {
+                            let note = trust.toggle_read();
+                            if matches!(trust.read, trust::TrustLevel::Session) {
+                                approvals.insert("read_file".to_string());
+                            } else {
+                                approvals.remove("read_file");
+                            }
+                            view.output = note;
+                            view.set_status(status_line(
+                                dir,
+                                &sel.name,
+                                task,
+                                pump.last_usage(),
+                                view.aden_active,
+                                &trust,
+                            ));
+                        }
+                        Command::Copy => view.output = copy_transcript(view),
                         Command::Unknown(c) => {
                             view.output = format!("unknown command: /{c}  (try /help)");
                         }
@@ -2264,7 +2383,8 @@ async fn drive(
                 if let Some(note) = refresh_discovery(dir, pump, sel, false) {
                     view.set_status(note);
                 }
-                pump.push_user(text);
+                let expanded = expand_at_paths(dir, &text);
+                pump.push_user(expanded);
                 // Stream the reply: render the transcript so far plus the
                 // assistant text as it arrives, repainting per fragment. The
                 // reply appears live instead of all at once, and a Ctrl-C between
@@ -2321,7 +2441,14 @@ async fn drive(
                         }
                         // Refresh the model + savings + context status after the turn.
                         let status =
-                            status_line(dir, &sel.name, task, pump.last_usage(), view.aden_active);
+                            status_line(
+                                dir,
+                                &sel.name,
+                                task,
+                                pump.last_usage(),
+                                view.aden_active,
+                                &trust,
+                            );
                         view.set_status(if cancelled {
                             format!("{status}  (cancelled)")
                         } else {
@@ -2337,7 +2464,16 @@ async fn drive(
                 }
                 // Surface a gate block from this turn as a confirm modal.
                 if let Some(block) = pump.take_block() {
-                    view.confirm(block.message);
+                    view.output.push_str(&format!(
+                        "\nsys: GATE BLOCKED — {} — change reverted\n{}",
+                        block.verdict.label(),
+                        block.message
+                    ));
+                    view.confirm(format!(
+                        "GATE BLOCKED: {} — {}",
+                        block.verdict.label(),
+                        block.message
+                    ));
                 }
                 // Persist any messages this turn added (user + assistant + tools).
                 let messages = pump.messages();
