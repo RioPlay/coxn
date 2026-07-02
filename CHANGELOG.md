@@ -5,12 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.2.0] - 2026-07-02
+
 ### Changed
 
 - **Phase K architecture extract**: `run_tui`, `drive`, and TUI helpers moved
   from `main.rs` to `src/drive.rs`; `main.rs` is CLI routing only (87 LOC).
   `build_registry` and `register_aden_tools` moved to `tools.rs`. No behaviour
   change; 298 tests green.
+
+### Security
+
+- Expanded `.gitignore` for local aden/codex state and key material.
+- Added `scripts/check-no-secrets.sh` to CI to block API keys and machine-local
+  paths from entering tracked files.
 
 ## [0.3.1.0] - 2026-07-02
 

@@ -169,7 +169,7 @@ Spec: `docs/provider-auth-plan.adoc` (delegation plan; T3 Code patterns).
 * [x] N4 `/model`, `/execute`, status line wired to instances
 * [x] N5 Docs + example config (OpenRouter preset, INSTALL)
 * [ ] N6 (optional) CLI piggyback backend (`codex`/`claude` subprocess)
-* [ ] N7 (parallel) `main.rs` → `app.rs` extract (Phase K)
+* [x] N7 (parallel) `main.rs` → `app.rs` extract (Phase K — done; drive loop in `drive.rs`)
 * [x] N8 T3-derived hardening: provider slug/env validation, unknown-driver unavailable state, atomic secrets
 * [ ] N9 Codex app-server auth probe (`initialize` + `account/read`)
 * [x] N10 Provider environment presets (`coxn auth setup`, `/auth setup <id>`) for Ollama/LM Studio/OpenAI/OpenRouter
