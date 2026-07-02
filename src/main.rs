@@ -5,11 +5,18 @@
 
 mod aden;
 mod agents;
+mod app;
+mod auth;
+mod commands;
 mod doctor;
+mod execute;
 mod gate;
 mod model;
+mod ollama;
 mod openai;
+mod provider;
 mod pump;
+mod run_ledger;
 mod sandbox;
 mod session;
 mod tools;
@@ -24,12 +31,19 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
+use app::{
+    AGENT_PREAMBLE_ADEN, AGENT_PREAMBLE_BASE, ModelSel, openai_model, resolve_instance_from_config,
+    resolve_role, task_config,
+};
+use commands::{Command, complete_input, parse_command};
 use model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
 use pump::{Approval, BatchIo, Pump, TurnIo};
-use tools::{AdenTool, EditTool, GlobTool, GrepTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
+use tools::{
+    AdenTool, EditTool, GlobTool, GrepTool, ReadFileTool, RunTool, ToolRegistry, WriteTool,
+};
 use trust::Trust;
 use tui::{
-    Action, Menu, MenuItem, MenuKind, Tui, View, map_input_key, map_menu_key, map_modal_key,
+    Action, Menu, MenuItem, MenuKind, Tui, View, map_input_key, map_modal_key, menu_max_rows,
 };
 use vim::{Outcome, Scroll};
 
@@ -54,7 +68,11 @@ const RETRY_BACKOFF_SECS: [u64; MAX_RETRIES as usize] = [2, 4, 8];
 /// discovery refresh ([`refresh_discovery`]) call it whenever aden might have
 /// appeared mid-session without ever double-registering. Returns `true` only
 /// when it actually added the tools (so the caller can announce the hot-load).
-fn register_aden_tools(tools: &mut ToolRegistry, dir: &std::path::Path, available: bool) -> bool {
+pub(crate) fn register_aden_tools(
+    tools: &mut ToolRegistry,
+    dir: &std::path::Path,
+    available: bool,
+) -> bool {
     if !available || tools.has_aden() {
         return false;
     }
@@ -67,7 +85,7 @@ fn register_aden_tools(tools: &mut ToolRegistry, dir: &std::path::Path, availabl
 }
 
 /// Build the standard tool registry for a session (aden + read/grep/glob/edit/run).
-fn build_registry(dir: &Path, caps: &aden::AdenCaps, bwrap: bool) -> ToolRegistry {
+pub(crate) fn build_registry(dir: &Path, caps: &aden::AdenCaps, bwrap: bool) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     register_aden_tools(&mut tools, dir, caps.available);
     let root = dir.to_path_buf();
@@ -102,7 +120,7 @@ fn refresh_discovery(
     let caps = aden::probe(dir);
     let mut notes: Vec<String> = Vec::new();
     if need_model {
-        let (model, new_sel) = resolve_model(&caps);
+        let (model, new_sel) = resolve_model(dir, &caps);
         if new_sel.endpoint.is_some() {
             pump.set_model(model);
             *sel = new_sel;
@@ -181,6 +199,7 @@ coxn — lean gated terminal harness for coding LLMs
 USAGE:
     coxn                 Interactive TUI (default)
     coxn doctor          Health check (model, sandbox, aden, task)
+    coxn auth status     Check configured provider auth
     coxn --version       Print version
     coxn --help          This help
 
@@ -188,6 +207,7 @@ ENVIRONMENT:
     COXN_MODEL_BASE_URL  OpenAI-compatible endpoint
     COXN_MODEL_NAME      Model id (default: local)
     COXN_MODEL_KEY       API key (never written to config)
+    COXN_KEY_<INSTANCE>  API key for a named provider instance
     COXN_BARE=1          Empty system prompt (zero-default-context purists)
     COXN_AUTO_APPROVE=1  Required for `coxn once` (auto-approves tool calls)
     COXN_TASK_NAME       Task scope (aden blast-radius gate)
@@ -213,6 +233,7 @@ async fn main() -> io::Result<()> {
                 return Ok(());
             }
             "doctor" => std::process::exit(doctor::run(&dir)),
+            "auth" => std::process::exit(auth::run(&dir, &args[1..])),
             "once" => return run_once(&dir, &args[1..]).await,
             s if s.starts_with('-') => {
                 eprintln!("coxn: unknown flag {s} (try --help)");
@@ -258,8 +279,8 @@ async fn run_tui(dir: &Path) -> io::Result<()> {
     let mut tui = Tui::new()?;
     tui.draw(&view)?;
 
-    let (model, mut sel) = resolve_model(&caps);
-    view.set_status(format!("{}  |  loading...", sel.name));
+    let (model, mut sel) = resolve_model(dir, &caps);
+    view.set_status(format!("{}  |  loading...", sel.label()));
     tui.draw(&view)?;
 
     // A named task (COXN_TASK_NAME) makes aden define the scope: the gate
@@ -276,15 +297,15 @@ async fn run_tui(dir: &Path) -> io::Result<()> {
     // A savings-free status at boot: the `aden status` call it would make is the
     // slowest aden spawn and is purely cosmetic, so defer it to the first
     // post-turn refresh and let the user reach the prompt sooner.
-    view.set_status(boot_status(&sel.name, &task.status, caps.available));
+    view.set_status(boot_status(&sel.label(), &task.status, caps.available));
     // Offline stub: block chat until a model is reachable (not a silent echo toy).
     if sel.is_offline_stub() {
         view.output.push_str(
             "\n\n⚠ OFFLINE STUB — no model reachable. This is not a coding agent yet.\n\
-             fix: start Ollama/LM Studio, or set COXN_MODEL_BASE_URL\n\
-             [r] retry detection   [q] quit",
+             fix: start Ollama/LM Studio, set COXN_MODEL_BASE_URL, or use /auth for provider setup\n\
+             try: /auth status, /auth login <id>, /model, [r] retry, [q] quit",
         );
-        view.set_status("OFFLINE STUB  |  [r] retry  [q] quit".to_string());
+        view.set_status("OFFLINE STUB  |  /auth status  /model  [r] retry  [q] quit".to_string());
     }
     if std::env::var("COXN_TASK_NAME")
         .ok()
@@ -378,74 +399,10 @@ fn append_aden(view: &mut View, label: &str, content: &str) {
     }
 }
 
-/// The live provider connection, kept so `/model` can enumerate and switch
-/// models at runtime without re-resolving. The stub has no endpoint.
-struct Endpoint {
-    base_url: String,
-    key: Option<String>,
-    source: &'static str,
-}
-
-/// The active model selection: which model, and (for a real provider) where it
-/// lives. Selection is data, so switching is just rebuilding the backend.
-struct ModelSel {
-    name: String,
-    endpoint: Option<Endpoint>,
-}
-
-impl ModelSel {
-    /// True when no real provider is configured (offline stub backend).
-    fn is_offline_stub(&self) -> bool {
-        self.endpoint.is_none()
-    }
-
-    /// The status-line label tagging the model and how it was resolved.
-    fn label(&self) -> String {
-        match &self.endpoint {
-            Some(e) => format!("{} @ {} ({})", self.name, e.base_url, e.source),
-            None => {
-                "stub (no model; start Ollama/LM Studio or set COXN_MODEL_BASE_URL)".to_string()
-            }
-        }
-    }
-}
-
-/// Build an OpenAI-compatible model paired with its selection state.
-fn openai_model(
-    base_url: String,
-    model: String,
-    key: Option<String>,
-    source: &'static str,
-) -> (AnyModel, ModelSel) {
-    let backend = AnyModel::OpenAiCompat(openai::OpenAiCompatModel::new(
-        base_url.clone(),
-        model.clone(),
-        key.clone(),
-    ));
-    (
-        backend,
-        ModelSel {
-            name: model,
-            endpoint: Some(Endpoint {
-                base_url,
-                key,
-                source,
-            }),
-        },
-    )
-}
-
-/// Pick the model backend at runtime, returning it with a short label for the
-/// status line. Resolution order: an explicit `COXN_MODEL_BASE_URL`, then the
-/// pre-probed aden caps (`model.base_url` / `model.name`), then a local provider
-/// auto-detected on its well-known port (Ollama / LM Studio), then the offline
-/// stub. Selection is data, not a type, so per-role routing and sub-agents drop
-/// in without reworking the seam. The key always comes from the environment,
-/// never the committed config.
-///
-/// `caps` is passed in rather than re-shelling to aden here; startup already
-/// called `aden::probe` once.
-fn resolve_model(caps: &aden::AdenCaps) -> (AnyModel, ModelSel) {
+/// Pick the model backend at runtime. Resolution order: explicit legacy
+/// `COXN_MODEL_*`, then named `[provider.*]` + `[route]`, then legacy aden
+/// `model.*`, then local auto-detect, then the offline stub.
+fn resolve_model(dir: &Path, caps: &aden::AdenCaps) -> (AnyModel, ModelSel) {
     let env_key = || {
         std::env::var("COXN_MODEL_KEY")
             .ok()
@@ -457,21 +414,28 @@ fn resolve_model(caps: &aden::AdenCaps) -> (AnyModel, ModelSel) {
         && !base_url.trim().is_empty()
     {
         let model = std::env::var("COXN_MODEL_NAME").unwrap_or_else(|_| "local".to_string());
-        return openai_model(base_url, model, env_key(), "env");
+        return openai_model("env".to_string(), base_url, model, env_key(), "env");
     }
-    // 2. aden config (.aden/config.toml) read from pre-probed caps.
+    // 2. Provider instances and route.active in .aden/config.toml.
+    let provider_cfg = provider::load_config(dir);
+    if let Some(selection) = provider_cfg.route("active")
+        && let Some(resolved) = resolve_instance_from_config(&provider_cfg, selection, "config")
+    {
+        return resolved;
+    }
+    // 3. aden config (.aden/config.toml) read from pre-probed caps.
     if let Some(base_url) = caps.model_base_url.clone() {
         let model = caps
             .model_name
             .clone()
             .unwrap_or_else(|| "local".to_string());
-        return openai_model(base_url, model, env_key(), "config");
+        return openai_model("config".to_string(), base_url, model, env_key(), "config");
     }
-    // 3. Local auto-detection.
+    // 4. Local auto-detection.
     if let Some((base_url, model)) = openai::detect() {
-        return openai_model(base_url, model, None, "auto");
+        return openai_model("local".to_string(), base_url, model, None, "auto");
     }
-    // 4. Offline stub.
+    // 5. Offline stub.
     (
         AnyModel::Stub(StubModel),
         ModelSel {
@@ -514,7 +478,23 @@ fn model_listing(sel: &ModelSel) -> String {
 /// model name). A name not in the listing is still allowed so an unloaded model
 /// can be selected (the backend JIT-loads it on first call). Returns the status
 /// message to show.
-fn switch_model(pump: &mut Pump<AnyModel>, sel: &mut ModelSel, target: &str) -> String {
+fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, target: &str) -> String {
+    if let Some((instance_id, model_name)) = target.split_once('/') {
+        let cfg = provider::load_config(dir);
+        let selection = provider::ModelSelection {
+            instance_id: instance_id.trim().to_string(),
+            model: model_name.trim().to_string(),
+        };
+        if selection.instance_id.is_empty() || selection.model.is_empty() {
+            return "usage: /model <name|#|instance/name>".to_string();
+        }
+        let Some((model, new_sel)) = resolve_instance_from_config(&cfg, selection, "manual") else {
+            return format!("provider instance '{instance_id}' is unavailable");
+        };
+        pump.set_model(model);
+        *sel = new_sel;
+        return format!("switched to {}", sel.label());
+    }
     let Some(e) = &sel.endpoint else {
         return "no provider to switch on (offline stub)".to_string();
     };
@@ -532,98 +512,8 @@ fn switch_model(pump: &mut Pump<AnyModel>, sel: &mut ModelSel, target: &str) -> 
         e.key.clone(),
     )));
     sel.name = chosen;
-    format!("switched to {}", sel.name)
+    format!("switched to {}", sel.label())
 }
-
-/// Resolve a role to a model id via the `[route]` table in `.aden/config.toml`
-/// (`route.<role>`), e.g. `route.scout = "qwen2.5-coder"`. Selection is data: the
-/// role is an opaque key, the map is config, coxn only looks it up. The same
-/// lookup the sub-agent runner (B4) uses to pick a model per scope. `None` when
-/// the role is unmapped or aden is unavailable. (A future `instance:model` value
-/// selects the instance too; today the value is a model id on the active endpoint.)
-fn resolve_role(dir: &Path, caps: &aden::AdenCaps, role: &str) -> Option<String> {
-    if !caps.available {
-        return None;
-    }
-    aden::config_get(dir, &format!("route.{role}"))
-}
-
-/// Slash command verbs, for Tab completion.
-const COMMANDS: &[&str] = &[
-    "help",
-    "model",
-    "think",
-    "tools",
-    "agents",
-    "execute",
-    "scope",
-    "trust",
-    "copy",
-    "session",
-    "resume",
-    "edit",
-    "clear",
-    "quit",
-];
-
-/// The longest common prefix of `items` (empty if they share none).
-fn longest_common_prefix(items: &[&str]) -> String {
-    let Some(first) = items.first() else {
-        return String::new();
-    };
-    let mut end = first.len();
-    for s in &items[1..] {
-        end = end.min(s.len());
-        while !s.is_char_boundary(end) || first[..end] != s[..end] {
-            end -= 1;
-        }
-    }
-    first[..end].to_string()
-}
-
-/// Tab-complete a slash-command input: the command verb, or a `/resume` slug.
-/// Returns the completed line, or `None` when there is nothing to add. Model
-/// names are completed via the `/model` picker, not here.
-pub(crate) fn complete_input(input: &str) -> Option<String> {
-    let rest = input.strip_prefix('/')?;
-    match rest.split_once(' ') {
-        // Completing the command verb.
-        None => {
-            let cands: Vec<&str> = COMMANDS
-                .iter()
-                .copied()
-                .filter(|c| c.starts_with(rest))
-                .collect();
-            match cands.as_slice() {
-                [] => None,
-                [only] => Some(format!("/{only} ")),
-                many => {
-                    let lcp = longest_common_prefix(many);
-                    (lcp.len() > rest.len()).then(|| format!("/{lcp}"))
-                }
-            }
-        }
-        // Completing a `/resume <slug>` argument from saved sessions.
-        Some(("resume", arg)) => {
-            let slugs: Vec<String> = session::list()
-                .into_iter()
-                .map(|s| s.slug)
-                .filter(|s| s.starts_with(arg))
-                .collect();
-            let refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
-            match refs.as_slice() {
-                [] => None,
-                [only] => Some(format!("/resume {only}")),
-                many => {
-                    let lcp = longest_common_prefix(many);
-                    (lcp.len() > arg.len()).then(|| format!("/resume {lcp}"))
-                }
-            }
-        }
-        _ => None,
-    }
-}
-
 /// Build the `/model` picker (every advertised model, hot ones marked, the
 /// active one starred). `None` for the offline stub or an unreachable endpoint.
 fn model_menu(sel: &ModelSel) -> Option<Menu> {
@@ -654,6 +544,9 @@ fn model_menu(sel: &ModelSel) -> Option<Menu> {
         title: "models".to_string(),
         items,
         selected,
+        scroll: 0,
+        count: None,
+        pending_g: false,
     })
 }
 
@@ -680,6 +573,9 @@ fn session_menu() -> Option<Menu> {
         title: "sessions".to_string(),
         items,
         selected: 0,
+        scroll: 0,
+        count: None,
+        pending_g: false,
     })
 }
 
@@ -747,6 +643,10 @@ fn commands_menu() -> Option<Menu> {
         value: "/session ".to_string(),
     });
     items.push(MenuItem {
+        label: "/runs - list execution ledgers".to_string(),
+        value: "/runs ".to_string(),
+    });
+    items.push(MenuItem {
         label: "/clear - new chat".to_string(),
         value: "/clear ".to_string(),
     });
@@ -776,26 +676,10 @@ fn commands_menu() -> Option<Menu> {
         title: "commands (Tab or type /) — for everyone".to_string(),
         items,
         selected: 0,
+        scroll: 0,
+        count: None,
+        pending_g: false,
     })
-}
-
-/// Read the task config from the environment: `(name, seeds, budget)`. `None`
-/// when no task is set. Shared by the boot path and `/agents`.
-fn task_config() -> Option<(String, Vec<String>, u64)> {
-    let name = std::env::var("COXN_TASK_NAME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
-    let seeds = std::env::var("COXN_TASK_SEEDS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let budget = std::env::var("COXN_TASK_BUDGET")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8192);
-    Some((name, seeds, budget))
 }
 
 /// Render `/agents`: run aden's partition for the current task and show each
@@ -821,43 +705,27 @@ fn agents_listing(dir: &Path, caps: &aden::AdenCaps) -> String {
     }
     let mut out = format!("partition of '{name}' (dependency order):\n");
     for s in agents::dependency_order(&scopes) {
-        let model =
-            resolve_role(dir, caps, &s.role).unwrap_or_else(|| "(default model)".to_string());
+        let model = resolve_role(dir, caps, &s.role)
+            .map(|s| format!("{}:{}", s.instance_id, s.model))
+            .unwrap_or_else(|| "(default model)".to_string());
         let after = if s.depends_on.is_empty() {
             String::new()
         } else {
             format!("  after {}", s.depends_on.join(", "))
         };
-        out.push_str(&format!("  {} [{}] -> {model}{after}\n", s.id, s.role));
+        let policy = execute::ToolPolicy::for_role(&s.role);
+        out.push_str(&format!(
+            "  {} [{}; tools: {}] -> {model}{after}\n",
+            s.id,
+            s.role,
+            policy.label()
+        ));
     }
     out.push_str(
         "(partition ready; BatchIo + per-Pump execution substrate added; runner wiring next)",
     );
     out
 }
-
-/// The aden-agnostic action instructions prepended to scope context in task mode.
-///
-/// coxn's default prompt is empty (zero-default-context), which leaves a weak
-/// local model passive. This nudge makes it act even without aden present.
-/// DESIGN sanctions this single preamble: it is operating instruction, not repo
-/// context, and appears only when a task name is active.
-const AGENT_PREAMBLE_BASE: &str = "\
-You are coxn, a coding agent. To change code, call `read_file` to get the exact \
-current text, then `edit` (replace an exact unique string) or `write_file` (whole \
-file) -- do not print a patch for the user to apply. To build, test, run, or use \
-git, call `run_command`: it runs in a sandbox confined to the project, with no \
-network unless you set network:true. Verify your changes by running the tests.\n\n";
-
-/// The aden-specific suffix appended when aden is present and the scope gated.
-///
-/// Appended after [`AGENT_PREAMBLE_BASE`] when aden produced a scope manifest,
-/// so every edit is governed. Followed immediately by the per-seed asm context.
-const AGENT_PREAMBLE_ADEN: &str = "\
-Edits are gated by aden against the task scope and reverted if they escape, so \
-keep changes minimal and in scope. To search or understand code, use the aden \
-tools: aden_grep, aden_locate, aden_asm, aden_understand, aden_ask.\n\n\
-=== task scope context ===\n\n";
 
 /// The result of resolving a task scope: the status-line text, the gate (when
 /// `aden scope` produced a mandate), and the context to load into the pump.
@@ -953,60 +821,6 @@ browse code with read_file and run_command (e.g. grep).\n\n",
         status,
         gate,
         context: Some(context),
-    }
-}
-
-/// A slash command typed into the input line.
-#[derive(Debug, PartialEq, Eq)]
-enum Command {
-    Help,
-    Quit,
-    Clear,
-    /// `/model` lists; `/model <name|#>` switches.
-    Model(Option<String>),
-    Tools,
-    /// `/session` lists saved sessions.
-    Session,
-    /// `/resume <slug>` loads a saved session.
-    Resume(Option<String>),
-    /// `/edit [path]` opens the last-edited file (or `path`) in `$EDITOR`.
-    OpenEditor(Option<String>),
-    /// `/think [off|low|med|high]` sets the reasoning-effort level.
-    Think(Option<String>),
-    /// `/agents` shows the task partition (sub-scopes + routed models).
-    Agents,
-    /// `/scope` shows the active task scope from the environment.
-    Scope,
-    /// `/trust` toggles read_file session-auto approval.
-    Trust,
-    /// `/copy` writes the transcript to disk.
-    Copy,
-    /// `/execute` runs the aden task partition sequentially (BatchIo).
-    Execute,
-    Unknown(String),
-}
-
-/// Parse a leading-slash input into a command. Pure and testable.
-fn parse_command(input: &str) -> Command {
-    let mut words = input.trim_start_matches('/').split_whitespace();
-    let word = words.next().unwrap_or("");
-    let arg = words.next().map(|s| s.to_string());
-    match word {
-        "help" | "h" | "?" => Command::Help,
-        "quit" | "q" | "exit" => Command::Quit,
-        "clear" => Command::Clear,
-        "model" => Command::Model(arg),
-        "tools" => Command::Tools,
-        "session" | "sessions" => Command::Session,
-        "resume" => Command::Resume(arg),
-        "edit" => Command::OpenEditor(arg),
-        "think" => Command::Think(arg),
-        "agents" => Command::Agents,
-        "scope" => Command::Scope,
-        "trust" => Command::Trust,
-        "copy" => Command::Copy,
-        "execute" | "run-agents" => Command::Execute,
-        other => Command::Unknown(other.to_string()),
     }
 }
 
@@ -1353,97 +1167,6 @@ impl TurnIo for DriveIo<'_> {
     }
 }
 
-/// Run the aden task partition sequentially: one pump per sub-scope, dense merge.
-async fn execute_partition(
-    dir: &Path,
-    caps: &aden::AdenCaps,
-    sel: &ModelSel,
-    bwrap: bool,
-) -> String {
-    let Some((name, seeds, budget)) = task_config() else {
-        return "set COXN_TASK_NAME + COXN_TASK_SEEDS first (see /scope)".to_string();
-    };
-    if !caps.available {
-        return "aden required for /execute".to_string();
-    }
-    if sel.is_offline_stub() {
-        return "no model reachable — start a provider before /execute".to_string();
-    }
-    let index = match aden::scope_agents(dir, &name, &seeds, budget) {
-        Ok(i) => i,
-        Err(e) => return format!("aden scope --agents failed: {e}"),
-    };
-    let scopes = agents::parse_index(&index);
-    let ordered = agents::dependency_order(&scopes);
-    if ordered.is_empty() {
-        return "aden returned no sub-scopes".to_string();
-    }
-    let mut upstream = String::new();
-    let mut report = format!("executing partition '{name}' ({} scopes)…\n", ordered.len());
-    for (i, scope) in ordered.iter().enumerate() {
-        let model_name =
-            resolve_role(dir, caps, &scope.role).unwrap_or_else(|| sel.name.clone());
-        let (model, _) = match &sel.endpoint {
-            Some(e) => openai_model(
-                e.base_url.clone(),
-                model_name.clone(),
-                e.key.clone(),
-                e.source,
-            ),
-            None => return "no provider for sub-agent".to_string(),
-        };
-        let tools = build_registry(dir, caps, bwrap);
-        let manifest_path = dir.join(&scope.manifest);
-        let gate: Box<dyn gate::Gate> = Box::new(aden::AdenGate::new(
-            dir.to_path_buf(),
-            manifest_path.clone(),
-        ));
-        let mut context = AGENT_PREAMBLE_BASE.to_string();
-        context.push_str(AGENT_PREAMBLE_ADEN);
-        if let Ok(manifest_seeds) = aden::seeds_from_manifest(&manifest_path) {
-            for s in &manifest_seeds {
-                if let Ok(text) = aden::pull(dir, aden::Pull::Asm(s)) {
-                    context.push_str(&text);
-                    context.push('\n');
-                }
-            }
-        }
-        if !upstream.is_empty() {
-            context.push_str("\n=== upstream agent results ===\n");
-            context.push_str(&upstream);
-        }
-        let mut pump = Pump::new(model, tools);
-        pump.set_gate(gate);
-        pump.set_context(context);
-        pump.push_user(format!(
-            "Complete sub-scope '{}' (role: {}). Work only within your file mandate. \
-             Return a dense summary of actions and findings.",
-            scope.id, scope.role
-        ));
-        let mut io = BatchIo::new();
-        match pump.run_turn_streaming(&mut io).await {
-            Ok(_) => {
-                let result = io.result();
-                report.push_str(&format!(
-                    "  [{}/{}] {} ({}) — done\n",
-                    i + 1,
-                    ordered.len(),
-                    scope.id,
-                    scope.role
-                ));
-                upstream.push_str(&format!("\n--- {} ---\n{}\n", scope.id, result));
-            }
-            Err(e) => {
-                report.push_str(&format!("  [{}] {} — error: {e}\n", scope.id, scope.role));
-                break;
-            }
-        }
-    }
-    report.push_str("\n=== merged upstream ===\n");
-    report.push_str(&upstream);
-    report
-}
-
 /// Headless single-turn mode: `coxn once -p "prompt"` (requires COXN_AUTO_APPROVE=1).
 async fn run_once(dir: &Path, args: &[String]) -> io::Result<()> {
     let auto = std::env::var("COXN_AUTO_APPROVE")
@@ -1466,7 +1189,7 @@ async fn run_once(dir: &Path, args: &[String]) -> io::Result<()> {
     };
     let caps = aden::probe(dir);
     let bwrap = sandbox::bwrap_available();
-    let (model, sel) = resolve_model(&caps);
+    let (model, sel) = resolve_model(dir, &caps);
     if sel.is_offline_stub() {
         eprintln!("no model reachable");
         std::process::exit(1);
@@ -1528,6 +1251,14 @@ async fn drive(
         }
         view.refresh_suggestion();
 
+        // Keep the picker viewport pinned to the selection even on a resize
+        // (handlers also re-pin on each key; this covers the no-key frame).
+        if view.menu.is_some() {
+            let (_, term_h) = pane_dims(tui);
+            let count = view.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
+            view.menu_refit(menu_max_rows(term_h, count));
+        }
+
         tui.draw(view)?;
 
         if !event::poll(TICK)? {
@@ -1551,10 +1282,14 @@ async fn drive(
             continue;
         }
 
-        // Offline stub: only retry and quit — no fake chat session.
-        if sel.is_offline_stub() {
+        // Offline stub: keep the quick retry/quit keys, but do not lock out
+        // normal input. Local slash commands like /auth and /model must remain
+        // reachable precisely when model resolution failed.
+        if sel.is_offline_stub() && view.input.is_empty() {
+            let mut handled_offline_key = false;
             match (key.code, key.modifiers) {
                 (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                    handled_offline_key = true;
                     if let Some(note) = refresh_discovery(dir, pump, sel, true) {
                         view.output.push('\n');
                         view.output.push_str(&format!("sys: {note}"));
@@ -1565,14 +1300,18 @@ async fn drive(
                     }
                     if !sel.is_offline_stub() {
                         view.output.push_str("\nsys: model online — ready to chat");
-                        view.set_status(boot_status(&sel.name, task, caps.available));
+                        view.set_status(boot_status(&sel.label(), task, caps.available));
                     }
                 }
                 (KeyCode::Char('q'), KeyModifiers::NONE)
                 | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
-                _ => {}
+                _ => {
+                    // Fall through to normal input handling.
+                }
             }
-            continue;
+            if handled_offline_key {
+                continue;
+            }
         }
 
         // Help overlay: Esc, q, or ? are the close keys and are consumed.
@@ -1603,9 +1342,15 @@ async fn drive(
 
         // A picker grabs input until selected or cancelled.
         if view.menu.is_some() {
-            match map_menu_key(key) {
-                Some(Action::MenuUp) => view.menu_move(-1),
-                Some(Action::MenuDown) => view.menu_move(1),
+            let (_, term_h) = pane_dims(tui);
+            let count = view.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
+            let rows = menu_max_rows(term_h, count);
+            match view.map_menu_key(key) {
+                Some(Action::MenuStep(d)) => view.menu_step(d, rows),
+                Some(Action::MenuTop) => view.menu_top(rows),
+                Some(Action::MenuBottom) => view.menu_bottom(rows),
+                Some(Action::MenuPageUp) => view.menu_page(-1, rows),
+                Some(Action::MenuPageDown) => view.menu_page(1, rows),
                 Some(Action::MenuCancel) => view.close_menu(),
                 Some(Action::MenuSelect) => {
                     let pick = view
@@ -1616,10 +1361,10 @@ async fn drive(
                     if let Some((kind, value)) = pick {
                         match kind {
                             MenuKind::Model => {
-                                view.output = switch_model(pump, sel, &value);
+                                view.output = switch_model(dir, pump, sel, &value);
                                 view.set_status(status_line(
                                     dir,
-                                    &sel.name,
+                                    &sel.label(),
                                     task,
                                     pump.last_usage(),
                                     view.aden_active,
@@ -1640,7 +1385,7 @@ async fn drive(
                                     view.output = transcript(pump.messages());
                                     view.set_status(status_line(
                                         dir,
-                                        &sel.name,
+                                        &sel.label(),
                                         task,
                                         pump.last_usage(),
                                         view.aden_active,
@@ -2007,10 +1752,10 @@ async fn drive(
                     }
                 }
                 ExCmd::Model(Some(target)) => {
-                    view.output = switch_model(pump, sel, &target);
+                    view.output = switch_model(dir, pump, sel, &target);
                     view.set_status(status_line(
                         dir,
-                        &sel.name,
+                        &sel.label(),
                         task,
                         pump.last_usage(),
                         view.aden_active,
@@ -2031,7 +1776,7 @@ async fn drive(
                     approved_commands.clear();
                     view.set_status(status_line(
                         dir,
-                        &sel.name,
+                        &sel.label(),
                         task,
                         pump.last_usage(),
                         view.aden_active,
@@ -2384,8 +2129,10 @@ async fn drive(
                         Command::Model(Some(target)) => {
                             // `@role` resolves through the [route] table; anything
                             // else is a model name or index.
-                            let resolved = if let Some(role) = target.strip_prefix('@') {
-                                resolve_role(dir, caps, role).ok_or_else(|| {
+                            let resolved: Result<String, String> = if let Some(role) =
+                                target.strip_prefix('@')
+                            {
+                                resolve_role(dir, caps, role).map(|s| format!("{}/{}", s.instance_id, s.model)).ok_or_else(|| {
                                     format!(
                                         "no model mapped for role '@{role}'; set route.{role} via aden config"
                                     )
@@ -2394,11 +2141,11 @@ async fn drive(
                                 Ok(target.clone())
                             };
                             match resolved {
-                                Ok(model) => {
-                                    view.output = switch_model(pump, sel, &model);
+                                Ok(target) => {
+                                    view.output = switch_model(dir, pump, sel, &target);
                                     view.set_status(status_line(
                                         dir,
-                                        &sel.name,
+                                        &sel.label(),
                                         task,
                                         pump.last_usage(),
                                         view.aden_active,
@@ -2458,6 +2205,13 @@ async fn drive(
                             Some(menu) => view.open_menu(menu),
                             None => view.output = session_listing(&session.slug()),
                         },
+                        Command::Runs(slug) => {
+                            view.output = match slug {
+                                Some(slug) => run_ledger::summarize(&slug)
+                                    .unwrap_or_else(|e| format!("run '{slug}' unavailable: {e}")),
+                                None => runs_listing(),
+                            };
+                        }
                         Command::Resume(slug) => {
                             view.output = match slug {
                                 Some(slug) => {
@@ -2476,7 +2230,7 @@ async fn drive(
                                         let out = transcript(pump.messages());
                                         view.set_status(status_line(
                                             dir,
-                                            &sel.name,
+                                            &sel.label(),
                                             task,
                                             pump.last_usage(),
                                             view.aden_active,
@@ -2500,7 +2254,7 @@ async fn drive(
                             trust.seed_approvals(&mut approvals);
                             view.set_status(status_line(
                                 dir,
-                                &sel.name,
+                                &sel.label(),
                                 task,
                                 pump.last_usage(),
                                 view.aden_active,
@@ -2518,7 +2272,7 @@ async fn drive(
                             view.output = note;
                             view.set_status(status_line(
                                 dir,
-                                &sel.name,
+                                &sel.label(),
                                 task,
                                 pump.last_usage(),
                                 view.aden_active,
@@ -2526,13 +2280,34 @@ async fn drive(
                             ));
                         }
                         Command::Copy => view.output = copy_transcript(view),
-                        Command::Execute => {
-                            view.set_status("executing partition…".to_string());
+                        Command::Auth(args) => {
+                            if args.first().is_some_and(|arg| arg == "set-key") {
+                                view.output =
+                                    "run key storage from your shell: coxn auth set-key <id> < key.txt\n"
+                                        .to_string();
+                            } else {
+                                let result = auth::report(dir, &args);
+                                view.output = result.output;
+                                if result.code != 0 {
+                                    view.output.push_str(&format!(
+                                        "status: auth exited {}\n",
+                                        result.code
+                                    ));
+                                }
+                            }
+                        }
+                        Command::Execute { resume } => {
+                            view.set_status(if resume {
+                                "resuming partition…".to_string()
+                            } else {
+                                "executing partition…".to_string()
+                            });
                             let _ = tui.draw(view);
-                            view.output = execute_partition(dir, caps, sel, bwrap).await;
+                            view.output =
+                                execute::execute_partition(dir, caps, sel, bwrap, resume).await;
                             view.set_status(status_line(
                                 dir,
-                                &sel.name,
+                                &sel.label(),
                                 task,
                                 pump.last_usage(),
                                 view.aden_active,
@@ -2551,6 +2326,15 @@ async fn drive(
                 // found now (and aden tools registered) so this very turn uses it.
                 if let Some(note) = refresh_discovery(dir, pump, sel, false) {
                     view.set_status(note);
+                }
+                if sel.is_offline_stub() {
+                    view.output =
+                        "no model reachable — use /auth status, /auth login <id>, /model, or [r] retry"
+                            .to_string();
+                    view.set_status(
+                        "OFFLINE STUB  |  /auth status  /model  [r] retry  [q] quit".to_string(),
+                    );
+                    continue;
                 }
                 let expanded = expand_at_paths(dir, &text);
                 pump.push_user(expanded);
@@ -2609,15 +2393,14 @@ async fn drive(
                                 .push_str(&format!("\nsys: done in {:.1}s", e.as_secs_f64()));
                         }
                         // Refresh the model + savings + context status after the turn.
-                        let status =
-                            status_line(
-                                dir,
-                                &sel.name,
-                                task,
-                                pump.last_usage(),
-                                view.aden_active,
-                                &trust,
-                            );
+                        let status = status_line(
+                            dir,
+                            &sel.label(),
+                            task,
+                            pump.last_usage(),
+                            view.aden_active,
+                            &trust,
+                        );
                         view.set_status(if cancelled {
                             format!("{status}  (cancelled)")
                         } else {
@@ -2677,6 +2460,18 @@ fn session_listing(active: &str) -> String {
     out
 }
 
+fn runs_listing() -> String {
+    let runs = run_ledger::list();
+    if runs.is_empty() {
+        return "no execution runs yet".to_string();
+    }
+    let mut out = String::from("execution runs (/runs <slug>):\n");
+    for slug in runs {
+        out.push_str(&format!("  {slug}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2728,56 +2523,6 @@ mod tests {
             out2,
             format!("tool: {aden_content}"),
             "non-cmd tool must be prefixed: {out2}"
-        );
-    }
-
-    #[test]
-    fn longest_common_prefix_of_candidates() {
-        assert_eq!(longest_common_prefix(&["think", "tools"]), "t");
-        assert_eq!(longest_common_prefix(&["model"]), "model");
-        assert_eq!(longest_common_prefix(&["abc", "abd", "abe"]), "ab");
-        assert_eq!(longest_common_prefix(&["x", "y"]), "");
-        assert_eq!(longest_common_prefix(&[]), "");
-    }
-
-    #[test]
-    fn tab_completes_command_verbs() {
-        // A unique prefix completes with a trailing space.
-        assert_eq!(complete_input("/mod").as_deref(), Some("/model "));
-        assert_eq!(complete_input("/he").as_deref(), Some("/help "));
-        // An ambiguous prefix that cannot be extended yields nothing
-        // (think/tools share only the typed "t").
-        assert_eq!(complete_input("/t"), None);
-        // No match, and non-command input, complete to nothing.
-        assert_eq!(complete_input("/zzz"), None);
-        assert_eq!(complete_input("hello"), None);
-    }
-
-    #[test]
-    fn parse_command_maps_aliases_and_unknowns() {
-        assert_eq!(parse_command("/help"), Command::Help);
-        assert_eq!(parse_command("/?"), Command::Help);
-        assert_eq!(parse_command("/q"), Command::Quit);
-        assert_eq!(parse_command("/clear"), Command::Clear);
-        assert_eq!(parse_command("/tools"), Command::Tools);
-        // /model lists; /model <arg> carries the switch target.
-        assert_eq!(parse_command("/model"), Command::Model(None));
-        assert_eq!(
-            parse_command("/model gpt"),
-            Command::Model(Some("gpt".to_string()))
-        );
-        assert_eq!(
-            parse_command("/model 3"),
-            Command::Model(Some("3".to_string()))
-        );
-        // A role switch carries the @-prefixed role as the target.
-        assert_eq!(
-            parse_command("/model @scout"),
-            Command::Model(Some("@scout".to_string()))
-        );
-        assert_eq!(
-            parse_command("/bogus"),
-            Command::Unknown("bogus".to_string())
         );
     }
 

@@ -493,7 +493,14 @@ impl Tool for GrepTool {
             });
         }
         let grep = std::process::Command::new("grep")
-            .args(["-r", "-n", "-m", &GREP_MAX_LINES.to_string(), &pattern, &root])
+            .args([
+                "-r",
+                "-n",
+                "-m",
+                &GREP_MAX_LINES.to_string(),
+                &pattern,
+                &root,
+            ])
             .output()
             .map_err(|e| format!("grep failed (install ripgrep or grep): {e}"))?;
         if grep.status.success() {
@@ -580,7 +587,10 @@ fn rel_path(root: &Path, path: &Path) -> Result<String, String> {
 }
 
 fn glob_match(pattern: &str, path: &str) -> bool {
-    glob_parts_match(&pattern.split('/').collect::<Vec<_>>(), &path.split('/').collect::<Vec<_>>())
+    glob_parts_match(
+        &pattern.split('/').collect::<Vec<_>>(),
+        &path.split('/').collect::<Vec<_>>(),
+    )
 }
 
 fn glob_parts_match(pat: &[&str], path: &[&str]) -> bool {
