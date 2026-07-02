@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
-use pump::{Approval, Pump, TurnIo};
+use pump::{Approval, BatchIo, Pump, TurnIo};
 use tools::{AdenTool, EditTool, GlobTool, GrepTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
 use trust::Trust;
 use tui::{
@@ -64,6 +64,20 @@ fn register_aden_tools(tools: &mut ToolRegistry, dir: &std::path::Path, availabl
     tools.register(Box::new(AdenTool::ask(dir.to_path_buf())));
     tools.register(Box::new(AdenTool::locate(dir.to_path_buf())));
     true
+}
+
+/// Build the standard tool registry for a session (aden + read/grep/glob/edit/run).
+fn build_registry(dir: &Path, caps: &aden::AdenCaps, bwrap: bool) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    register_aden_tools(&mut tools, dir, caps.available);
+    let root = dir.to_path_buf();
+    tools.register(Box::new(ReadFileTool::new(root.clone())));
+    tools.register(Box::new(GrepTool::new(root.clone())));
+    tools.register(Box::new(GlobTool::new(root.clone())));
+    tools.register(Box::new(EditTool::new(root.clone())));
+    tools.register(Box::new(WriteTool::new(root.clone())));
+    tools.register(Box::new(RunTool::new(root, bwrap)));
+    tools
 }
 
 /// Re-discover capabilities that may have come online since boot, with no
@@ -175,6 +189,7 @@ ENVIRONMENT:
     COXN_MODEL_NAME      Model id (default: local)
     COXN_MODEL_KEY       API key (never written to config)
     COXN_BARE=1          Empty system prompt (zero-default-context purists)
+    COXN_AUTO_APPROVE=1  Required for `coxn once` (auto-approves tool calls)
     COXN_TASK_NAME       Task scope (aden blast-radius gate)
     COXN_TASK_SEEDS      Comma-separated seed symbols
     COXN_ADEN_BIN        Path to aden binary
@@ -198,6 +213,7 @@ async fn main() -> io::Result<()> {
                 return Ok(());
             }
             "doctor" => std::process::exit(doctor::run(&dir)),
+            "once" => return run_once(&dir, &args[1..]).await,
             s if s.starts_with('-') => {
                 eprintln!("coxn: unknown flag {s} (try --help)");
                 std::process::exit(2);
@@ -217,35 +233,19 @@ async fn run_tui(dir: &Path) -> io::Result<()> {
 
     // Probe aden availability once at boot. All downstream decisions read from
     // `caps`; nothing shells out to aden a second time for the same question.
-    let caps = aden::probe(&dir);
+    let caps = aden::probe(dir);
 
     // Coxn owns the write path: one quiet gen at boot, then every read sets
     // ADEN_SKIP_AUTO_GEN so aden grep/asm/scope never fight the store lock.
     if caps.available {
-        let _ = aden::ensure_indexed(&dir);
+        let _ = aden::ensure_indexed(dir);
     }
 
     // When aden is present, register its five read tools as active so the model
     // uses dense retrieval immediately. When absent, register none; the discovery
     // seam reports an empty catalog, which is honest.
-    let mut tools = ToolRegistry::new();
-    register_aden_tools(&mut tools, &dir, caps.available);
-
-    // The action set is always advertised; each mutating call is gated by user
-    // approval at the prompt, and (when a task scope is active) by aden's
-    // blast-radius gate on top. read_file is advertised with the editors so the
-    // model can fetch the exact text to replace.
-    let root = dir.to_path_buf();
-    tools.register(Box::new(ReadFileTool::new(root.clone())));
-    tools.register(Box::new(GrepTool::new(root.clone())));
-    tools.register(Box::new(GlobTool::new(root.clone())));
-    tools.register(Box::new(EditTool::new(root.clone())));
-    tools.register(Box::new(WriteTool::new(root.clone())));
-    // run_command lets the model close the edit->build->test loop. It is the
-    // riskiest tool, so it is always approval-gated and confined by bwrap when
-    // present (probed once here; the answer is shown at the approval prompt).
     let bwrap = sandbox::bwrap_available();
-    tools.register(Box::new(RunTool::new(root, bwrap)));
+    let tools = build_registry(dir, &caps, bwrap);
 
     // Take over the terminal and paint a frame first, so the user sees coxn
     // start instead of a frozen blank while the aden subprocess calls below
@@ -265,7 +265,7 @@ async fn run_tui(dir: &Path) -> io::Result<()> {
     // A named task (COXN_TASK_NAME) makes aden define the scope: the gate
     // mandate and exactly the seeds' context. No task = bare prompt, edits gated
     // by approval alone.
-    let task = load_task(&dir, &caps);
+    let task = load_task(dir, &caps);
     let mut pump = Pump::new(model, tools);
     if let Some(gate) = task.gate {
         pump.set_gate(gate);
@@ -301,7 +301,7 @@ async fn run_tui(dir: &Path) -> io::Result<()> {
         &mut tui,
         &mut view,
         &mut pump,
-        &dir,
+        dir,
         &caps,
         &mut sel,
         &task.status,
@@ -550,7 +550,20 @@ fn resolve_role(dir: &Path, caps: &aden::AdenCaps, role: &str) -> Option<String>
 
 /// Slash command verbs, for Tab completion.
 const COMMANDS: &[&str] = &[
-    "help", "model", "think", "tools", "agents", "session", "resume", "edit", "clear", "quit",
+    "help",
+    "model",
+    "think",
+    "tools",
+    "agents",
+    "execute",
+    "scope",
+    "trust",
+    "copy",
+    "session",
+    "resume",
+    "edit",
+    "clear",
+    "quit",
 ];
 
 /// The longest common prefix of `items` (empty if they share none).
@@ -968,6 +981,8 @@ enum Command {
     Trust,
     /// `/copy` writes the transcript to disk.
     Copy,
+    /// `/execute` runs the aden task partition sequentially (BatchIo).
+    Execute,
     Unknown(String),
 }
 
@@ -990,6 +1005,7 @@ fn parse_command(input: &str) -> Command {
         "scope" => Command::Scope,
         "trust" => Command::Trust,
         "copy" => Command::Copy,
+        "execute" | "run-agents" => Command::Execute,
         other => Command::Unknown(other.to_string()),
     }
 }
@@ -1333,6 +1349,146 @@ impl TurnIo for DriveIo<'_> {
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+/// Run the aden task partition sequentially: one pump per sub-scope, dense merge.
+async fn execute_partition(
+    dir: &Path,
+    caps: &aden::AdenCaps,
+    sel: &ModelSel,
+    bwrap: bool,
+) -> String {
+    let Some((name, seeds, budget)) = task_config() else {
+        return "set COXN_TASK_NAME + COXN_TASK_SEEDS first (see /scope)".to_string();
+    };
+    if !caps.available {
+        return "aden required for /execute".to_string();
+    }
+    if sel.is_offline_stub() {
+        return "no model reachable — start a provider before /execute".to_string();
+    }
+    let index = match aden::scope_agents(dir, &name, &seeds, budget) {
+        Ok(i) => i,
+        Err(e) => return format!("aden scope --agents failed: {e}"),
+    };
+    let scopes = agents::parse_index(&index);
+    let ordered = agents::dependency_order(&scopes);
+    if ordered.is_empty() {
+        return "aden returned no sub-scopes".to_string();
+    }
+    let mut upstream = String::new();
+    let mut report = format!("executing partition '{name}' ({} scopes)…\n", ordered.len());
+    for (i, scope) in ordered.iter().enumerate() {
+        let model_name =
+            resolve_role(dir, caps, &scope.role).unwrap_or_else(|| sel.name.clone());
+        let (model, _) = match &sel.endpoint {
+            Some(e) => openai_model(
+                e.base_url.clone(),
+                model_name.clone(),
+                e.key.clone(),
+                e.source,
+            ),
+            None => return "no provider for sub-agent".to_string(),
+        };
+        let tools = build_registry(dir, caps, bwrap);
+        let manifest_path = dir.join(&scope.manifest);
+        let gate: Box<dyn gate::Gate> = Box::new(aden::AdenGate::new(
+            dir.to_path_buf(),
+            manifest_path.clone(),
+        ));
+        let mut context = AGENT_PREAMBLE_BASE.to_string();
+        context.push_str(AGENT_PREAMBLE_ADEN);
+        if let Ok(manifest_seeds) = aden::seeds_from_manifest(&manifest_path) {
+            for s in &manifest_seeds {
+                if let Ok(text) = aden::pull(dir, aden::Pull::Asm(s)) {
+                    context.push_str(&text);
+                    context.push('\n');
+                }
+            }
+        }
+        if !upstream.is_empty() {
+            context.push_str("\n=== upstream agent results ===\n");
+            context.push_str(&upstream);
+        }
+        let mut pump = Pump::new(model, tools);
+        pump.set_gate(gate);
+        pump.set_context(context);
+        pump.push_user(format!(
+            "Complete sub-scope '{}' (role: {}). Work only within your file mandate. \
+             Return a dense summary of actions and findings.",
+            scope.id, scope.role
+        ));
+        let mut io = BatchIo::new();
+        match pump.run_turn_streaming(&mut io).await {
+            Ok(_) => {
+                let result = io.result();
+                report.push_str(&format!(
+                    "  [{}/{}] {} ({}) — done\n",
+                    i + 1,
+                    ordered.len(),
+                    scope.id,
+                    scope.role
+                ));
+                upstream.push_str(&format!("\n--- {} ---\n{}\n", scope.id, result));
+            }
+            Err(e) => {
+                report.push_str(&format!("  [{}] {} — error: {e}\n", scope.id, scope.role));
+                break;
+            }
+        }
+    }
+    report.push_str("\n=== merged upstream ===\n");
+    report.push_str(&upstream);
+    report
+}
+
+/// Headless single-turn mode: `coxn once -p "prompt"` (requires COXN_AUTO_APPROVE=1).
+async fn run_once(dir: &Path, args: &[String]) -> io::Result<()> {
+    let auto = std::env::var("COXN_AUTO_APPROVE")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+    if !auto {
+        eprintln!("coxn once requires COXN_AUTO_APPROVE=1 (auto-approves all tool calls)");
+        std::process::exit(1);
+    }
+    let prompt = args
+        .iter()
+        .position(|a| a == "-p" || a == "--prompt")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .or_else(|| args.get(1).cloned())
+        .filter(|s| !s.starts_with('-'));
+    let Some(prompt) = prompt else {
+        eprintln!("usage: coxn once -p \"your prompt\"");
+        std::process::exit(2);
+    };
+    let caps = aden::probe(dir);
+    let bwrap = sandbox::bwrap_available();
+    let (model, sel) = resolve_model(&caps);
+    if sel.is_offline_stub() {
+        eprintln!("no model reachable");
+        std::process::exit(1);
+    }
+    let task = load_task(dir, &caps);
+    let mut pump = Pump::new(model, build_registry(dir, &caps, bwrap));
+    if let Some(gate) = task.gate {
+        pump.set_gate(gate);
+    }
+    if let Some(context) = task.context {
+        pump.set_context(context);
+    }
+    pump.push_user(prompt);
+    let mut io = BatchIo::new();
+    match pump.run_turn_streaming(&mut io).await {
+        Ok(_) => {
+            print!("{}", io.result());
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
     }
 }
@@ -2370,6 +2526,19 @@ async fn drive(
                             ));
                         }
                         Command::Copy => view.output = copy_transcript(view),
+                        Command::Execute => {
+                            view.set_status("executing partition…".to_string());
+                            let _ = tui.draw(view);
+                            view.output = execute_partition(dir, caps, sel, bwrap).await;
+                            view.set_status(status_line(
+                                dir,
+                                &sel.name,
+                                task,
+                                pump.last_usage(),
+                                view.aden_active,
+                                &trust,
+                            ));
+                        }
                         Command::Unknown(c) => {
                             view.output = format!("unknown command: /{c}  (try /help)");
                         }
