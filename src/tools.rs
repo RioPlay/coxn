@@ -433,6 +433,187 @@ impl Tool for ReadFileTool {
     }
 }
 
+/// Public wrapper for path confinement (used by `@path` input expansion in main).
+pub(crate) fn confine_path(dir: &Path, path: &str) -> Result<PathBuf, String> {
+    project_path(dir, path)
+}
+
+const GREP_MAX_LINES: usize = 80;
+const GLOB_MAX_MATCHES: usize = 200;
+
+/// Ripgrep (or grep) search confined to the project root. Fallback when aden is
+/// absent; commodity shell-out, not context assembly.
+pub struct GrepTool {
+    dir: PathBuf,
+}
+
+impl GrepTool {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+impl Tool for GrepTool {
+    fn name(&self) -> &str {
+        "grep"
+    }
+
+    fn intent(&self) -> &str {
+        "search file contents under the project root (ripgrep or grep)"
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        one_string_param("pattern", "regex or literal pattern to search for")
+    }
+
+    fn run(&self, arguments: &str) -> ToolResult {
+        let pattern = arg(arguments, "pattern");
+        if pattern.is_empty() {
+            return Err("pattern is required".to_string());
+        }
+        let root = self.dir.display().to_string();
+        if let Ok(out) = std::process::Command::new("rg")
+            .args([
+                "-n",
+                "--max-count",
+                &GREP_MAX_LINES.to_string(),
+                "--glob",
+                "!.git/*",
+                &pattern,
+                &root,
+            ])
+            .output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            return Ok(if text.is_empty() {
+                "(no matches)".to_string()
+            } else {
+                text.trim_end().to_string()
+            });
+        }
+        let grep = std::process::Command::new("grep")
+            .args(["-r", "-n", "-m", &GREP_MAX_LINES.to_string(), &pattern, &root])
+            .output()
+            .map_err(|e| format!("grep failed (install ripgrep or grep): {e}"))?;
+        if grep.status.success() {
+            Ok(String::from_utf8_lossy(&grep.stdout).trim_end().to_string())
+        } else {
+            Ok("(no matches)".to_string())
+        }
+    }
+}
+
+/// List paths under the project root matching a simple glob (`*`, `**` per segment).
+pub struct GlobTool {
+    dir: PathBuf,
+}
+
+impl GlobTool {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+impl Tool for GlobTool {
+    fn name(&self) -> &str {
+        "glob"
+    }
+
+    fn intent(&self) -> &str {
+        "list files matching a glob pattern under the project root"
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        one_string_param("pattern", "glob like src/**/*.rs or *.toml")
+    }
+
+    fn run(&self, arguments: &str) -> ToolResult {
+        let pattern = arg(arguments, "pattern");
+        if pattern.is_empty() {
+            return Err("pattern is required".to_string());
+        }
+        let mut matches = Vec::new();
+        glob_walk(&self.dir, &self.dir, pattern.trim(), &mut matches)?;
+        matches.sort();
+        matches.dedup();
+        if matches.len() > GLOB_MAX_MATCHES {
+            matches.truncate(GLOB_MAX_MATCHES);
+            matches.push(format!("... truncated at {GLOB_MAX_MATCHES} matches"));
+        }
+        Ok(if matches.is_empty() {
+            "(no matches)".to_string()
+        } else {
+            matches.join("\n")
+        })
+    }
+}
+
+fn glob_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) -> Result<(), String> {
+    if out.len() >= GLOB_MAX_MATCHES {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            glob_walk(root, &path, pattern, out)?;
+        } else {
+            let rel = rel_path(root, &path)?;
+            if glob_match(pattern, &rel) {
+                out.push(rel);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rel_path(root: &Path, path: &Path) -> Result<String, String> {
+    path.strip_prefix(root)
+        .map(|p| p.display().to_string())
+        .map_err(|_| "path outside root".to_string())
+}
+
+fn glob_match(pattern: &str, path: &str) -> bool {
+    glob_parts_match(&pattern.split('/').collect::<Vec<_>>(), &path.split('/').collect::<Vec<_>>())
+}
+
+fn glob_parts_match(pat: &[&str], path: &[&str]) -> bool {
+    match (pat.first(), path.first()) {
+        (None, None) => true,
+        (Some(&"**"), _) => {
+            if pat.len() == 1 {
+                return true;
+            }
+            (0..=path.len()).any(|i| glob_parts_match(&pat[1..], &path[i..]))
+        }
+        (Some(p), Some(f)) if segment_match(p, f) => glob_parts_match(&pat[1..], &path[1..]),
+        _ => false,
+    }
+}
+
+fn segment_match(pat: &str, name: &str) -> bool {
+    if pat == "*" {
+        return true;
+    }
+    if let Some(prefix) = pat.strip_suffix('*')
+        && !prefix.is_empty()
+    {
+        return name.starts_with(prefix);
+    }
+    if let Some(suffix) = pat.strip_prefix('*')
+        && !suffix.is_empty()
+    {
+        return name.ends_with(suffix);
+    }
+    pat == name
+}
+
 /// Resolve a `path` argument under the project root, rejecting anything that
 /// could escape it. An action tool writes to the working tree; the gate only
 /// judges the tree's git diff, so a write outside the tree (an absolute path or
