@@ -73,7 +73,7 @@ DONE. Deps approved (P3.0) and the path verified live against LM Studio.
 * [x] P3.2b Tool-calling over the wire: `Message` carries tool_calls/tool_call_id; `Tool` carries JSON schemas; `advertised_defs` -> OpenAI `function` tools; assistant tool_calls + `tool` results threaded; response tool_calls parsed back. Tools read JSON-or-bare args. 2 commits, hermetic tests. Network e2e VERIFIED live (LM Studio gpt-oss-20b).
 * [x] P3.8 Model enumeration + switching: `openai::list_models` lists every model the provider advertises (loaded or not; auth header for cloud); `/model` lists with active marked, `/model <name|#>` switches via `Pump::set_model`. An unlisted name is allowed (backend JIT-loads). Verified live.
 * [x] P3.9 Streaming: `Model::stream` (default delegates to `call`; OpenAiCompat reads SSE, assembling text + tool-call deltas by index). `Pump::run_turn_streaming` threads a sink; `drive` repaints the reply per fragment. Verified live vs LM Studio gpt-oss-20b: text grows smoothly (56->1250 chars over ~5s) AND a streamed tool call drove a gated edit that persisted. Tool-calling-under-streaming works on LM Studio (the drop is Ollama-specific).
-* [ ] Ollama-native `/api/chat` profile -- DEFERRED: Ollama not installed/runnable here, so the protocol code cannot be live-validated (test-first). The OpenAI-compat path covers LM Studio/OpenAI/OpenRouter/vLLM; add the native profile when an Ollama instance is available to test against.
+* [x] Ollama-native `/api/chat` profile (`src/ollama.rs`, `AnyModel::Ollama`). Wire format unit-tested; live Ollama smoke test still pending on hosts without `ollama` installed.
 * [ ] Optional Anthropic-direct profile (native prompt caching, exact billing).
 
 == Phase 4 (coxn-side): the harness -- gated editing  -- DONE
@@ -143,21 +143,22 @@ commits; 101 tests green, clippy/fmt clean, still six deps):
 * [x] Gate revert banner + confirm modal with verdict label
 * [x] Dirty-tree boot warning when task scope active
 * [x] `scripts/demo-sandbox.sh`
-* [ ] `scripts/demo-scope-escape.sh` + README GIF
+* [x] `scripts/demo-scope-escape.sh` (deterministic wedge demo)
+* [ ] README GIF for scope-escape demo
 
-== Phase J (provider): Ollama native -- OPEN
+== Phase J (provider): Ollama native -- DONE (live smoke pending)
 
-* [ ] `OllamaModel` `/api/chat` profile (streaming + tools on `:11434`)
+* [x] `OllamaModel` `/api/chat` profile (streaming + tools on `:11434`) — see `src/ollama.rs`
 
-== Phase K (architecture): extract app.rs -- OPEN
+== Phase K (architecture): extract app.rs -- PARTIAL
 
-* [ ] Move `drive` + command parsing out of `main.rs` (< 400 LOC target)
+* [~] Move `drive` + command parsing out of `main.rs` (< 400 LOC target). `app.rs` holds model-selection + session wiring (222 LOC); `commands.rs` + `execute.rs` extracted; `main.rs` still ~3074 LOC (drive loop remains).
 
 == Phase M (automation): headless -- DONE
 
 * [x] `coxn once -p` with `COXN_AUTO_APPROVE=1` + `BatchIo`
 
-== Phase N (provider): profiles, auth, cloud opt-in -- OPEN
+== Phase N (provider): profiles, auth, cloud opt-in -- MOSTLY DONE
 
 Spec: `docs/provider-auth-plan.adoc` (delegation plan; T3 Code patterns).
 
@@ -171,10 +172,22 @@ Spec: `docs/provider-auth-plan.adoc` (delegation plan; T3 Code patterns).
 * [ ] N7 (parallel) `main.rs` → `app.rs` extract (Phase K)
 * [x] N8 T3-derived hardening: provider slug/env validation, unknown-driver unavailable state, atomic secrets
 * [ ] N9 Codex app-server auth probe (`initialize` + `account/read`)
-* [ ] N10 Claude/OpenRouter environment presets + CLI backend design
+* [x] N10 Provider environment presets (`coxn auth setup`, `/auth setup <id>`) for Ollama/LM Studio/OpenAI/OpenRouter
+* [ ] N10b CLI backend design (piggyback — see N6/N11)
 * [ ] N11 CLI-backed provider MVP (`AnyModel::CliPiggyback`)
 
-== Phase O (next-generation harness): scoped execution and observability -- OPEN
+== Phase T (TUI frictionless): daily-driver chrome -- DONE
+
+Spec: `docs/tui-frictionless-plan.adoc`. Six deps unchanged.
+
+* [x] M1 Multiline input + submit semantics (Alt/Shift-Enter, bracketed paste)
+* [x] M2 Transcript search + context-sensitive `/` (aden grep → `gr`, help → `g?`)
+* [x] M3 Diff hunk rendering in approval modal + transcript
+* [x] M4 Fuzzy command palette (`Ctrl-Space`)
+* [x] M5 Mouse + OSC52 clipboard (`COXN_CLIPBOARD=on`)
+* [x] M6 Mode cheat-sheet + status-line chips
+
+== Phase O (next-generation harness): scoped execution and observability -- DONE (live partition validation open)
 
 Spec: `docs/next-generation-harness-plan.adoc` (KISS execution plan).
 
@@ -182,10 +195,10 @@ Spec: `docs/next-generation-harness-plan.adoc` (KISS execution plan).
       `src/execute.rs` owns sequential + parallel partition execution;
       `src/app.rs` owns the model-selection + session-wiring core (`Endpoint`,
       `ModelSel`, `openai_model`/`ollama_model`, `resolve_instance_from_config`,
-      `resolve_role`, `task_config`, `AGENT_PREAMBLE_*`); `main.rs` shrank
-      2915->2755 lines to CLI routing + the TUI drive loop. The full `run_tui`
-      / drive-loop extract into `app.rs` remains open (high blind-refactor risk;
-      PTY-validated, no automated test).
+      `resolve_role`, `task_config`, `AGENT_PREAMBLE_*`); `main.rs` is CLI
+      routing + the TUI drive loop (~3074 LOC). The full `run_tui` /
+      drive-loop extract into `app.rs` remains open (Phase K; high blind-refactor
+      risk; PTY-validated, no automated test).
 * [x] O2 Sequential sub-agent correctness: per-role `ToolPolicy` tool subsets and
       per-scope budgets (`budget_from_manifest` -> prompt, usage in the run
       report); adaptive stopping via the global hop cap + repeated-tool-error
