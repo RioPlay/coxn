@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (provider setup)
+
+- **`coxn auth setup`**: lists built-in provider presets and writes
+  `.aden/config.toml` for local Ollama/LM Studio, OpenAI direct, and
+  Claude/GPT/Gemini/Grok via OpenRouter (`/auth setup <id>` in the TUI).
+  Keys still live in `COXN_KEY_<INSTANCE>` or `coxn auth set-key`.
+
 ### Added (TUI frictionless — M6)
 
 - **Mode cheat-sheet + status chips**: `g?` flashes a dim one-line tip per vim

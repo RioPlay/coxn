@@ -83,12 +83,233 @@ impl ProviderConfig {
     }
 }
 
+pub fn config_path(dir: &Path) -> std::path::PathBuf {
+    dir.join(".aden/config.toml")
+}
+
 pub fn load_config(dir: &Path) -> ProviderConfig {
-    let path = dir.join(".aden/config.toml");
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = std::fs::read_to_string(config_path(dir)) else {
         return ProviderConfig::default();
     };
     parse_config(&text)
+}
+
+/// A built-in provider profile users can apply with `coxn auth setup <id>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub instance_id: &'static str,
+    pub driver: &'static str,
+    pub base_url: &'static str,
+    pub model: &'static str,
+    pub needs_key: bool,
+}
+
+/// Named presets for common local and cloud backends (OpenAI-compat unless noted).
+pub fn presets() -> &'static [ProviderPreset] {
+    &[
+        ProviderPreset {
+            id: "local-ollama",
+            label: "Ollama (OpenAI-compat /v1)",
+            instance_id: "local",
+            driver: "openai_compat",
+            base_url: "http://localhost:11434/v1",
+            model: "qwen2.5-coder",
+            needs_key: false,
+        },
+        ProviderPreset {
+            id: "ollama-native",
+            label: "Ollama (native /api/chat)",
+            instance_id: "local",
+            driver: "ollama",
+            base_url: "http://localhost:11434",
+            model: "qwen2.5-coder",
+            needs_key: false,
+        },
+        ProviderPreset {
+            id: "lmstudio",
+            label: "LM Studio (:1234)",
+            instance_id: "local",
+            driver: "openai_compat",
+            base_url: "http://localhost:1234/v1",
+            model: "local",
+            needs_key: false,
+        },
+        ProviderPreset {
+            id: "openai",
+            label: "OpenAI API",
+            instance_id: "openai",
+            driver: "openai_compat",
+            base_url: "https://api.openai.com/v1",
+            model: "gpt-4o",
+            needs_key: true,
+        },
+        ProviderPreset {
+            id: "openrouter-claude",
+            label: "Claude via OpenRouter",
+            instance_id: "openrouter",
+            driver: "openai_compat",
+            base_url: "https://openrouter.ai/api/v1",
+            model: "anthropic/claude-sonnet-4",
+            needs_key: true,
+        },
+        ProviderPreset {
+            id: "openrouter-gpt",
+            label: "GPT via OpenRouter",
+            instance_id: "openrouter",
+            driver: "openai_compat",
+            base_url: "https://openrouter.ai/api/v1",
+            model: "openai/gpt-4o",
+            needs_key: true,
+        },
+        ProviderPreset {
+            id: "openrouter-gemini",
+            label: "Gemini via OpenRouter",
+            instance_id: "openrouter",
+            driver: "openai_compat",
+            base_url: "https://openrouter.ai/api/v1",
+            model: "google/gemini-2.0-flash-001",
+            needs_key: true,
+        },
+        ProviderPreset {
+            id: "openrouter-grok",
+            label: "Grok via OpenRouter",
+            instance_id: "openrouter",
+            driver: "openai_compat",
+            base_url: "https://openrouter.ai/api/v1",
+            model: "x-ai/grok-2-1212",
+            needs_key: true,
+        },
+    ]
+}
+
+pub fn preset_by_id(id: &str) -> Option<&'static ProviderPreset> {
+    presets().iter().find(|p| p.id == id)
+}
+
+/// Merge a preset into `.aden/config.toml` (creates the file if missing).
+pub fn apply_preset(dir: &Path, preset_id: &str) -> Result<String, String> {
+    let preset = preset_by_id(preset_id)
+        .ok_or_else(|| format!("unknown preset '{preset_id}' (run: coxn auth setup)"))?;
+    let path = config_path(dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let merged = merge_preset_into_config(&existing, preset);
+    write_config_atomic(&path, &merged)?;
+    let active = format!("{}:{}", preset.instance_id, preset.model);
+    let mut notes = format!("wrote {}\nactive route: {active}\n", path.display());
+    if preset.needs_key {
+        notes.push_str(&format!(
+            "next: export {}=your-api-key\n      or: coxn auth set-key {} < key.txt\n",
+            secret_env_name(preset.instance_id),
+            preset.instance_id
+        ));
+    } else {
+        notes.push_str("no API key needed — run: coxn auth status\n");
+    }
+    Ok(notes)
+}
+
+fn write_config_atomic(path: &std::path::Path, content: &str) -> Result<(), String> {
+    let temp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    std::fs::write(&temp, content).map_err(|e| format!("write {}: {e}", temp.display()))?;
+    std::fs::rename(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("persist {}: {e}", path.display())
+    })
+}
+
+fn merge_preset_into_config(existing: &str, preset: &ProviderPreset) -> String {
+    let section = format!("provider.{}", preset.instance_id);
+    let mut body = remove_section(existing, &section);
+    body = set_route_active(&body, &format!("{}:{}", preset.instance_id, preset.model));
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    if !body.is_empty() && !body.ends_with("\n\n") {
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "[provider.{}]\n\
+         driver = \"{}\"\n\
+         base_url = \"{}\"\n\
+         enabled = true\n",
+        preset.instance_id, preset.driver, preset.base_url
+    ));
+    if let Some(name) = preset.label.split('(').next().map(str::trim) {
+        if !name.is_empty() {
+            body.push_str(&format!("display_name = \"{name}\"\n"));
+        }
+    }
+    body
+}
+
+fn remove_section(text: &str, section_name: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let name = trimmed[1..trimmed.len() - 1].trim();
+            skipping = name == section_name;
+        }
+        if !skipping && (!out.is_empty() || !line.is_empty()) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn set_route_active(text: &str, selection: &str) -> String {
+    let active_line = format!("active = \"{selection}\"");
+    if text.contains("[route]") {
+        let mut out = String::new();
+        let mut in_route = false;
+        let mut wrote_active = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed == "[route]" {
+                in_route = true;
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            if in_route && trimmed.starts_with('[') {
+                if !wrote_active {
+                    out.push_str(&active_line);
+                    out.push('\n');
+                    wrote_active = true;
+                }
+                in_route = false;
+            }
+            if in_route && trimmed.starts_with("active") {
+                out.push_str(&active_line);
+                out.push('\n');
+                wrote_active = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if in_route && !wrote_active {
+            out.push_str(&active_line);
+            out.push('\n');
+        }
+        out.trim_end().to_string()
+    } else {
+        let mut out = text.trim_end().to_string();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("[route]\n");
+        out.push_str(&active_line);
+        out.push('\n');
+        out
+    }
 }
 
 pub fn split_selection(value: &str) -> Option<ModelSelection> {
@@ -343,6 +564,50 @@ mod tests {
             cfg.instance("future").map(|p| &p.driver),
             Some(&ProviderDriver::Unknown("future_driver".to_string()))
         );
+    }
+
+    #[test]
+    fn preset_apply_merges_provider_and_route() {
+        let preset = preset_by_id("openrouter-claude").unwrap();
+        let merged = merge_preset_into_config(
+            "[provider.local]\ndriver = \"openai_compat\"\nbase_url = \"http://localhost:11434/v1\"\n",
+            preset,
+        );
+        assert!(merged.contains("[provider.openrouter]"));
+        assert!(merged.contains("anthropic/claude-sonnet-4"));
+        assert!(merged.contains("[provider.local]"));
+        assert!(merged.contains("active = \"openrouter:anthropic/claude-sonnet-4\""));
+    }
+
+    #[test]
+    fn preset_apply_replaces_existing_provider_section() {
+        let preset = preset_by_id("openai").unwrap();
+        let merged = merge_preset_into_config(
+            "[provider.openai]\ndriver = \"openai_compat\"\nbase_url = \"https://old.example/v1\"\nenabled = false\n",
+            preset,
+        );
+        assert!(merged.contains("https://api.openai.com/v1"));
+        assert!(!merged.contains("old.example"));
+        assert_eq!(merged.matches("[provider.openai]").count(), 1);
+    }
+
+    #[test]
+    fn apply_preset_writes_config_file() {
+        let dir = std::env::temp_dir().join(format!("coxn-preset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        apply_preset(&dir, "lmstudio").expect("apply");
+        let text = std::fs::read_to_string(config_path(&dir)).unwrap();
+        assert!(text.contains("http://localhost:1234/v1"));
+        assert!(text.contains("active = \"local:local\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn presets_include_local_and_cloud() {
+        assert!(preset_by_id("local-ollama").is_some());
+        assert!(preset_by_id("openrouter-gemini").is_some());
+        assert!(preset_by_id("nope").is_none());
     }
 
     #[test]

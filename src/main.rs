@@ -203,6 +203,7 @@ USAGE:
     coxn                 Interactive TUI (default)
     coxn doctor          Health check (model, sandbox, aden, task)
     coxn auth status     Check configured provider auth
+    coxn auth setup      List provider presets; setup <id> writes config
     coxn --version       Print version
     coxn --help          This help
 
@@ -305,10 +306,10 @@ async fn run_tui(dir: &Path) -> io::Result<()> {
     if sel.is_offline_stub() {
         view.output.push_str(
             "\n\n⚠ OFFLINE STUB — no model reachable. This is not a coding agent yet.\n\
-             fix: start Ollama/LM Studio, set COXN_MODEL_BASE_URL, or use /auth for provider setup\n\
-             try: /auth status, /auth login <id>, /model, [r] retry, [q] quit",
+             fix: start Ollama/LM Studio, set COXN_MODEL_BASE_URL, or use /auth setup\n\
+             try: /auth setup, /auth status, /model, [r] retry, [q] quit",
         );
-        view.set_status("OFFLINE STUB  |  /auth status  /model  [r] retry  [q] quit".to_string());
+        view.set_status("OFFLINE STUB  |  /auth setup  /model  [r] retry  [q] quit".to_string());
     }
     if std::env::var("COXN_TASK_NAME")
         .ok()
@@ -2614,10 +2615,10 @@ async fn drive(
                 }
                 if sel.is_offline_stub() {
                     view.output =
-                        "no model reachable — use /auth status, /auth login <id>, /model, or [r] retry"
+                        "no model reachable — use /auth setup, /auth status, /model, or [r] retry"
                             .to_string();
                     view.set_status(
-                        "OFFLINE STUB  |  /auth status  /model  [r] retry  [q] quit".to_string(),
+                        "OFFLINE STUB  |  /auth setup  /model  [r] retry  [q] quit".to_string(),
                     );
                     continue;
                 }
