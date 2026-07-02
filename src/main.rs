@@ -5,6 +5,7 @@
 
 mod aden;
 mod agents;
+mod doctor;
 mod gate;
 mod model;
 mod openai;
@@ -149,12 +150,68 @@ fn transcript(messages: &[Message]) -> String {
         .join("\n\n")
 }
 
+/// True when the user opts into the zero-default-context floor (`COXN_BARE=1`).
+fn bare_mode() -> bool {
+    std::env::var("COXN_BARE")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+}
+
+fn print_cli_help() {
+    println!(
+        "\
+coxn — lean gated terminal harness for coding LLMs
+
+USAGE:
+    coxn                 Interactive TUI (default)
+    coxn doctor          Health check (model, sandbox, aden, task)
+    coxn --version       Print version
+    coxn --help          This help
+
+ENVIRONMENT:
+    COXN_MODEL_BASE_URL  OpenAI-compatible endpoint
+    COXN_MODEL_NAME      Model id (default: local)
+    COXN_MODEL_KEY       API key (never written to config)
+    COXN_BARE=1          Empty system prompt (zero-default-context purists)
+    COXN_TASK_NAME       Task scope (aden blast-radius gate)
+    COXN_TASK_SEEDS      Comma-separated seed symbols
+    COXN_ADEN_BIN        Path to aden binary
+
+See README.md for tools, approval gate, and slash commands."
+    );
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
+    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(arg) = args.first() {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("coxn {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                print_cli_help();
+                return Ok(());
+            }
+            "doctor" => std::process::exit(doctor::run(&dir)),
+            s if s.starts_with('-') => {
+                eprintln!("coxn: unknown flag {s} (try --help)");
+                std::process::exit(2);
+            }
+            _ => {}
+        }
+    }
+
+    run_tui(&dir).await
+}
+
+/// The interactive TUI session.
+async fn run_tui(dir: &Path) -> io::Result<()> {
     // The wiring: a runtime-selected backend and aden-backed pull-context tools
     // rooted at the working directory. The model pulls context (asm/understand)
     // on demand; aden directs, coxn relays.
-    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     // Probe aden availability once at boot. All downstream decisions read from
     // `caps`; nothing shells out to aden a second time for the same question.
@@ -176,14 +233,15 @@ async fn main() -> io::Result<()> {
     // approval at the prompt, and (when a task scope is active) by aden's
     // blast-radius gate on top. read_file is advertised with the editors so the
     // model can fetch the exact text to replace.
-    tools.register(Box::new(ReadFileTool::new(dir.clone())));
-    tools.register(Box::new(EditTool::new(dir.clone())));
-    tools.register(Box::new(WriteTool::new(dir.clone())));
+    let root = dir.to_path_buf();
+    tools.register(Box::new(ReadFileTool::new(root.clone())));
+    tools.register(Box::new(EditTool::new(root.clone())));
+    tools.register(Box::new(WriteTool::new(root.clone())));
     // run_command lets the model close the edit->build->test loop. It is the
     // riskiest tool, so it is always approval-gated and confined by bwrap when
     // present (probed once here; the answer is shown at the approval prompt).
     let bwrap = sandbox::bwrap_available();
-    tools.register(Box::new(RunTool::new(dir.clone(), bwrap)));
+    tools.register(Box::new(RunTool::new(root, bwrap)));
 
     // Take over the terminal and paint a frame first, so the user sees coxn
     // start instead of a frozen blank while the aden subprocess calls below
@@ -215,11 +273,14 @@ async fn main() -> io::Result<()> {
     // slowest aden spawn and is purely cosmetic, so defer it to the first
     // post-turn refresh and let the user reach the prompt sooner.
     view.set_status(boot_status(&sel.name, &task.status, caps.available));
-    // When no model was detected, nudge the user with a one-line hint so the
-    // stub is not silently confusing.
-    if sel.name == "stub" {
-        view.output
-            .push_str("\n\nno model detected -- set COXN_MODEL_BASE_URL or start LM Studio/Ollama");
+    // Offline stub: block chat until a model is reachable (not a silent echo toy).
+    if sel.is_offline_stub() {
+        view.output.push_str(
+            "\n\n⚠ OFFLINE STUB — no model reachable. This is not a coding agent yet.\n\
+             fix: start Ollama/LM Studio, or set COXN_MODEL_BASE_URL\n\
+             [r] retry detection   [q] quit",
+        );
+        view.set_status("OFFLINE STUB  |  [r] retry  [q] quit".to_string());
     }
 
     let result = drive(
@@ -317,6 +378,11 @@ struct ModelSel {
 }
 
 impl ModelSel {
+    /// True when no real provider is configured (offline stub backend).
+    fn is_offline_stub(&self) -> bool {
+        self.endpoint.is_none()
+    }
+
     /// The status-line label tagging the model and how it was resolved.
     fn label(&self) -> String {
         match &self.endpoint {
@@ -784,7 +850,12 @@ fn load_task(dir: &Path, caps: &aden::AdenCaps) -> Task {
     let bare = || Task {
         status: String::new(),
         gate: None,
-        context: None,
+        // Default agent preamble so local models call tools; COXN_BARE=1 opts out.
+        context: if bare_mode() {
+            None
+        } else {
+            Some(AGENT_PREAMBLE_BASE.to_string())
+        },
     };
     let Some(name) = std::env::var("COXN_TASK_NAME")
         .ok()
@@ -1230,6 +1301,30 @@ async fn drive(
             continue;
         };
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        // Offline stub: only retry and quit — no fake chat session.
+        if sel.is_offline_stub() {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                    if let Some(note) = refresh_discovery(dir, pump, sel, true) {
+                        view.output.push('\n');
+                        view.output.push_str(&format!("sys: {note}"));
+                    } else {
+                        view.output.push('\n');
+                        view.output
+                            .push_str("sys: still offline — start a model server and retry");
+                    }
+                    if !sel.is_offline_stub() {
+                        view.output.push_str("\nsys: model online — ready to chat");
+                        view.set_status(boot_status(&sel.name, task, caps.available));
+                    }
+                }
+                (KeyCode::Char('q'), KeyModifiers::NONE)
+                | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
+                _ => {}
+            }
             continue;
         }
 
