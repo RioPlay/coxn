@@ -5,12 +5,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1.0] - 2026-07-02
+
 ### Added (provider setup)
 
 - **`coxn auth setup`**: lists built-in provider presets and writes
   `.aden/config.toml` for local Ollama/LM Studio, OpenAI direct, and
   Claude/GPT/Gemini/Grok via OpenRouter (`/auth setup <id>` in the TUI).
   Keys still live in `COXN_KEY_<INSTANCE>` or `coxn auth set-key`.
+
+### Added (TUI frictionless — M1–M3)
+
+- **Multiline input**: Alt-Enter and Shift-Enter insert newlines; Enter always
+  submits; bracketed paste for multi-line prompts.
+- **Transcript search**: vim-style `/` and `?` in Normal mode; aden symbol-grep
+  moved to `gr`; help overlay moved to `g?`.
+- **Diff hunk rendering**: green/red/cyan diff lines in the approval modal and
+  transcript via `paint_diff_line`.
 
 ### Added (TUI frictionless — M6)
 
@@ -134,5 +145,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (previously they searched only the latent set, which is empty once aden is
   present).
 
-[Unreleased]: https://github.com/RioPlay/coxn/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/RioPlay/coxn/compare/v0.3.1.0...HEAD
+[0.3.1.0]: https://github.com/RioPlay/coxn/compare/v0.2.0...v0.3.1.0
 [0.2.0]: https://github.com/RioPlay/coxn/releases/tag/v0.2.0
