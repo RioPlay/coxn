@@ -95,7 +95,7 @@ pub fn run(dir: &Path) -> i32 {
     }
 }
 
-fn git_dirty(dir: &Path) -> bool {
+pub(crate) fn git_dirty(dir: &Path) -> bool {
     std::process::Command::new("git")
         .args(["-C", &dir.display().to_string(), "status", "--porcelain"])
         .output()
@@ -104,7 +104,7 @@ fn git_dirty(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn session_dir() -> std::path::PathBuf {
+pub(crate) fn session_dir() -> std::path::PathBuf {
     std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
