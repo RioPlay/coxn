@@ -212,6 +212,44 @@ pub fn seeds_from_manifest(path: &Path) -> Result<Vec<String>, AdenError> {
     Ok(seeds)
 }
 
+/// Extract `context.budget` from a scope manifest JSON.
+///
+/// Missing or non-numeric budgets return `Ok(None)` so callers can fall back to
+/// the task-level budget without treating older manifests as errors.
+/// Extract the manifest's `files` mandate (repo-relative paths the scope may
+/// touch). Used by the parallel scheduler to verify two scopes' working-tree
+/// mandates are disjoint before running them concurrently. Missing or
+/// non-array `files` returns `Ok(vec![])` so a manifest without a mandate is
+/// treated as no-known-files (never parallelizable, always serialized).
+pub fn files_from_manifest(path: &Path) -> Result<Vec<String>, AdenError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AdenError::Spawn(format!("reading manifest {}: {}", path.display(), e)))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| AdenError::Failed {
+        code: None,
+        stderr: format!("invalid json in {}: {}", path.display(), e),
+    })?;
+    Ok(v.get("files")
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+pub fn budget_from_manifest(path: &Path) -> Result<Option<u64>, AdenError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AdenError::Spawn(format!("reading manifest {}: {}", path.display(), e)))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| AdenError::Failed {
+        code: None,
+        stderr: format!("invalid json in {}: {}", path.display(), e),
+    })?;
+    Ok(v.get("context")
+        .and_then(|c| c.get("budget"))
+        .and_then(|b| b.as_u64()))
+}
+
 fn pull_with(bin: &str, dir: &Path, what: Pull) -> Result<String, AdenError> {
     let mut cmd = Command::new(bin);
     read_only_aden_env(&mut cmd);
@@ -514,6 +552,45 @@ mod tests {
         std::fs::write(&man, r#"{"name":"t","seeds":["foo","bar"]}"#).unwrap();
         let seeds = seeds_from_manifest(&man).expect("parses");
         assert_eq!(seeds, vec!["foo".to_string(), "bar".to_string()]);
+        let _ = std::fs::remove_file(&man);
+    }
+
+    #[test]
+    fn budget_from_manifest_reads_context_budget() {
+        let _serial = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir();
+        let man = dir.join(format!(
+            "coxn-test-budget-manifest-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&man, r#"{"name":"t","context":{"budget":4096}}"#).unwrap();
+        assert_eq!(budget_from_manifest(&man).expect("parses"), Some(4096));
+
+        std::fs::write(&man, r#"{"name":"t","context":{}}"#).unwrap();
+        assert_eq!(budget_from_manifest(&man).expect("parses"), None);
+        let _ = std::fs::remove_file(&man);
+    }
+
+    #[test]
+    fn files_from_manifest_reads_files_mandate() {
+        let _serial = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir();
+        let man = dir.join(format!(
+            "coxn-test-files-manifest-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&man, r#"{"name":"t","files":["src/a.rs","src/b.rs"]}"#).unwrap();
+        assert_eq!(
+            files_from_manifest(&man).expect("parses"),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+
+        // No `files` key => empty mandate (never parallelizable).
+        std::fs::write(&man, r#"{"name":"t"}"#).unwrap();
+        assert_eq!(
+            files_from_manifest(&man).expect("parses"),
+            Vec::<String>::new()
+        );
         let _ = std::fs::remove_file(&man);
     }
 }

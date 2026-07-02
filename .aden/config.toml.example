@@ -1,0 +1,15 @@
+[provider.local]
+driver = "openai_compat"
+base_url = "http://localhost:11434/v1"
+enabled = true
+
+[provider.openrouter]
+driver = "openai_compat"
+base_url = "https://openrouter.ai/api/v1"
+enabled = false
+
+[route]
+active = "local:qwen2.5-coder"
+scout = "local:qwen2.5-coder"
+synth = "openrouter:anthropic/claude-sonnet-4"
+orchestrate = "local:llama3"

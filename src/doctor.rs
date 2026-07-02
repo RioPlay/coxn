@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::aden;
 use crate::openai;
+use crate::provider;
 use crate::sandbox;
 
 /// Run all checks, print a human-readable report to stdout, return exit code
@@ -30,7 +31,10 @@ pub fn run(dir: &Path) -> i32 {
             .ok()
             .filter(|k| !k.is_empty())
             .is_some();
-        println!("✓ model: {name} @ {base} (env){}", if key { "" } else { " — no COXN_MODEL_KEY" });
+        println!(
+            "✓ model: {name} @ {base} (env){}",
+            if key { "" } else { " — no COXN_MODEL_KEY" }
+        );
         if !key && !base.contains("localhost") && !base.contains("127.0.0.1") {
             warnings = true;
             println!("  warn: cloud endpoint without COXN_MODEL_KEY may 401");
@@ -41,6 +45,59 @@ pub fn run(dir: &Path) -> i32 {
         blocking = true;
         println!("✗ model: OFFLINE STUB — no endpoint reachable");
         println!("  fix: start Ollama/LM Studio, or set COXN_MODEL_BASE_URL");
+    }
+
+    let provider_cfg = provider::load_config(dir);
+    if !provider_cfg.instances.is_empty() {
+        println!();
+        println!("providers:");
+        for instance in &provider_cfg.instances {
+            if !instance.enabled {
+                println!("○ {}: disabled", instance.id);
+                continue;
+            }
+            match &instance.driver {
+                provider::ProviderDriver::OpenAiCompat => {
+                    let base = instance.base_url.as_deref().unwrap_or("(missing base_url)");
+                    let key = provider::secret_for_instance(&instance.id);
+                    if provider::cloud_blocked(base, key.as_deref()) {
+                        blocking = true;
+                        println!(
+                            "✗ {}: {} requires COXN_KEY_{} or COXN_ALLOW_CLOUD=1",
+                            instance.id,
+                            base,
+                            provider::secret_env_name(&instance.id).trim_start_matches("COXN_KEY_")
+                        );
+                    } else {
+                        let auth = if key.is_some() { "key" } else { "no key" };
+                        println!("✓ {}: {} ({auth})", instance.id, base);
+                    }
+                }
+                provider::ProviderDriver::Stub => println!("✓ {}: stub", instance.id),
+                provider::ProviderDriver::Ollama => {
+                    let base = instance
+                        .base_url
+                        .as_deref()
+                        .unwrap_or("http://localhost:11434");
+                    if crate::ollama::reachable(base) {
+                        println!("✓ {}: ollama native @ {base} (no key)", instance.id);
+                    } else {
+                        blocking = true;
+                        println!("✗ {}: ollama not reachable @ {base}", instance.id);
+                    }
+                }
+                provider::ProviderDriver::Codex | provider::ProviderDriver::ClaudeCli => {
+                    println!(
+                        "○ {}: CLI driver configured (execution deferred)",
+                        instance.id
+                    )
+                }
+                provider::ProviderDriver::Unknown(driver) => {
+                    blocking = true;
+                    println!("✗ {}: unknown driver '{}'", instance.id, driver)
+                }
+            }
+        }
     }
 
     // --- Sandbox ---

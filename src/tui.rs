@@ -62,12 +62,39 @@ pub struct MenuItem {
 
 /// An arrow-navigable picker overlaid on the pane. Up/Down move `selected`,
 /// Enter acts on the selected item's `value`, Esc cancels.
+///
+/// Navigation is vim-native: `j`/`k`, `G`/`gg`, `Ctrl-D`/`Ctrl-U`, PageUp/PageDown,
+/// and a `[count]` prefix (`5j`). `scroll` is the index of the topmost visible
+/// row; render re-pins it to keep `selected` on screen. `count` and `pending_g`
+/// are transient key-state (cleared when the menu closes).
 #[derive(Debug, Clone)]
 pub struct Menu {
     pub kind: MenuKind,
     pub title: String,
     pub items: Vec<MenuItem>,
     pub selected: usize,
+    /// Index of the first visible row in the viewport.
+    pub scroll: usize,
+    /// Pending count prefix consumed by the next motion (`3j` -> move 3).
+    pub count: Option<u32>,
+    /// A bare `g` was typed; the next key resolves `gg` (top) or cancels.
+    pub pending_g: bool,
+}
+
+impl Menu {
+    /// Re-pin `scroll` so `selected` stays within `[scroll, scroll+rows)`,
+    /// scrolling only when the selection leaves the window.
+    fn clamp_scroll(&mut self, rows: usize) {
+        if self.items.is_empty() || rows == 0 {
+            return;
+        }
+        let rows = rows.min(self.items.len());
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + rows {
+            self.scroll = self.selected + 1 - rows;
+        }
+    }
 }
 
 /// The view state coxn renders: the streaming output buffer and the status
@@ -179,13 +206,77 @@ impl View {
         self.show_help = false;
     }
 
-    /// Move the picker selection by `delta` (wraps at the ends).
-    pub fn menu_move(&mut self, delta: i32) {
+    /// Move the picker selection by `delta` (clamps at the ends, vim-style;
+    /// no wrap) and re-pin the viewport so the selection stays visible. `rows`
+    /// is the item-row capacity of the menu body, computed by the caller from
+    /// the terminal height (see [`menu_max_rows`]).
+    pub fn menu_step(&mut self, delta: i32, rows: usize) {
         if let Some(menu) = &mut self.menu {
-            let len = menu.items.len() as i32;
-            if len > 0 {
-                menu.selected = (((menu.selected as i32 + delta) % len + len) % len) as usize;
+            if menu.items.is_empty() {
+                return;
             }
+            let len = menu.items.len() as i32;
+            let next = (menu.selected as i32 + delta).clamp(0, len - 1) as usize;
+            menu.selected = next;
+            menu.clamp_scroll(rows);
+        }
+    }
+
+    /// Shift the selection by one full viewport in `dir` (+1 down, -1 up),
+    /// keeping the selection inside the new window. Falls back to a single
+    /// step when the viewport is tiny.
+    pub fn menu_page(&mut self, dir: i32, rows: usize) {
+        if let Some(menu) = &mut self.menu {
+            if menu.items.is_empty() {
+                return;
+            }
+            let step = rows.max(1) as i32 * dir.signum();
+            let len = menu.items.len() as i32;
+            let next = (menu.selected as i32 + step).clamp(0, len - 1) as usize;
+            // Page keeps the previous page's edge row visible for context.
+            menu.selected = next;
+            menu.clamp_scroll(rows);
+        }
+    }
+
+    /// Jump to the first row.
+    pub fn menu_top(&mut self, rows: usize) {
+        if let Some(menu) = &mut self.menu {
+            menu.selected = 0;
+            menu.scroll = 0;
+            menu.clamp_scroll(rows);
+        }
+    }
+
+    /// Jump to the last row.
+    pub fn menu_bottom(&mut self, rows: usize) {
+        if let Some(menu) = &mut self.menu {
+            if !menu.items.is_empty() {
+                menu.selected = menu.items.len() - 1;
+                menu.clamp_scroll(rows);
+            }
+        }
+    }
+
+    /// Back-compat shim: a single step with a viewport large enough to show
+    /// everything (no windowing). Used by tests that drive selection directly.
+    #[cfg(test)]
+    pub fn menu_move(&mut self, delta: i32) {
+        let rows = self
+            .menu
+            .as_ref()
+            .map(|m| m.items.len())
+            .unwrap_or(0)
+            .max(1);
+        self.menu_step(delta, rows);
+    }
+
+    /// Re-pin the viewport to the current selection for the given row
+    /// capacity. Called once per frame so a terminal resize keeps the
+    /// selection on screen even when no key was pressed.
+    pub fn menu_refit(&mut self, rows: usize) {
+        if let Some(menu) = &mut self.menu {
+            menu.clamp_scroll(rows);
         }
     }
 
@@ -193,6 +284,82 @@ impl View {
     #[allow(dead_code)]
     pub fn menu_selected(&self) -> Option<&MenuItem> {
         self.menu.as_ref().and_then(|m| m.items.get(m.selected))
+    }
+
+    /// Decode a key while a picker is open. Vim-native: `j`/`k`, `G`/`gg`,
+    /// `Ctrl-D`/`Ctrl-U`, PageUp/PageDown, Home/End, and a `[count]` prefix
+    /// (`5j`). Arrows and Ctrl-P/N still work for users who have not adopted
+    /// the vim motions. Stateful: the count prefix and a pending `g` (for
+    /// `gg`) live on [`Menu`] so they are cleared when the picker closes.
+    pub fn map_menu_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let menu = self.menu.as_mut()?;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl-C cancels even mid-count / mid-g.
+        if key.code == KeyCode::Char('c') && ctrl {
+            menu.count = None;
+            menu.pending_g = false;
+            return Some(Action::MenuCancel);
+        }
+
+        // Resolve a pending `g`: `gg` jumps to top. Any other key cancels the
+        // pending state and is then handled fresh (its count, if any, was
+        // already consumed before the `g` and is gone).
+        if menu.pending_g {
+            menu.pending_g = false;
+            menu.count = None;
+            if let KeyCode::Char('g') = key.code {
+                return Some(Action::MenuTop);
+            }
+            // Non-g cancels `gg`; fall through and handle the key normally.
+        }
+
+        // Count accumulation: `[1-9][0-9]*`. A bare `0` is End-of-line in vim
+        // but in a one-D list it is a no-op digit, so treat it as End here only
+        // when no count is in progress (matches the input-line `0` motion).
+        if let KeyCode::Char(d) = key.code
+            && d.is_ascii_digit()
+            && !ctrl
+        {
+            let digit = d as u32 - '0' as u32;
+            if digit != 0 || menu.count.is_some() {
+                let acc = menu
+                    .count
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(digit);
+                menu.count = Some(acc);
+                return None;
+            }
+        }
+
+        let n = menu.count.take().unwrap_or(1);
+        let n_step = n as i32;
+        match key.code {
+            KeyCode::Enter => Some(Action::MenuSelect),
+            KeyCode::Esc => Some(Action::MenuCancel),
+            // Linear motion (count repeats).
+            KeyCode::Char('j') | KeyCode::Down if !ctrl => Some(Action::MenuStep(n_step)),
+            KeyCode::Char('k') | KeyCode::Up if !ctrl => Some(Action::MenuStep(-n_step)),
+            KeyCode::Char('n') if ctrl => Some(Action::MenuStep(n_step)),
+            KeyCode::Char('p') if ctrl => Some(Action::MenuStep(-n_step)),
+            // Jumps.
+            KeyCode::Char('G') if !ctrl => Some(Action::MenuBottom),
+            KeyCode::Char('g') if !ctrl => {
+                // Wait for the second `g`. The count (if any) is dropped:
+                // `gg` is a jump-to-top, not a counted motion.
+                menu.pending_g = true;
+                None
+            }
+            KeyCode::Home => Some(Action::MenuTop),
+            KeyCode::End => Some(Action::MenuBottom),
+            // Pages.
+            KeyCode::Char('d') if ctrl => Some(Action::MenuPageDown),
+            KeyCode::Char('u') if ctrl => Some(Action::MenuPageUp),
+            KeyCode::PageDown => Some(Action::MenuPageDown),
+            KeyCode::PageUp => Some(Action::MenuPageUp),
+            // Unknown: drop the count, eat the key (picker owns input).
+            _ => None,
+        }
     }
 
     /// Append a typed character at the cursor position.
@@ -602,6 +769,20 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+/// Visible item-row capacity of a menu body inside a screen of `area_height`
+/// rows. The overlay spends 2 rows on its border and 2 on the blank line +
+/// hint footer, leaving the rest for items. Clamped to `item_count` so an
+/// empty menu stays zero.
+pub fn menu_max_rows(area_height: u16, item_count: usize) -> usize {
+    if item_count == 0 {
+        return 0;
+    }
+    let overhead: u16 = 4;
+    ((area_height.saturating_sub(overhead)) as usize)
+        .min(item_count)
+        .max(1)
+}
+
 // -- Render ---------------------------------------------------------------
 
 /// Render one frame: a ruled output pane, a hairline separator, a one-row status
@@ -902,9 +1083,16 @@ pub fn render(frame: &mut Frame, view: &View) {
         frame.render_widget(Clear, area);
         frame.render_widget(Paragraph::new(body).block(block), area);
     } else if let Some(menu) = &view.menu {
-        // The picker overlay: one row per item; the selected one gets a ›
-        // marker and bold primary text rather than raw reverse-video.
-        let hint = "↑↓ select  Enter choose  Esc cancel";
+        // The picker overlay: a windowed slice of the item list. Only rows
+        // [scroll, scroll+rows) are drawn so long lists stay reachable; the
+        // selected row carries a › marker and bold primary text. Overflow
+        // above/below is signalled by ▴/▾ in the title so the user knows there
+        // is more to scroll to.
+        let hint = "j/k ↑↓  G/gg  PgUp/Dn  Enter  Esc";
+        let count = menu.items.len();
+        let rows = menu_max_rows(frame.area().height, count);
+        let start = menu.scroll.min(count);
+        let end = (start + rows).min(count);
         let width = menu
             .items
             .iter()
@@ -916,6 +1104,8 @@ pub fn render(frame: &mut Frame, view: &View) {
             .items
             .iter()
             .enumerate()
+            .skip(start)
+            .take(end.saturating_sub(start))
             .map(|(i, item)| {
                 if i == menu.selected {
                     Line::from(vec![
@@ -937,8 +1127,10 @@ pub fn render(frame: &mut Frame, view: &View) {
         // Same ACCENT-key / DIM-verb split the modal hint uses, so both overlays
         // treat affordances identically. `hint` above still sizes the box.
         lines.push(Line::from(vec![
-            Span::styled("↑↓", Style::default().fg(ACCENT)),
-            Span::styled(" select  ", Style::default().fg(DIM)),
+            Span::styled("j/k ↑↓", Style::default().fg(ACCENT)),
+            Span::styled(" move  ", Style::default().fg(DIM)),
+            Span::styled("G/gg", Style::default().fg(ACCENT)),
+            Span::styled(" jump  ", Style::default().fg(DIM)),
             Span::styled("Enter", Style::default().fg(ACCENT)),
             Span::styled(" choose  ", Style::default().fg(DIM)),
             Span::styled("Esc", Style::default().fg(ACCENT)),
@@ -946,14 +1138,22 @@ pub fn render(frame: &mut Frame, view: &View) {
         ]));
         let height = lines.len() as u16 + 2;
         let area = centered_rect(width + 6, height, frame.area());
+        let has_above = start > 0 && rows < count;
+        let has_below = end < count && rows < count;
+        let mut title = String::from(" ");
+        if has_above {
+            title.push_str("▴ ");
+        }
+        title.push_str(&menu.title);
+        if has_below {
+            title.push_str(" ▾");
+        }
+        title.push(' ');
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(ACCENT))
             .padding(Padding::horizontal(1))
-            .title(Line::from(Span::styled(
-                format!(" {} ", menu.title),
-                Style::default().fg(DIM),
-            )));
+            .title(Line::from(Span::styled(title, Style::default().fg(DIM))));
         frame.render_widget(Clear, area);
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
@@ -982,6 +1182,13 @@ pub fn render(frame: &mut Frame, view: &View) {
             ("Tab", Some("opens command palette / suggestions")),
             ("? or /help", Some("this help")),
             ("mouse wheel", Some("scrolls transcript")),
+            ("", None),
+            ("PICKER (open menu)", None),
+            ("j/k or ↑↓", Some("move selection")),
+            ("G / gg", Some("jump to bottom / top")),
+            ("Ctrl-D/U, PgUp/Dn", Some("scroll the list one page")),
+            ("5j", Some("repeat a motion (count)")),
+            ("Enter / Esc", Some("choose / cancel")),
             ("", None),
             // Section: modes
             ("MODES", None),
@@ -1127,10 +1334,16 @@ pub enum Action {
     PageDown,
     /// Complete the current input token (Tab).
     Complete,
-    /// Move the picker selection up.
-    MenuUp,
-    /// Move the picker selection down.
-    MenuDown,
+    /// Move the picker selection by a signed step (j/k/↑↓ with optional count).
+    MenuStep(i32),
+    /// Jump the picker to the first row (gg / Home).
+    MenuTop,
+    /// Jump the picker to the last row (G / End).
+    MenuBottom,
+    /// Scroll the picker viewport up one page (Ctrl-U / PageUp).
+    MenuPageUp,
+    /// Scroll the picker viewport down one page (Ctrl-D / PageDown).
+    MenuPageDown,
     /// Act on the selected picker item (Enter).
     MenuSelect,
     /// Close the picker without acting (Esc).
@@ -1192,22 +1405,6 @@ pub fn map_modal_key(key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
-        _ => None,
-    }
-}
-
-/// Map a key event while a picker is open: Up/Down (or Ctrl-P/Ctrl-N) move the
-/// selection, Enter acts, Esc / Ctrl-C cancels. Selected by [`View::menu`].
-pub fn map_menu_key(key: KeyEvent) -> Option<Action> {
-    match (key.code, key.modifiers) {
-        (KeyCode::Up, _) | (KeyCode::Char('k' | 'p'), KeyModifiers::CONTROL) => {
-            Some(Action::MenuUp)
-        }
-        (KeyCode::Down, _) | (KeyCode::Char('j' | 'n'), KeyModifiers::CONTROL) => {
-            Some(Action::MenuDown)
-        }
-        (KeyCode::Enter, _) => Some(Action::MenuSelect),
-        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::MenuCancel),
         _ => None,
     }
 }
@@ -1383,20 +1580,26 @@ mod tests {
     }
 
     #[test]
-    fn menu_navigation_wraps_and_selects() {
+    fn menu_navigation_clamps_and_selects() {
         let mut v = View::new();
         v.open_menu(Menu {
             kind: MenuKind::Model,
             title: "m".to_string(),
             items: vec![menu_item("a"), menu_item("b"), menu_item("c")],
             selected: 0,
+            scroll: 0,
+            count: None,
+            pending_g: false,
         });
-        v.menu_move(-1); // wrap up to the last
-        assert_eq!(v.menu_selected().unwrap().value, "c");
-        v.menu_move(1); // wrap back to the first
+        // Clamps at the ends (vim-like; no wrap).
+        v.menu_move(-1);
         assert_eq!(v.menu_selected().unwrap().value, "a");
         v.menu_move(1);
         assert_eq!(v.menu_selected().unwrap().value, "b");
+        v.menu_move(1);
+        assert_eq!(v.menu_selected().unwrap().value, "c");
+        v.menu_move(1); // past the last stays put
+        assert_eq!(v.menu_selected().unwrap().value, "c");
         v.close_menu();
         assert!(v.menu.is_none());
         // An empty menu does not open.
@@ -1405,17 +1608,139 @@ mod tests {
             title: "s".to_string(),
             items: Vec::new(),
             selected: 0,
+            scroll: 0,
+            count: None,
+            pending_g: false,
         });
         assert!(v.menu.is_none());
+    }
+
+    fn open_menu_for_keys() -> View {
+        let mut v = View::new();
+        v.open_menu(Menu {
+            kind: MenuKind::Commands,
+            title: "pick".to_string(),
+            items: vec![
+                menu_item("0"),
+                menu_item("1"),
+                menu_item("2"),
+                menu_item("3"),
+                menu_item("4"),
+            ],
+            selected: 0,
+            scroll: 0,
+            count: None,
+            pending_g: false,
+        });
+        v
     }
 
     #[test]
     fn menu_keys_map_to_actions() {
         let k = |c| KeyEvent::new(c, KeyModifiers::NONE);
-        assert_eq!(map_menu_key(k(KeyCode::Up)), Some(Action::MenuUp));
-        assert_eq!(map_menu_key(k(KeyCode::Down)), Some(Action::MenuDown));
-        assert_eq!(map_menu_key(k(KeyCode::Enter)), Some(Action::MenuSelect));
-        assert_eq!(map_menu_key(k(KeyCode::Esc)), Some(Action::MenuCancel));
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut v = open_menu_for_keys();
+
+        // Arrows, Ctrl-P/N, and bare j/k all step.
+        assert_eq!(v.map_menu_key(k(KeyCode::Down)), Some(Action::MenuStep(1)));
+        assert_eq!(
+            v.map_menu_key(k(KeyCode::Char('j'))),
+            Some(Action::MenuStep(1))
+        );
+        assert_eq!(v.map_menu_key(ctrl('n')), Some(Action::MenuStep(1)));
+        assert_eq!(v.map_menu_key(k(KeyCode::Up)), Some(Action::MenuStep(-1)));
+        assert_eq!(
+            v.map_menu_key(k(KeyCode::Char('k'))),
+            Some(Action::MenuStep(-1))
+        );
+        assert_eq!(v.map_menu_key(ctrl('p')), Some(Action::MenuStep(-1)));
+
+        // Count prefix repeats the motion.
+        v.menu.as_mut().unwrap().selected = 0;
+        assert_eq!(v.map_menu_key(k(KeyCode::Char('3'))), None);
+        assert_eq!(
+            v.map_menu_key(k(KeyCode::Char('j'))),
+            Some(Action::MenuStep(3))
+        );
+
+        // G / gg / pages / jumps.
+        v.menu.as_mut().unwrap().selected = 0;
+        assert_eq!(
+            v.map_menu_key(k(KeyCode::Char('G'))),
+            Some(Action::MenuBottom)
+        );
+        assert_eq!(v.map_menu_key(k(KeyCode::End)), Some(Action::MenuBottom));
+        assert_eq!(v.map_menu_key(k(KeyCode::Home)), Some(Action::MenuTop));
+        assert_eq!(
+            v.map_menu_key(k(KeyCode::PageDown)),
+            Some(Action::MenuPageDown)
+        );
+        assert_eq!(v.map_menu_key(k(KeyCode::PageUp)), Some(Action::MenuPageUp));
+        assert_eq!(v.map_menu_key(ctrl('d')), Some(Action::MenuPageDown));
+        assert_eq!(v.map_menu_key(ctrl('u')), Some(Action::MenuPageUp));
+
+        // gg is a two-key sequence: first `g` consumes (None), second jumps top.
+        v.menu.as_mut().unwrap().selected = 2;
+        assert_eq!(v.map_menu_key(k(KeyCode::Char('g'))), None);
+        assert!(v.menu.as_ref().unwrap().pending_g);
+        assert_eq!(v.map_menu_key(k(KeyCode::Char('g'))), Some(Action::MenuTop));
+        assert!(!v.menu.as_ref().unwrap().pending_g);
+
+        // A non-g after a pending g clears the state and routes the key.
+        v.menu.as_mut().unwrap().selected = 0;
+        assert_eq!(v.map_menu_key(k(KeyCode::Char('g'))), None);
+        assert_eq!(v.map_menu_key(k(KeyCode::Down)), Some(Action::MenuStep(1)));
+        assert!(!v.menu.as_ref().unwrap().pending_g);
+
+        // Enter / Esc / Ctrl-C.
+        assert_eq!(v.map_menu_key(k(KeyCode::Enter)), Some(Action::MenuSelect));
+        assert_eq!(v.map_menu_key(k(KeyCode::Esc)), Some(Action::MenuCancel));
+        assert_eq!(v.map_menu_key(ctrl('c')), Some(Action::MenuCancel));
+    }
+
+    #[test]
+    fn menu_viewport_follows_selection() {
+        // 20 items in a 10-row-tall screen: body rows = 10 - 4 = 6.
+        let items: Vec<MenuItem> = (0..20).map(|i| menu_item(&format!("row{i}"))).collect();
+        let mut v = View::new();
+        v.open_menu(Menu {
+            kind: MenuKind::Session,
+            title: "long".to_string(),
+            items,
+            selected: 0,
+            scroll: 0,
+            count: None,
+            pending_g: false,
+        });
+        let rows = menu_max_rows(10, 20);
+        assert_eq!(rows, 6);
+
+        // Step past the bottom of the window: scroll follows.
+        for _ in 0..6 {
+            v.menu_step(1, rows);
+        }
+        let m = v.menu.as_ref().unwrap();
+        assert_eq!(m.selected, 6);
+        assert_eq!(m.scroll, 1, "scroll advances to keep selection in view");
+
+        // Page all the way down hits the last row.
+        v.menu_bottom(rows);
+        let m = v.menu.as_ref().unwrap();
+        assert_eq!(m.selected, 19);
+        assert!(m.scroll + rows > 19);
+
+        // Back to top.
+        v.menu_top(rows);
+        let m = v.menu.as_ref().unwrap();
+        assert_eq!(m.selected, 0);
+        assert_eq!(m.scroll, 0);
+
+        // A half-page up from the bottom moves the selection up by `rows`.
+        v.menu_bottom(rows);
+        let before = v.menu.as_ref().unwrap().selected;
+        v.menu_page(-1, rows);
+        let after = v.menu.as_ref().unwrap().selected;
+        assert_eq!(before - after, rows, "page moves one full viewport");
     }
 
     #[test]
