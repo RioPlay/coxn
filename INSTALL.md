@@ -4,7 +4,7 @@
 
 - A model server **or** cloud API key:
   - Local: [Ollama](https://ollama.com) or LM Studio on `:11434` / `:1234`
-  - Cloud: set `COXN_MODEL_BASE_URL` + `COXN_MODEL_KEY`
+  - Cloud: configure a provider profile and set a per-instance key
 - Optional: `bwrap` (bubblewrap) for filesystem/network sandbox
 - Optional: [aden](https://github.com/RioPlay/aden) ≥ 0.2.0 for blast-radius scope gate
 
@@ -22,9 +22,39 @@ Requires Rust ≥ 1.85 (edition 2024).
 
 ```sh
 coxn doctor
+coxn auth status
 ```
 
 Exit `0` = ready, `1` = blocking (no model), `2` = warnings (no bwrap, etc.).
+
+## Provider profiles
+
+For local-first use, coxn auto-detects Ollama and LM Studio. For external
+OpenAI-compatible providers, add profiles to `.aden/config.toml`:
+
+```toml
+[provider.openrouter]
+driver = "openai_compat"
+base_url = "https://openrouter.ai/api/v1"
+enabled = true
+
+[route]
+active = "openrouter:anthropic/claude-sonnet-4"
+```
+
+Keep secrets out of the repo:
+
+```sh
+export COXN_KEY_OPENROUTER=sk-or-...
+export COXN_ALLOW_CLOUD=1
+```
+
+`COXN_ALLOW_CLOUD=1` is required only when no key is resolved. A key can also
+live in `~/.config/coxn/secrets/openrouter.key`:
+
+```sh
+coxn auth set-key openrouter < key.txt
+```
 
 ## Quick start
 

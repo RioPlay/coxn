@@ -1,0 +1,494 @@
+= coxn next-generation harness plan
+:revdate: 2026-07-01
+:status: execution plan
+
+This plan turns coxn from a strong baseline TUI LLM harness into a next-generation
+coding harness without violating the original laws: coxn stays a dumb pump,
+aden owns graph context and blast-radius scope, and the model acts.
+
+KISS rule: every phase must either reduce coupling, make scoped execution more
+correct, or make the gate easier to trust. Provider expansion and parallelism are
+last because they multiply bugs in the core loop.
+
+== Outcome
+
+The target product is:
+
+* A terminal-native harness that can run one scoped agent or a partition of
+  scoped sub-agents.
+* Every action is gated, recorded, resumable, and explainable after the fact.
+* The scope-escape demo is obvious enough that a new user understands the wedge
+  in one minute.
+* The implementation remains boring Rust modules around the existing `Pump`,
+  `ToolRegistry`, `Gate`, `ProviderConfig`, and aden subprocess seams.
+
+== Non-goals
+
+Do not build these in this pass:
+
+* A custom planner in coxn. aden emits partitions; coxn executes them.
+* A provider platform. Keep provider support behind `AnyModel`.
+* A browser graph viewer. `aden view` owns that surface.
+* Full parallel execution before sequential `/execute` is validated and resumable.
+* A large rewrite. Extract structure first, then move behavior unchanged.
+
+== Current baseline
+
+Already present:
+
+* TUI chat, streaming, Vim input, help overlay, command picker, model picker.
+* OpenAI-compatible providers, provider instances, route table, auth commands.
+* Human approval, session approval, command approval by exact command string.
+* bwrap sandbox, env scrubbing, no-network default for commands.
+* `read_file`, `grep`, `glob`, `edit`, `write_file`, `run_command`.
+* Optional aden tools: `asm`, `understand`, `grep`, `ask`, `locate`, `impact`.
+* Scope gate: apply edit, run `impact-diff --scope`, revert on violation.
+* Sessions, resume, headless `coxn once`, sequential `/execute` foundation.
+
+Main gaps:
+
+* `src/main.rs` is too large and owns too many concerns.
+* `/execute` exists but lacks budgets, role tool subsets, adaptive stopping,
+  resumability, and live validation on a real partition.
+* There is no first-class run ledger for approvals, edits, gate verdicts,
+  command output, usage, and sub-agent results.
+* The gate wedge lacks a polished demo.
+* Native Ollama and CLI-backed providers are not core-loop blockers.
+
+== Target shape
+
+[source,text]
+----
+main.rs
+  |
+  v
+app.rs              owns app startup and high-level session wiring
+commands.rs         parses and executes slash/ex commands
+execute.rs          runs aden partitions, sequential first
+run_ledger.rs       appends machine-readable run events
+provider.rs         keeps provider config and resolution
+pump.rs             stays the model/tool/gate loop
+tui.rs + vim.rs     stay input and rendering
+tools.rs            stays tool definitions and schemas
+aden.rs             stays subprocess seam
+----
+
+Keep dependencies unchanged unless a phase proves a standard library solution is
+too fragile. JSONL can use existing `serde_json`; no database.
+
+== Workstream A: extract architecture first
+
+Goal: make later changes easy by separating orchestration from terminal input.
+No behavior changes.
+
+=== A1. Add `src/app.rs`
+
+Move startup/session assembly out of `main.rs`:
+
+* `run_tui`
+* boot status helpers
+* model refresh/discovery glue
+* app-level state structs if needed
+
+Acceptance:
+
+* `main.rs` keeps CLI argument routing and calls into `app`.
+* No user-visible behavior changes.
+* `cargo test` passes.
+
+=== A2. Add `src/commands.rs`
+
+Move command parsing and command execution helpers:
+
+* `Command`
+* `parse_command`
+* command completion candidates
+* pure command helpers that do not need terminal ownership
+
+Keep TUI-specific rendering decisions in `app` or `tui`, not in the parser.
+
+Acceptance:
+
+* Existing command parser tests move with the module.
+* Parser remains pure and cheap to test.
+* `/help`, `/model`, `/tools`, `/agents`, `/execute`, `/auth`, `/scope`,
+  `/trust`, `/copy`, `/session`, `/resume`, `/edit`, `/clear`, `/quit` behave
+  the same.
+
+=== A3. Add `src/execute.rs`
+
+Move partition execution out of `main.rs`:
+
+* `execute_partition`
+* `render_agents`
+* partition context assembly helpers
+
+Do not add parallelism here. The point is to make the sequential runner visible
+and testable.
+
+Acceptance:
+
+* `execute.rs` owns only partition execution.
+* `agents.rs` continues to own index parsing and dependency ordering.
+* `pump.rs` remains ignorant of partitions.
+
+== Workstream B: make sequential sub-agents correct
+
+Goal: make `/execute` trustworthy before making it faster.
+
+=== B1. Per-role tool subsets
+
+Add an explicit tool policy per sub-agent role. Keep the default permissive
+enough to preserve current behavior, then tighten where obvious.
+
+Suggested defaults:
+
+[cols="1,3"]
+|===
+| Role | Tools
+
+| `scout`
+| read-only tools: `read_file`, `grep`, `glob`, aden tools.
+
+| `synth`
+| read tools plus `edit` and `write_file`.
+
+| `orchestrate`
+| read tools plus `run_command`; file mutation only if its manifest allows it.
+
+| unmapped role
+| current full registry, with approval and gate still enforced.
+|===
+
+KISS implementation:
+
+* Add `ToolPolicy` in `tools.rs` or `execute.rs`.
+* Build a registry from a policy using the existing tool constructors.
+* Do not add TOML policy config until the defaults are proven wrong.
+
+Acceptance:
+
+* Unit tests prove `scout` cannot mutate.
+* `/agents` displays each role and its effective tool class.
+* A blocked role reports "tool unavailable for role" as a model-visible tool
+  result, not a panic.
+
+=== B2. Per-scope budgets
+
+Honor the budget aden already emits in each manifest when available.
+
+KISS implementation:
+
+* Extend the existing manifest parsing only enough to read `context.budget`.
+* Store budget on an `ExecuteScope` struct.
+* Pass the budget into context assembly and the prompt as a hard instruction.
+* Track usage from `Pump::last_usage()` after each sub-agent.
+
+Acceptance:
+
+* A manifest with `context.budget` changes the assembled context budget.
+* The run report shows requested budget and observed usage when provider usage
+  is available.
+* Missing budget falls back to `COXN_TASK_BUDGET`.
+
+=== B3. Adaptive stopping
+
+Stop a sub-agent when it is no longer making useful progress.
+
+KISS rules:
+
+* Keep the existing pump hop cap.
+* Add a per-sub-agent max turn/tool-call count.
+* Stop if the model repeats the same tool error twice.
+* Stop if no file changed and no new dense finding appears after a synth turn.
+
+Acceptance:
+
+* Tests cover repeated tool-error stop.
+* Stopped sub-agent returns a dense failure summary for downstream scopes.
+* The whole `/execute` run continues only when dependencies allow it.
+
+=== B4. Live validation
+
+Run `/execute` on a real aden partition in this repo or a small fixture repo.
+
+Acceptance:
+
+* Log shows different role selections where route config specifies them.
+* Scout does read-only work.
+* Synth can edit inside its manifest.
+* Out-of-scope edit is reverted.
+* Merge/orchestrate receives upstream dense results.
+
+== Workstream C: add a run ledger
+
+Goal: make every run inspectable and resumable without a database.
+
+=== C1. Define event types
+
+Add `src/run_ledger.rs`. Use append-only JSONL under:
+
+----
+$XDG_DATA_HOME/coxn/runs/<run_slug>.jsonl
+----
+
+Event shape:
+
+[source,json]
+----
+{
+  "ts": "2026-07-01T00:00:00Z",
+  "run": "fix-parser-20260701-001122",
+  "kind": "tool_call",
+  "scope": "fix-parser-0",
+  "role": "scout",
+  "data": {}
+}
+----
+
+Start with these event kinds:
+
+* `run_started`
+* `scope_started`
+* `model_selected`
+* `assistant_delta`
+* `tool_call`
+* `approval`
+* `tool_result`
+* `file_edit`
+* `command_output`
+* `gate_verdict`
+* `usage`
+* `scope_finished`
+* `run_finished`
+
+KISS rule: record facts only. Do not build analysis in the ledger writer.
+
+Acceptance:
+
+* Ledger write failure does not break the TUI run.
+* Events are one JSON object per line.
+* Sensitive values are redacted before writing.
+
+=== C2. Wire ledger into the pump boundary
+
+The right boundary is `TurnIo`, not inside model/provider code.
+
+Add ledger hooks where coxn already observes facts:
+
+* approval prompt result
+* streamed assistant deltas
+* streamed command output
+* tool call/result
+* gate outcome
+* usage after turn
+
+Acceptance:
+
+* A normal chat turn produces a ledger.
+* A gated edit records approval, edit, gate verdict, and final state.
+* A declined tool records the decline.
+
+=== C3. Add `/runs`
+
+Keep the first UI primitive tiny:
+
+* `/runs` lists recent run slugs.
+* `/runs <slug>` prints a compact text summary.
+
+No TUI dashboard yet.
+
+Acceptance:
+
+* The user can inspect a completed `/execute` run after restarting coxn.
+* Summary includes scopes, models, approvals, edits, gate blocks, commands,
+  usage, and final status.
+
+== Workstream D: recovery and resume
+
+Goal: make long `/execute` runs restartable.
+
+=== D1. Persist scope status
+
+Use the run ledger as the source of truth.
+
+Status derivation:
+
+[source,text]
+----
+scope_started without scope_finished  -> interrupted
+scope_finished success                -> complete
+scope_finished error                  -> failed
+missing scope_started                 -> pending
+----
+
+Acceptance:
+
+* A helper can derive partition status from a ledger and current aden index.
+* Missing or malformed events are ignored with a warning.
+
+=== D2. Add `/execute --resume`
+
+Resume skips complete scopes and restarts failed/interrupted scopes.
+
+KISS rule: do not replay model context from old transcripts. Rebuild scope
+context from aden and prepend dense upstream results from completed scopes.
+
+Acceptance:
+
+* Completed scopes are not rerun.
+* Failed scope can be rerun after a provider or gate problem is fixed.
+* Downstream scopes wait for dependencies to complete.
+
+== Workstream E: make the wedge visible
+
+Goal: make the gate obvious to a new user.
+
+=== E1. Add `scripts/demo-scope-escape.sh`
+
+The demo should create a small throwaway repo, generate an aden scope, then show:
+
+1. in-scope edit succeeds
+2. out-of-scope edit is blocked
+3. file is reverted after the block
+4. command output labels sandbox state
+
+Acceptance:
+
+* Script is deterministic.
+* Script leaves its temp directory path visible.
+* Script does not require cloud keys.
+
+=== E2. README proof
+
+Add a short "Why coxn is different" section:
+
+* approval is human gate
+* bwrap is OS gate
+* aden is blast-radius gate
+* blocked edit is reverted
+
+Add a terminal recording or GIF once the script is stable.
+
+Acceptance:
+
+* A new user can understand the wedge without reading `DESIGN.adoc`.
+
+== Workstream F: parallelism after correctness
+
+Goal: reduce wall-clock only after sequential execution is proven.
+
+Prerequisites:
+
+* B1-B4 complete.
+* C ledger complete.
+* D resume complete.
+* aden guarantees disjoint file mandates for parallel scopes.
+
+KISS implementation:
+
+* Run only dependency-independent scopes in parallel.
+* Cap concurrency with `COXN_EXECUTE_JOBS`, default `1`.
+* Each sub-agent gets its own `Pump`, `ToolRegistry`, manifest gate, model, and
+  ledger scope id.
+* Serialize terminal output through the run ledger and print compact status lines.
+
+Acceptance:
+
+* `COXN_EXECUTE_JOBS=1` is identical to sequential behavior.
+* `COXN_EXECUTE_JOBS=2` runs independent scopes concurrently.
+* A failing scope blocks dependents but not unrelated independent scopes.
+* Gate verdicts remain correct on dirty working trees.
+
+== Workstream G: provider expansion last
+
+Goal: widen reach without disturbing the harness loop.
+
+Order:
+
+1. Native Ollama `/api/chat`, because it fixes streaming-plus-tools for local users.
+2. Codex auth probe via `app-server initialize` + `account/read`.
+3. CLI-backed provider MVP for Codex, text-only first.
+4. Claude CLI design after Codex proves the piggyback seam.
+5. Anthropic-direct only if native caching or exact billing is worth the adapter.
+
+Acceptance:
+
+* Each provider lands behind `AnyModel`.
+* The pump does not learn provider-specific concepts.
+* Tool calling support is explicit per provider: supported, partial, or unavailable.
+
+== Suggested commit slices
+
+Use small commits in this order:
+
+1. `refactor(app): extract app startup from main`
+2. `refactor(commands): move slash command parser`
+3. `refactor(execute): isolate partition runner`
+4. `feat(execute): apply per-role tool policies`
+5. `feat(execute): honor sub-scope budgets`
+6. `feat(execute): stop stalled sub-agents`
+7. `feat(runs): append run ledger events`
+8. `feat(runs): summarize recent runs`
+9. `feat(execute): resume incomplete partition runs`
+10. `docs/demo: add scope escape demo`
+11. `feat(execute): run independent scopes concurrently`
+12. `feat(provider): add native ollama chat profile`
+
+== Test plan
+
+Every phase:
+
+* `cargo fmt --check`
+* `cargo clippy -- -D warnings`
+* `cargo test`
+
+Extra tests by phase:
+
+* Architecture extraction: moved tests still pass with no behavior changes.
+* Tool policies: role registry tests prove scout cannot mutate.
+* Budgets: manifest budget parsing and fallback tests.
+* Adaptive stopping: repeated tool error and hop-limit tests.
+* Ledger: JSONL append, redaction, malformed-line tolerance.
+* Resume: derive status from ledger and skip completed scopes.
+* Demo: script exits zero and proves revert.
+* Parallelism: deterministic fixture with two independent scopes and one dependent.
+
+== Risk register
+
+[cols="1,2,2"]
+|===
+| Risk | Failure mode | Mitigation
+
+| Big refactor
+| Behavior changes hide inside file moves.
+| Move code first with tests only; no feature changes in A1-A3.
+
+| Ledger leaks secrets
+| API keys or command env values land in JSONL.
+| Record summaries and redacted data only; test redaction.
+
+| Resume reuses stale context
+| A rerun sees old transcript state instead of current code.
+| Rebuild from aden scope each time; reuse only dense completed summaries.
+
+| Parallel gate false blocks
+| One agent sees another agent's dirty diff.
+| Require disjoint mandates and keep jobs default `1`.
+
+| Provider churn distracts
+| CLI backends consume time before harness is trustworthy.
+| Keep providers after execution correctness and ledger.
+|===
+
+== Definition of done
+
+This plan is done when:
+
+* `main.rs` is mostly CLI glue, not the app.
+* `/execute` can run a real partition sequentially with role tools and budgets.
+* Every `/execute` run writes a useful ledger and can be summarized.
+* Interrupted `/execute` runs can resume.
+* The README/demo proves the gate and revert behavior.
+* Parallel execution is opt-in and preserves sequential semantics at jobs `1`.
+* Provider expansion does not alter `Pump` semantics.

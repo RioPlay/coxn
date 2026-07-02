@@ -157,6 +157,74 @@ commits; 101 tests green, clippy/fmt clean, still six deps):
 
 * [x] `coxn once -p` with `COXN_AUTO_APPROVE=1` + `BatchIo`
 
+== Phase N (provider): profiles, auth, cloud opt-in -- OPEN
+
+Spec: `docs/provider-auth-plan.adoc` (delegation plan; T3 Code patterns).
+
+* [x] N0 Spec lock: plan + this ledger (no code)
+* [x] N1 Provider instance types + `[provider.*]` config load (`src/provider.rs`)
+* [x] N2 `resolve_instance` / `instance:model` routing + secrets + `COXN_ALLOW_CLOUD` gate
+* [x] N3 `coxn auth status|login|set-key` + doctor per-instance rows
+* [x] N4 `/model`, `/execute`, status line wired to instances
+* [x] N5 Docs + example config (OpenRouter preset, INSTALL)
+* [ ] N6 (optional) CLI piggyback backend (`codex`/`claude` subprocess)
+* [ ] N7 (parallel) `main.rs` → `app.rs` extract (Phase K)
+* [x] N8 T3-derived hardening: provider slug/env validation, unknown-driver unavailable state, atomic secrets
+* [ ] N9 Codex app-server auth probe (`initialize` + `account/read`)
+* [ ] N10 Claude/OpenRouter environment presets + CLI backend design
+* [ ] N11 CLI-backed provider MVP (`AnyModel::CliPiggyback`)
+
+== Phase O (next-generation harness): scoped execution and observability -- OPEN
+
+Spec: `docs/next-generation-harness-plan.adoc` (KISS execution plan).
+
+* [~] O1 Architecture extraction: `src/commands.rs` owns slash parsing/completion;
+      `src/execute.rs` owns sequential + parallel partition execution;
+      `src/app.rs` owns the model-selection + session-wiring core (`Endpoint`,
+      `ModelSel`, `openai_model`/`ollama_model`, `resolve_instance_from_config`,
+      `resolve_role`, `task_config`, `AGENT_PREAMBLE_*`); `main.rs` shrank
+      2915->2755 lines to CLI routing + the TUI drive loop. The full `run_tui`
+      / drive-loop extract into `app.rs` remains open (high blind-refactor risk;
+      PTY-validated, no automated test).
+* [x] O2 Sequential sub-agent correctness: per-role `ToolPolicy` tool subsets and
+      per-scope budgets (`budget_from_manifest` -> prompt, usage in the run
+      report); adaptive stopping via the global hop cap + repeated-tool-error
+      abort; a configurable per-sub-agent turn cap (`Pump::set_max_turns`,
+      `COXN_SUBAGENT_MAX_TURNS`). Live gate validation:
+      `scripts/demo-scope-escape.sh` proves in-scope/scope-escape/revert against
+      real aden 0.2.0 on a fixture repo. A model-driven partition run (scout /
+      synth / orchestrate role selection end to end) is the remaining
+      live-validation open item -- it needs a live model; the gate wedge it
+      rests on is now demonstrated.
+* [x] O3 Run ledger: append-only JSONL events (`src/run_ledger.rs`) for run
+      start/resume, scope start/finish, and run finish; secret redaction;
+      `summarize`/`list`/`scope_statuses`/`latest_for_task`; `COXN_RUNS_DIR`
+      override (also a test hook). The opt-in parallel path records coarse
+      events (granular per-tool events are emitted only on the sequential path).
+* [x] O4 Resume: `run_ledger::latest_for_task` + `scope_statuses` feed
+      `RunLedger::open`; `/execute --resume` is parsed, plumbed, and drives
+      partition continuation (resume always takes the trusted sequential path).
+* [x] O5 Wedge demo: `scripts/demo-scope-escape.sh` (deterministic, no cloud
+      keys, requires `aden`) proves in-scope edit allowed, out-of-scope edit
+      blocked (exit 1), file reverted to HEAD, and `coxn doctor` labels the
+      sandbox state. README gained a "Why coxn is different" three-gate wedge
+      section (human / OS / blast-radius, blocked edit reverted).
+* [x] O6 Parallel execution: opt-in via `COXN_EXECUTE_JOBS` (default `1`,
+      clamped `1..=8`). Correctness invariant -- `impact-diff` judges the whole
+      working tree, so only READ-ONLY scopes run concurrently on worker threads
+      (their pump never invokes the gate); mutating scopes serialize on the
+      driving thread. `jobs == 1` (or `--resume`) takes the unchanged
+      sequential path. Non-Send pump state is built + run inside each worker
+      (`current_thread` runtime per thread); only Send-safe `ScopeInput`
+      crosses the boundary.
+* [x] O7 Provider expansion: native Ollama `/api/chat` backend
+      (`AnyModel::Ollama`, `src/ollama.rs`; NDJSON streaming, function tools,
+      usage from `prompt_eval_count`/`eval_count`, tool-call dedup) behind
+      `ProviderDriver::Ollama`, with `ollama_model`, `/auth` + `/doctor`
+      reachability probes. Live Ollama smoke test pending (no `ollama` binary on
+      this host); the wire format is unit-tested. Codex probe + CLI piggyback
+      backend remain open (Phase N9-N11).
+
 == Notes / decisions
 
 * Live validation (against a real third-party codebase, 42k-contract aden store): the full aden seam -- `scope`, `impact-diff --scope` (in-scope AND scope-escape on a dirty tree), `asm` (bare seeds resolve), `status` savings, `config` -- all confirmed against real aden 0.2.0. The TUI loop confirmed against LM Studio gpt-oss-20b: auto-detect, grounded reply on a real symbol, tool-calling round-trip.
