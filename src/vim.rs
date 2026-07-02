@@ -70,8 +70,22 @@ pub enum Outcome {
     /// The user typed a `:command` and pressed Enter. The string is trimmed.
     /// Mode is reset to Normal and `cmdline` is cleared before this is returned.
     Command(String),
-    /// Toggle the help overlay (`?` in Normal mode).
+    /// Toggle the help overlay. Traditionally `?` in Normal mode; M2 moves it
+    /// to `g?` because `?` becomes the backward transcript-search prompt.
     ToggleHelp,
+    /// Open the transcript search prompt forward (`/` in Normal mode). The
+    /// host installs a search field; typed characters build the query, Enter
+    /// commits and jumps to the first match, Esc cancels, `n`/`N` cycle.
+    SearchForward,
+    /// Open the transcript search prompt backward (`?` in Normal mode).
+    /// Same host handling as [`Outcome::SearchForward`] with reversed cycle.
+    SearchBackward,
+    /// Jump to the next active search match (`n` in Normal mode while a
+    /// search is already committed; no-op if no active search).
+    SearchNext,
+    /// Jump to the previous active search match (`N` in Normal mode while a
+    /// search is already committed; no-op if no active search).
+    SearchPrev,
     /// Vim-native aden symbol lookup from input-line word at cursor.
     /// e.g. K or gd on a symbol word while composing.
     AdenLookup(String),
@@ -259,6 +273,19 @@ impl Vim {
                 // `gg` -> top of the ledger.
                 ('g', KeyCode::Char('g')) => Outcome::Scroll(Scroll::Top),
 
+                // `g?` -> toggle help overlay (M2 rebinding: `?` now opens
+                // backward transcript search, so help moves under the `g`
+                // prefix that the existing `gg`/`gd`/`ga`/`gi`/`gv` family
+                // already uses).
+                ('g', KeyCode::Char('?')) => Outcome::ToggleHelp,
+                // `gr` -> aden grep on word at cursor. Aden symbol-grep was on
+                // bare `/` in Normal mode and moved here so `/` can become
+                // the transcript-search prompt (vim-native / behavior).
+                ('g', KeyCode::Char('r')) => {
+                    let sym = word_at_cursor(text, *cursor).unwrap_or_default();
+                    Outcome::AdenGrep(sym)
+                }
+
                 // `gd` -> aden understand/locate on word at cursor (vim go-to-def style).
                 ('g', KeyCode::Char('d')) => {
                     let sym = word_at_cursor(text, *cursor).unwrap_or_default();
@@ -312,6 +339,10 @@ impl Vim {
         match key.code {
             KeyCode::Enter => Outcome::Submit,
             KeyCode::Esc => Outcome::Consumed,
+            // `n` / `N` cycle the active transcript search (M2). No-op when no
+            // search is committed: the host checks `view.search` state.
+            KeyCode::Char('n') if !ctrl => Outcome::SearchNext,
+            KeyCode::Char('N') if !ctrl => Outcome::SearchPrev,
             // Ledger navigation (may carry a count).
             KeyCode::Char('d') if ctrl => Outcome::Scroll(Scroll::HalfPageDown),
             KeyCode::Char('u') if ctrl => Outcome::Scroll(Scroll::HalfPageUp),
@@ -456,30 +487,18 @@ impl Vim {
             // Arrow scrolling and page keys: not vim Normal-mode bindings; the
             // host handles them via map_input_key (ScrollUp/Down, PageUp/Down).
             KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => Outcome::Pass,
-            // `?` toggles the help overlay (Normal mode only).
-            KeyCode::Char('?') if !ctrl => Outcome::ToggleHelp,
+            // `/` opens the transcript-search prompt forward (vim-native).
+            // Aden symbol-grep moved to `gr` (above); Insert-mode `/foo`
+            // slash commands are unaffected (Insert mode Passes this key).
+            KeyCode::Char('/') if !ctrl => Outcome::SearchForward,
+            // `?` opens transcript search backward (vim-native). The
+            // help overlay moved to `g?` because `?` is taken.
+            KeyCode::Char('?') if !ctrl => Outcome::SearchBackward,
             // Vim-native aden lookups (K = lookup like man/K in vim; gd like go-def).
             // Extracts word at cursor from the (chat) input line and signals host.
             KeyCode::Char('K') if !ctrl => {
                 let sym = word_at_cursor(text, *cursor).unwrap_or_default();
                 Outcome::AdenLookup(sym)
-            }
-            // / : aden grep / fuzzy search on word at cursor (plan fuzzy + gm).
-            // Falls back to current input text as pattern for ease when cursor not on word.
-            KeyCode::Char('/') if !ctrl => {
-                let sym = word_at_cursor(text, *cursor).or_else(|| {
-                    let t = text.trim();
-                    if t.is_empty() {
-                        None
-                    } else {
-                        Some(t.to_string())
-                    }
-                });
-                if let Some(s) = sym {
-                    Outcome::AdenGrep(s)
-                } else {
-                    Outcome::Consumed
-                }
             }
             // ] : simple graph nav flavor - aden communities (or impact context).
             KeyCode::Char(']') if !ctrl => Outcome::AdenCommunities,
@@ -1153,12 +1172,33 @@ mod tests {
         let res_gv = v4.handle(&mut t4, &mut c4, k('v'));
         assert!(matches!(res_gv, Outcome::AdenView(s) if s.contains("parse")));
         // /
+        // M2: bare `/` in Normal mode opens transcript search forward.
         let mut v5 = Vim::new();
         let mut t5 = "foo_bar".to_string();
         let mut c5 = 0;
         v5.handle(&mut t5, &mut c5, esc());
         let res_slash = v5.handle(&mut t5, &mut c5, k('/'));
-        assert!(matches!(res_slash, Outcome::AdenGrep(s) if s.contains("foo")));
+        assert_eq!(res_slash, Outcome::SearchForward);
+        // `gr` is the new aden-grep binding.
+        v5.handle(&mut t5, &mut c5, esc());
+        v5.handle(&mut t5, &mut c5, k('g'));
+        let res_gr = v5.handle(&mut t5, &mut c5, k('r'));
+        assert!(matches!(res_gr, Outcome::AdenGrep(s) if s.contains("foo")));
+        // `g?` toggles help (was bare `?`).
+        v5.handle(&mut t5, &mut c5, esc());
+        v5.handle(&mut t5, &mut c5, k('g'));
+        let res_gq = v5.handle(&mut t5, &mut c5, k('?'));
+        assert_eq!(res_gq, Outcome::ToggleHelp);
+        // `?` opens backward search.
+        v5.handle(&mut t5, &mut c5, esc());
+        let res_q = v5.handle(&mut t5, &mut c5, k('?'));
+        assert_eq!(res_q, Outcome::SearchBackward);
+        // `n`/`N` cycle the active search (no-op without one at the engine
+        // level; the host checks search state).
+        let res_n = v5.handle(&mut t5, &mut c5, k('n'));
+        assert_eq!(res_n, Outcome::SearchNext);
+        let res_capn = v5.handle(&mut t5, &mut c5, k('N'));
+        assert_eq!(res_capn, Outcome::SearchPrev);
         // ]
         let mut v6 = Vim::new();
         let mut t6 = String::new();

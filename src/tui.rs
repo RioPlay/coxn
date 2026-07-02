@@ -151,6 +151,73 @@ pub struct View {
     /// Inline ghost-text suggestion (dim) for /commands as you type (Tab or
     /// Right to accept). Populated live for better discoverability of commands.
     pub suggestion: Option<String>,
+    /// Active transcript search (M2). `None` when no search has been opened.
+    /// A search is "open" (interactive prompt active) while `query_open` is
+    /// true; after Enter commits, `query_open` flips to false but `matches` /
+    /// `current` persist so `n`/`N` can cycle until the user cancels or opens
+    /// a new search.
+    pub search: Option<SearchState>,
+}
+
+/// Linear-match transcript search state (M2). Matches are record-by-line
+/// substring (case-sensitive substring for MVP; can be promoted to a regex
+/// or fuzzy comparator in M5 with zero View API change).
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    /// Live pattern the user is typing in the search prompt. Once committed
+    /// (`query_open == false`) this is the pattern the matches are scored
+    /// against -- editing it re-scores.
+    pub query: String,
+    /// True while the search prompt is editing (before Enter). After Enter,
+    /// this flips to false and `current` pins to the first match found from
+    /// the search direction.
+    pub query_open: bool,
+    /// Backward search (`?`) reverses the cycle direction of `n`. Forward
+    /// search (`/`) is the default.
+    pub backward: bool,
+    /// Indices into the OUTPUT record lines that match the current `query`.
+    /// Recomputed live as `query` changes (incremental search).
+    pub matches: Vec<usize>,
+    /// Index into `matches` of the current cursor; `n` advances, `N` retreats
+    /// (or vice versa under backward). Wraps around the end.
+    pub current: usize,
+}
+
+impl SearchState {
+    /// Score the query against the output and refresh `matches`. Empty query
+    /// clears matches so the search prompt shows "0 matches" honestly.
+    /// Pure in `output`; `current` is clamped to the match range so a stale
+    /// cursor never points past the end of `matches`.
+    fn rescore(&mut self, output: &str) {
+        self.matches.clear();
+        if self.query.is_empty() {
+            self.current = 0;
+            return;
+        }
+        for (i, line) in output.lines().enumerate() {
+            if line.contains(&self.query) {
+                self.matches.push(i);
+            }
+        }
+        if self.current >= self.matches.len() {
+            self.current = 0;
+        }
+    }
+
+    /// Forward / backward aware step. Returns the *next* cursor index after
+    /// advancing in the search direction (`backward` means `N` advances and
+    /// `n` retreats; vim lets users redefine, we keep it simple).
+    /// Wraps mod-len so cycles never get stuck at the ends.
+    fn step(&mut self, advance: i32) {
+        if self.matches.is_empty() {
+            self.current = 0;
+            return;
+        }
+        let len = self.matches.len() as i32;
+        let cur = self.current as i32;
+        let next = ((cur + advance) % len + len) % len;
+        self.current = next as usize;
+    }
 }
 
 impl View {
@@ -196,6 +263,77 @@ impl View {
     /// Close the picker.
     pub fn close_menu(&mut self) {
         self.menu = None;
+    }
+
+    // -- M2 transcript search -------------------------------------------
+    /// Open the search prompt with the given direction (`/` forward, `?`
+    /// backward). Clears any prior search; query starts empty so the user
+    /// types a fresh pattern.
+    pub fn search_open(&mut self, backward: bool) {
+        let mut st = SearchState {
+            query_open: true,
+            backward,
+            ..SearchState::default()
+        };
+        st.rescore(&self.output);
+        self.search = Some(st);
+    }
+
+    /// Push a character into the live search query (re-scores matches).
+    pub fn search_push(&mut self, c: char) {
+        if let Some(st) = &mut self.search {
+            st.query.push(c);
+            st.rescore(&self.output);
+        }
+    }
+
+    /// Delete the last character of the live search query (Backspace).
+    pub fn search_backspace(&mut self) {
+        if let Some(st) = &mut self.search {
+            if st.query.pop().is_some() {
+                st.rescore(&self.output);
+            }
+        }
+    }
+
+    /// Commit the search (Enter). Stops editing and pins `current` to the
+    /// first match in cycle order; viewport snapping happens in `render`.
+    pub fn search_commit(&mut self) {
+        if let Some(st) = &mut self.search {
+            st.query_open = false;
+            st.current = st.current.min(st.matches.len().saturating_sub(1));
+            if !st.matches.is_empty() {
+                st.current = 0;
+            }
+        }
+    }
+
+    /// Cancel the search and drop its state entirely (Esc).
+    pub fn search_cancel(&mut self) {
+        self.search = None;
+    }
+
+    /// Walk the active search by one step. `n` advances along the match list
+    /// in the search direction (`?` flips the polarity); `N` is the inverse.
+    pub fn search_step(&mut self, advance: i32) {
+        let backward = self.search.as_ref().map(|s| s.backward).unwrap_or(false);
+        let effective = if backward { -advance } else { advance };
+        if let Some(st) = &mut self.search {
+            st.step(effective);
+        }
+    }
+
+    /// True while a search prompt is still open for editing (before Enter).
+    pub fn search_editing(&self) -> bool {
+        self.search.as_ref().map(|s| s.query_open).unwrap_or(false)
+    }
+
+    /// The visual-line index for the current committed match, if any.
+    pub fn search_match_line(&self) -> Option<usize> {
+        self.search
+            .as_ref()
+            .filter(|s| !s.matches.is_empty())
+            .and_then(|s| s.matches.get(s.current).copied())
     }
 
     /// Toggle the help overlay on or off.
@@ -746,34 +884,66 @@ fn rule_breath(elapsed_ms: u128, pending: bool) -> Color {
 /// `coxn:` answer stays PRIMARY throughout while raw `tool:` output recedes to
 /// DIM -- the brightness follows the voice, not the line shape. While `pending`,
 /// the final line is brightened to [`SHIMMER`] so streaming output reads as live.
-fn styled_output(output: &str, pending: bool) -> Text<'static> {
+/// Build the transcript paragraphs with optional search-match tinting.
+/// Matched lines get a reverse-video ACCENT overlay on their body span so
+/// the user can see where `n`/`N` will land; the *current* match (the one the
+/// viewport has snapped to) is rendered with PRIMARY+REVERSED so it is the
+/// brightest, while other matches are ACCENT-dim.
+fn styled_output_with_search(
+    output: &str,
+    pending: bool,
+    search: Option<&SearchState>,
+) -> Text<'static> {
     let last = output.lines().count().saturating_sub(1);
     // The body color of the turn currently being rendered; continuation lines
     // adopt it until the next role line changes it.
     let mut owner_body = SECONDARY;
+    let matches = search.map(|s| &s.matches).cloned().unwrap_or_default();
+    let current_match_line = search.and_then(|s| {
+        if s.matches.is_empty() {
+            None
+        } else {
+            s.matches.get(s.current).copied()
+        }
+    });
     let lines: Vec<Line<'static>> = output
         .lines()
         .enumerate()
         .map(|(idx, raw)| {
             let live = pending && idx == last;
+            let matched = matches.contains(&idx);
+            let current = current_match_line == Some(idx);
+            let highlight = if current {
+                Some(
+                    Style::default()
+                        .fg(PRIMARY)
+                        .add_modifier(Modifier::REVERSED),
+                )
+            } else if matched {
+                Some(Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED))
+            } else {
+                None
+            };
             if let Some(prefix) = ROLE_PREFIXES.iter().find(|&&p| raw.starts_with(p)) {
                 owner_body = role_body_color(prefix);
                 let after = &raw[prefix.len()..];
                 let rest = after.strip_prefix(' ').unwrap_or(after);
                 let body = if live { SHIMMER } else { owner_body };
+                let body_style = highlight.unwrap_or(Style::default().fg(body));
                 Line::from(vec![
                     Span::styled(
                         format!("{} ", role_sigil(prefix)),
                         Style::default().fg(role_color(prefix)),
                     ),
-                    Span::styled(rest.to_string(), Style::default().fg(body)),
+                    Span::styled(rest.to_string(), body_style),
                 ])
             } else {
                 // Continuation: aligned under the role text, inheriting its color.
                 let body = if live { SHIMMER } else { owner_body };
+                let body_style = highlight.unwrap_or(Style::default().fg(body));
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(raw.to_string(), Style::default().fg(body)),
+                    Span::styled(raw.to_string(), body_style),
                 ])
             }
         })
@@ -985,16 +1155,41 @@ pub fn render(frame: &mut Frame, view: &View) {
     let from_bottom = view.scroll_offset.min(max_scrollback);
     let scroll_row = max_scrollback - from_bottom;
 
+    // Search snap (M2): if a committed search holds a current match, pin the
+    // viewport to that line so `n`/`N` brings the match into view. The user's
+    // manual scroll (`Up/Down`, PgUp/Dn) is reset by the snap -- matches always
+    // come to the user instead of the user having to find them.
+    let search_is_committed = view
+        .search
+        .as_ref()
+        .map(|s| !s.query_open && s.matches.len() > 1)
+        .unwrap_or(false);
+    let snapped_scroll_row = if search_is_committed {
+        // Center the match vertically inside the pane; clamp at the scrollback edges.
+        view.search_match_line()
+            .map(|target_line| {
+                let target = (target_line as u16).saturating_sub((pane_height as u16) / 2);
+                target.min(max_scrollback)
+            })
+            .unwrap_or(scroll_row)
+    } else {
+        scroll_row
+    };
+
     // The left rule is the Block border; one column of padding sets text off it.
-    let output_widget = Paragraph::new(styled_output(&view.output, pending))
-        .block(
-            Block::default()
-                .borders(Borders::LEFT)
-                .border_style(Style::default().fg(RULE))
-                .padding(Padding::new(1, 0, 0, 0)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_row, 0));
+    let output_widget = Paragraph::new(styled_output_with_search(
+        &view.output,
+        pending,
+        view.search.as_ref(),
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(RULE))
+            .padding(Padding::new(1, 0, 0, 0)),
+    )
+    .wrap(Wrap { trim: false })
+    .scroll((snapped_scroll_row, 0));
 
     // -- Separator: a hairline that breathes while a turn runs ---
     // A `└` corner on the first column joins the left rule to the hairline so the
@@ -1135,10 +1330,50 @@ pub fn render(frame: &mut Frame, view: &View) {
     frame.render_widget(output_widget, pane);
     frame.render_widget(separator, areas[1]);
     frame.render_widget(Paragraph::new(Line::from(status_spans)), areas[2]);
-    frame.render_widget(
-        Paragraph::new(prompt_text).wrap(Wrap { trim: false }),
-        areas[3],
-    );
+    // Search prompt (M2): an editing search overlays the input row with its
+    // own prompt symbol (`/` or `?`) + the live query + match counter. A
+    // committed-but-still-active search also gets a 1-row hint reading
+    // "[n] next [N] prev [Esc] clear" so cycling is discoverable.
+    if let Some(st) = &view.search {
+        let prompt_sym = if st.backward { "?" } else { "/" };
+        let mut spans = vec![
+            Span::styled(prompt_sym.to_string(), Style::default().fg(ACCENT)),
+            Span::styled(" ", Style::default().fg(ACCENT)),
+            Span::styled(st.query.clone(), Style::default().fg(SECONDARY)),
+            Span::styled(
+                " ".to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED),
+            ),
+        ];
+        if st.query_open {
+            // Live edit: show running match count.
+            spans.push(Span::styled(
+                format!("  [{} match]", st.matches.len()),
+                Style::default().fg(DIM),
+            ));
+        } else {
+            // Committed: cycling hint.
+            spans.push(Span::styled(
+                format!("  [{} of {}]  ", st.current + 1, st.matches.len()),
+                Style::default().fg(DIM),
+            ));
+            spans.push(Span::styled("[n]", Style::default().fg(ACCENT)));
+            spans.push(Span::styled(" next ", Style::default().fg(DIM)));
+            spans.push(Span::styled("[N]", Style::default().fg(ACCENT)));
+            spans.push(Span::styled(" prev ", Style::default().fg(DIM)));
+            spans.push(Span::styled("[Esc]", Style::default().fg(ACCENT)));
+            spans.push(Span::styled(" clear", Style::default().fg(DIM)));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+            areas[3],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(prompt_text).wrap(Wrap { trim: false }),
+            areas[3],
+        );
+    }
 
     if let Some(prompt) = &view.modal {
         let hint = "[y] proceed   [n] block";
@@ -2107,9 +2342,10 @@ mod tests {
 
     #[test]
     fn styled_output_labels_prefixes() {
-        let text = styled_output(
+        let text = styled_output_with_search(
             "you: hello\ncoxn: world\ntool: ok\nsys: info\nunknown",
             false,
+            None,
         );
         assert_eq!(text.lines.len(), 5);
         // Role lines: a gutter sigil span, then the role text (prefix stripped).
@@ -2125,10 +2361,10 @@ mod tests {
     #[test]
     fn styled_output_shimmers_last_line_when_pending() {
         // While pending, the final line is brightened to SHIMMER; not otherwise.
-        let pending = styled_output("coxn: a\ncoxn: b", true);
+        let pending = styled_output_with_search("coxn: a\ncoxn: b", true, None);
         assert_eq!(pending.lines[1].spans[1].style.fg, Some(SHIMMER));
         assert_eq!(pending.lines[0].spans[1].style.fg, Some(PRIMARY));
-        let idle = styled_output("coxn: a\ncoxn: b", false);
+        let idle = styled_output_with_search("coxn: a\ncoxn: b", false, None);
         assert_eq!(idle.lines[1].spans[1].style.fg, Some(PRIMARY));
     }
 
@@ -2314,13 +2550,62 @@ mod tests {
     }
 
     #[test]
-    fn vim_question_mark_in_normal_returns_toggle_help() {
+    fn vim_question_mark_in_normal_opens_search_backward() {
+        // M2 rebinding: `?` is backward transcript search (was help).
+        // Help moved to `g?`.
         use crate::vim::Outcome;
         let mut view = View::new();
         // Enter Normal mode first.
         view.vim.handle(&mut view.input, &mut view.cursor, esc());
         let out = view.vim.handle(&mut view.input, &mut view.cursor, k('?'));
+        assert_eq!(out, Outcome::SearchBackward);
+    }
+
+    #[test]
+    fn vim_g_question_mark_toggles_help() {
+        // M2: help overlay moved to `g?` so `?` can become the backward
+        // search prompt.
+        use crate::vim::Outcome;
+        let mut view = View::new();
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        view.vim.handle(&mut view.input, &mut view.cursor, k('g'));
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, k('?'));
         assert_eq!(out, Outcome::ToggleHelp);
+    }
+
+    #[test]
+    fn vim_gr_in_normal_emits_aden_grep() {
+        // M2: aden symbol-grep moved from bare `/` to `gr`.
+        use crate::vim::Outcome;
+        let mut view = View::new();
+        view.input_push_str("foo_bar");
+        view.cursor_home();
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        view.vim.handle(&mut view.input, &mut view.cursor, k('g'));
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, k('r'));
+        assert!(matches!(out, Outcome::AdenGrep(s) if s.contains("foo")));
+    }
+
+    #[test]
+    fn vim_slash_in_normal_opens_search_forward() {
+        // M2: transcript forward search instead of aden-grep.
+        use crate::vim::Outcome;
+        let mut view = View::new();
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, k('/'));
+        assert_eq!(out, Outcome::SearchForward);
+    }
+
+    #[test]
+    fn vim_n_in_normal_cycles_search() {
+        // M2: `n` cycles the active transcript search when there is one.
+        use crate::vim::Outcome;
+        let mut view = View::new();
+        view.vim.handle(&mut view.input, &mut view.cursor, esc());
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, k('n'));
+        assert_eq!(out, Outcome::SearchNext);
+        let out = view.vim.handle(&mut view.input, &mut view.cursor, k('N'));
+        assert_eq!(out, Outcome::SearchPrev);
     }
 
     #[test]
@@ -2581,5 +2866,172 @@ mod tests {
         // Multi-line render must not panic for an embedded \n at the start.
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).expect("test backend");
         terminal.draw(|frame| render(frame, &view)).expect("draw");
+    }
+
+    // -- M2: transcript search -------------------------------------------------
+
+    #[test]
+    fn m2_search_open_is_editing_empty() {
+        let mut view = View::new();
+        view.search_open(false);
+        assert!(
+            view.search_editing(),
+            "freshly opened search is in edit mode"
+        );
+        assert_eq!(
+            view.search.as_ref().unwrap().query,
+            "",
+            "query starts empty"
+        );
+        assert!(
+            view.search.as_ref().unwrap().matches.is_empty(),
+            "empty query matches nothing"
+        );
+    }
+
+    #[test]
+    fn m2_search_push_rescords_matches_live() {
+        let mut view = View::new();
+        view.push("you: hello world\ncoxn: hello there\nyou: bye\n");
+        view.search_open(false);
+        // Type 'h' -- should match the two lines containing 'h'.
+        view.search_push('h');
+        let st = view.search.as_ref().unwrap();
+        assert_eq!(st.matches.len(), 2, "h matches two lines");
+        assert!(st.matches.contains(&0), "line 0 matches: {:?}", st.matches);
+        assert!(st.matches.contains(&1));
+    }
+
+    #[test]
+    fn m2_search_commit_pins_to_first_match() {
+        let mut view = View::new();
+        view.push("you: foo\ncoxn: foo bar\nyou: baz\n");
+        view.search_open(false);
+        view.search_push('f');
+        view.search_push('o');
+        view.search_push('o');
+        view.search_commit();
+        let st = view.search.as_ref().unwrap();
+        assert!(!st.query_open, "commit drops the edit bit");
+        assert_eq!(st.current, 0, "current indexes match 0");
+        assert_eq!(view.search_match_line(), Some(0), "match line is line 0");
+    }
+
+    #[test]
+    fn m2_search_step_cycles_wraps() {
+        let mut view = View::new();
+        view.push("you: foo\ncoxn: foo bar\nyou: baz foo\n");
+        view.search_open(false);
+        view.search_push('f');
+        view.search_push('o');
+        view.search_push('o');
+        view.search_commit();
+        // Three matches: lines 0/1/2 (all contain 'foo'). Stepping through
+        // them wraps 0 -> 1 -> 2 -> 0.
+        let got = |v: &View| v.search_match_line();
+        assert_eq!(got(&view), Some(0));
+        view.search_step(1);
+        assert_eq!(got(&view), Some(1));
+        view.search_step(1);
+        assert_eq!(got(&view), Some(2));
+        view.search_step(1);
+        assert_eq!(got(&view), Some(0), "wrap-around afterlast");
+    }
+
+    #[test]
+    fn m2_search_backward_flips_n_direction() {
+        let mut view = View::new();
+        view.push("you: foo\ncoxn: foo bar\nyou: baz foo\n");
+        view.search_open(true); // ? -> backward
+        view.search_push('f');
+        view.search_push('o');
+        view.search_push('o');
+        view.search_commit();
+        let got = |v: &View| v.search_match_line();
+        assert_eq!(got(&view), Some(0));
+        // `n` in backward retreats; under our model that means stepping -1
+        // against advancing match list (wraps to last).
+        view.search_step(1); // n under backward == retreat
+        assert_eq!(
+            got(&view),
+            Some(2),
+            "n under backward retreats/wraps to last"
+        );
+    }
+
+    #[test]
+    fn m2_search_cancel_drops_state() {
+        let mut view = View::new();
+        view.push("you: foo\n");
+        view.search_open(false);
+        view.search_push('f');
+        view.search_cancel();
+        assert!(view.search.is_none());
+        assert!(!view.search_editing());
+    }
+
+    #[test]
+    fn m2_search_backspace_edits_query() {
+        let mut view = View::new();
+        view.push("you: foo\ncoxn: foo bar\n");
+        view.search_open(false);
+        view.search_push('f');
+        view.search_push('o');
+        view.search_push('o');
+        // Backspace twice cuts 'foo' to 'f'.
+        view.search_backspace();
+        view.search_backspace();
+        let st = view.search.as_ref().unwrap();
+        assert_eq!(st.query, "f");
+    }
+
+    #[test]
+    fn m2_render_paints_search_prompt_when_editing() {
+        // The search-prompt bar replaces the input row while editing.
+        let mut view = View::new();
+        view.push("you: hello world\n");
+        view.search_open(false);
+        view.search_push('h');
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        // The 1 match counter and the live query 'h' should both be present
+        // in the rendered text.
+        let text = buffer_text(&terminal).replace('\u{1b}', "");
+        assert!(text.contains("/ h"), "live query 'h' shown: {text:?}");
+        assert!(text.contains("match"), "match counter: {text:?}");
+    }
+
+    #[test]
+    fn m2_render_tints_match_lines_when_committed() {
+        // A committed search highlights matched transcript lines. We assert
+        // the highlighted signature via the render buffer's reverse-video
+        // cells on a match-bearing line. The clearest signal is the count
+        // of cells with REVERSED modifier on the row of the matched line.
+        let mut view = View::new();
+        view.push("you: foo\ncoxn: bar\n");
+        view.search_open(false);
+        view.search_push('f');
+        view.search_push('o');
+        view.search_push('o');
+        view.search_commit();
+        // 'foo' appears once (line 0); render must show it highlighted.
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        // Walk row 0 of the output pane area and assert at least one cell
+        // receives REVERSED. The output pane area starts at the top of the
+        // frame; row 0 corresponds to line 0 of the output ("you: foo").
+        let buffer = terminal.backend().buffer();
+        let reversed_in_top: usize = (0..40)
+            .map(|x| &buffer[(x, 0)])
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .count();
+        assert!(
+            reversed_in_top > 0,
+            "matched line must highlight with REVERSED cells, found {reversed_in_top}"
+        );
     }
 }
