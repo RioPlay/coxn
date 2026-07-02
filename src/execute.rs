@@ -10,8 +10,9 @@ use crate::app::{
 use crate::model::{AnyModel, ToolCall, Usage};
 use crate::pump::{Approval, TurnIo};
 use crate::pump::{BatchIo, Pump};
+use crate::tools::register_aden_tools;
 use crate::tools::{EditTool, GlobTool, GrepTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
-use crate::{aden, agents, gate, provider, register_aden_tools, run_ledger};
+use crate::{aden, agents, gate, provider, run_ledger};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolPolicy {

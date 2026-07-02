@@ -252,6 +252,41 @@ impl ToolRegistry {
     }
 }
 
+/// Register the five aden read tools.
+///
+/// When `available` is true, each tool is registered as active so the model can
+/// use dense aden retrieval from turn one. When false, nothing is registered;
+/// the `aden_tools` discovery seam will report an empty catalog, which is honest.
+///
+/// Idempotent: if aden tools are already active, it does nothing. This lets the
+/// discovery refresh call it whenever aden might have appeared mid-session without
+/// ever double-registering. Returns `true` only when it actually added the tools.
+pub fn register_aden_tools(tools: &mut ToolRegistry, dir: &Path, available: bool) -> bool {
+    if !available || tools.has_aden() {
+        return false;
+    }
+    tools.register(Box::new(AdenTool::asm(dir.to_path_buf())));
+    tools.register(Box::new(AdenTool::understand(dir.to_path_buf())));
+    tools.register(Box::new(AdenTool::grep(dir.to_path_buf())));
+    tools.register(Box::new(AdenTool::ask(dir.to_path_buf())));
+    tools.register(Box::new(AdenTool::locate(dir.to_path_buf())));
+    true
+}
+
+/// Build the standard tool registry for a session (aden + read/grep/glob/edit/run).
+pub fn build_registry(dir: &Path, caps: &crate::aden::AdenCaps, bwrap: bool) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    register_aden_tools(&mut tools, dir, caps.available);
+    let root = dir.to_path_buf();
+    tools.register(Box::new(ReadFileTool::new(root.clone())));
+    tools.register(Box::new(GrepTool::new(root.clone())));
+    tools.register(Box::new(GlobTool::new(root.clone())));
+    tools.register(Box::new(EditTool::new(root.clone())));
+    tools.register(Box::new(WriteTool::new(root.clone())));
+    tools.register(Box::new(RunTool::new(root, bwrap)));
+    tools
+}
+
 /// A trivial tool that returns its arguments verbatim. Kept only to exercise the
 /// dispatch path in tests; the live binary advertises no such tool (the real
 /// tools are aden's, discovered on demand), so it is test-only.

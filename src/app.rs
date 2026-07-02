@@ -3,7 +3,8 @@
 //! The model-selection core (provider resolution, the `ModelSel`/`Endpoint`
 //! types, the OpenAI-compat and native Ollama constructors, role routing, the
 //! task-env config, and the agent preambles) lives here so `main.rs` can stay
-//! focused on CLI routing and the TUI drive loop. `execute.rs` imports these
+//! focused on CLI routing; the TUI drive loop lives in `drive.rs`. `execute.rs`
+//! imports these
 //! directly from this module; `main.rs` re-exports them so its existing call
 //! sites are unchanged.
 //!

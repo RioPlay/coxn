@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Phase K architecture extract**: `run_tui`, `drive`, and TUI helpers moved
+  from `main.rs` to `src/drive.rs`; `main.rs` is CLI routing only (87 LOC).
+  `build_registry` and `register_aden_tools` moved to `tools.rs`. No behaviour
+  change; 298 tests green.
+
 ## [0.3.1.0] - 2026-07-02
 
 ### Added (provider setup)

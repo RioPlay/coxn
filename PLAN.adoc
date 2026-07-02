@@ -150,9 +150,9 @@ commits; 101 tests green, clippy/fmt clean, still six deps):
 
 * [x] `OllamaModel` `/api/chat` profile (streaming + tools on `:11434`) — see `src/ollama.rs`
 
-== Phase K (architecture): extract app.rs -- PARTIAL
+== Phase K (architecture): extract drive loop -- DONE (main.rs target met)
 
-* [~] Move `drive` + command parsing out of `main.rs` (< 400 LOC target). `app.rs` holds model-selection + session wiring (222 LOC); `commands.rs` + `execute.rs` extracted; `main.rs` still ~3074 LOC (drive loop remains).
+* [x] Move `run_tui` + `drive` + TUI helpers out of `main.rs` into `src/drive.rs` (~2955 LOC). `main.rs` is CLI routing only (87 LOC). `build_registry`/`register_aden_tools` moved to `tools.rs`. `app.rs` holds model-selection + session wiring (222 LOC); `commands.rs` + `execute.rs` already extracted.
 
 == Phase M (automation): headless -- DONE
 
@@ -196,9 +196,8 @@ Spec: `docs/next-generation-harness-plan.adoc` (KISS execution plan).
       `src/app.rs` owns the model-selection + session-wiring core (`Endpoint`,
       `ModelSel`, `openai_model`/`ollama_model`, `resolve_instance_from_config`,
       `resolve_role`, `task_config`, `AGENT_PREAMBLE_*`); `main.rs` is CLI
-      routing + the TUI drive loop (~3074 LOC). The full `run_tui` /
-      drive-loop extract into `app.rs` remains open (Phase K; high blind-refactor
-      risk; PTY-validated, no automated test).
+      routing only (87 LOC); the TUI drive loop lives in `drive.rs` (Phase K
+      done; 298 tests green, no behaviour change).
 * [x] O2 Sequential sub-agent correctness: per-role `ToolPolicy` tool subsets and
       per-scope budgets (`budget_from_manifest` -> prompt, usage in the run
       report); adaptive stopping via the global hop cap + repeated-tool-error

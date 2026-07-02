@@ -883,7 +883,7 @@ impl View {
     /// shows the dim "p " completion.
     pub fn refresh_suggestion(&mut self) {
         self.suggestion = if self.input.starts_with('/') {
-            super::complete_input(&self.input).and_then(|full| {
+            crate::commands::complete_input(&self.input).and_then(|full| {
                 if full.len() > self.input.len() && full.starts_with(&self.input) {
                     Some(full[self.input.len()..].to_string())
                 } else {
