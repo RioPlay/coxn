@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (TUI frictionless — M5)
+
+- **Mouse + OSC52 clipboard**: picker row clicks select; gate-modal hint zone
+  answers proceed/block; click-to-place-cursor in the input box; wheel scroll;
+  drag-select in the transcript copies via OSC52 when `COXN_CLIPBOARD=on` or
+  `1` (emitted after frame flush). Mouse is ignored while the help overlay is
+  open.
+
 ### Added (TUI frictionless — M4)
 
 - **Fuzzy command palette** (`Ctrl-Space`): subsequence-filtered picker unifying

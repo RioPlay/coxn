@@ -12,6 +12,7 @@ mod doctor;
 mod execute;
 mod gate;
 mod model;
+mod mouse;
 mod ollama;
 mod openai;
 mod provider;
@@ -29,7 +30,8 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 
 use app::{
     AGENT_PREAMBLE_ADEN, AGENT_PREAMBLE_BASE, ModelSel, openai_model, resolve_instance_from_config,
@@ -37,6 +39,7 @@ use app::{
 };
 use commands::{Command, complete_input, parse_command};
 use model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
+use mouse::{MouseEffect, frame_layout, handle_mouse, osc52_copy};
 use pump::{Approval, BatchIo, Pump, TurnIo};
 use tools::{
     AdenTool, EditTool, GlobTool, GrepTool, ReadFileTool, RunTool, ToolRegistry, WriteTool,
@@ -1284,6 +1287,194 @@ async fn run_once(dir: &Path, args: &[String]) -> io::Result<()> {
     }
 }
 
+/// Apply a picker choice (keyboard Enter or mouse row click).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_menu_pick(
+    view: &mut View,
+    pump: &mut Pump<AnyModel>,
+    dir: &Path,
+    sel: &mut ModelSel,
+    task: &str,
+    trust: &Trust,
+    kind: MenuKind,
+    value: String,
+    persisted: &mut usize,
+    approvals: &mut HashSet<String>,
+    approved_commands: &mut HashSet<String>,
+    session: &mut session::Session,
+) {
+    match kind {
+        MenuKind::Model => {
+            view.output = switch_model(dir, pump, sel, &value);
+            view.set_status(status_line(
+                dir,
+                &sel.label(),
+                task,
+                pump.last_usage(),
+                view.aden_active,
+                trust,
+            ));
+        }
+        MenuKind::Session => {
+            let messages = session::load(&value);
+            if messages.is_empty() {
+                view.output = format!("no session '{value}'");
+            } else {
+                *persisted = messages.len();
+                pump.load_conversation(messages);
+                approvals.clear();
+                approved_commands.clear();
+                *session = session::Session::open(&value);
+                view.output = transcript(pump.messages());
+                view.set_status(status_line(
+                    dir,
+                    &sel.label(),
+                    task,
+                    pump.last_usage(),
+                    view.aden_active,
+                    trust,
+                ));
+            }
+        }
+        MenuKind::Commands => {
+            if value.starts_with("ADEN_UNDERSTAND:") {
+                let sym = value.strip_prefix("ADEN_UNDERSTAND:").unwrap_or("");
+                if pump.registry_mut().has_aden() {
+                    match aden::pull(dir, aden::Pull::Understand(sym)) {
+                        Ok(out) => {
+                            append_aden(view, &format!("understand '{}'", sym), &out);
+                            view.last_aden = Some(format!("understand '{}'", sym));
+                        }
+                        Err(e) => view
+                            .output
+                            .push_str(&format!("\naden: understand failed: {e}")),
+                    }
+                } else {
+                    view.output
+                        .push_str(&format!("\naden: (not present) would understand: {}", sym));
+                }
+                view.snap_to_bottom();
+            } else if value.starts_with("ADEN_VIEW:") {
+                let sym = value.strip_prefix("ADEN_VIEW:").unwrap_or("");
+                if pump.registry_mut().has_aden() {
+                    match aden::launch_view(dir, Some(sym)) {
+                        Ok(()) => {
+                            view.output
+                                .push_str(&format!("\naden: launched view for '{}'", sym));
+                            view.last_aden = Some(format!("view '{}'", sym));
+                        }
+                        Err(e) => view.output.push_str(&format!("\naden: view failed: {e}")),
+                    }
+                } else {
+                    view.output
+                        .push_str(&format!("\naden: (not present) would view: {}", sym));
+                }
+                view.snap_to_bottom();
+            } else if value.starts_with("ADEN_IMPACT:") {
+                let sym = value.strip_prefix("ADEN_IMPACT:").unwrap_or("");
+                if pump.registry_mut().has_aden() {
+                    match aden::pull(dir, aden::Pull::Impact(sym)) {
+                        Ok(out) => {
+                            append_aden(view, &format!("impact '{}'", sym), &out);
+                            view.last_aden = Some(format!("impact '{}'", sym));
+                        }
+                        Err(e) => view.output.push_str(&format!("\naden: impact failed: {e}")),
+                    }
+                } else {
+                    view.output
+                        .push_str(&format!("\naden: (not present) would impact: {}", sym));
+                }
+                view.snap_to_bottom();
+            } else if value == "ADEN_COMMUNITIES" {
+                if pump.registry_mut().has_aden() {
+                    match aden::communities(dir) {
+                        Ok(out) => {
+                            append_aden(view, "communities", &out);
+                            view.last_aden = Some("communities".to_string());
+                        }
+                        Err(e) => view
+                            .output
+                            .push_str(&format!("\naden: communities failed: {e}")),
+                    }
+                } else {
+                    view.output
+                        .push_str("\naden: (not present) would show communities");
+                }
+                view.snap_to_bottom();
+            } else if value == "ADEN_DOCTOR" {
+                if pump.registry_mut().has_aden() {
+                    match aden::doctor(dir) {
+                        Ok(out) => {
+                            append_aden(view, "doctor", &out);
+                            view.last_aden = Some("doctor".to_string());
+                        }
+                        Err(e) => view.output.push_str(&format!("\naden: doctor failed: {e}")),
+                    }
+                } else {
+                    view.output
+                        .push_str("\naden: (not present) would run doctor");
+                }
+                view.snap_to_bottom();
+            } else if value == "ADEN_AUDIT" {
+                if pump.registry_mut().has_aden() {
+                    match aden::audit(dir) {
+                        Ok(out) => {
+                            append_aden(view, "audit", &out);
+                            view.last_aden = Some("audit".to_string());
+                        }
+                        Err(e) => view.output.push_str(&format!("\naden: audit failed: {e}")),
+                    }
+                } else {
+                    view.output
+                        .push_str("\naden: (not present) would run audit");
+                }
+                view.snap_to_bottom();
+            } else {
+                view.input = value;
+                view.cursor_end();
+                view.refresh_suggestion();
+            }
+        }
+        MenuKind::Palette => {
+            if let Some(name) = value.strip_prefix("model:") {
+                view.output = switch_model(dir, pump, sel, name);
+                view.set_status(status_line(
+                    dir,
+                    &sel.label(),
+                    task,
+                    pump.last_usage(),
+                    view.aden_active,
+                    trust,
+                ));
+            } else if let Some(slug) = value.strip_prefix("session:") {
+                let messages = session::load(slug);
+                if messages.is_empty() {
+                    view.output = format!("no session '{slug}'");
+                } else {
+                    *persisted = messages.len();
+                    pump.load_conversation(messages);
+                    approvals.clear();
+                    approved_commands.clear();
+                    *session = session::Session::open(slug);
+                    view.output = transcript(pump.messages());
+                    view.set_status(status_line(
+                        dir,
+                        &sel.label(),
+                        task,
+                        pump.last_usage(),
+                        view.aden_active,
+                        trust,
+                    ));
+                }
+            } else if let Some(text) = value.strip_prefix("input:") {
+                view.input = text.to_string();
+                view.cursor_end();
+                view.refresh_suggestion();
+            }
+        }
+    }
+}
+
 /// The event loop: draw, read a key, route it by mode (modal vs input), and run
 /// a turn on submit. Carries no intelligence; it only paces and shuttles.
 #[allow(clippy::too_many_arguments, clippy::collapsible_if)]
@@ -1333,13 +1524,65 @@ async fn drive(
             continue;
         }
         let ev = event::read()?;
-        // Mouse scroll for average users who don't (yet) use vim keys
+        // M5: mouse scroll, picker clicks, modal hints, input cursor, transcript
+        // drag-select + OSC52 copy (gated on COXN_CLIPBOARD).
         if let Event::Mouse(me) = ev {
-            let (w, h) = pane_dims(tui);
-            match me.kind {
-                MouseEventKind::ScrollUp => view.scroll_up(SCROLL_STEP, view.max_scroll(w, h)),
-                MouseEventKind::ScrollDown => view.scroll_down(SCROLL_STEP),
-                _ => {}
+            if !view.show_help {
+                let (w, h) = pane_dims(tui);
+                let max_scroll = view.max_scroll(w, h);
+                let frame = tui
+                    .size()
+                    .map(|s| Rect::new(0, 0, s.width, s.height))
+                    .unwrap_or(Rect::new(0, 0, 80, 24));
+                let layout = frame_layout(frame, view);
+                let effect = handle_mouse(view, &layout, me, max_scroll);
+                let mut copy_text = None;
+                match effect {
+                    MouseEffect::ScrollUp => view.scroll_up(SCROLL_STEP, max_scroll),
+                    MouseEffect::ScrollDown => view.scroll_down(SCROLL_STEP),
+                    MouseEffect::SetCursor(_) => {}
+                    MouseEffect::MenuRow(idx) => {
+                        if let Some(m) = view.menu.as_mut() {
+                            m.selected = idx;
+                        }
+                        let pick = view.menu.as_ref().and_then(|m| {
+                            m.items.get(m.selected).map(|it| (m.kind, it.value.clone()))
+                        });
+                        view.close_menu();
+                        if let Some((kind, value)) = pick {
+                            dispatch_menu_pick(
+                                view,
+                                pump,
+                                dir,
+                                sel,
+                                task,
+                                &trust,
+                                kind,
+                                value,
+                                &mut persisted,
+                                &mut approvals,
+                                &mut approved_commands,
+                                &mut session,
+                            );
+                        }
+                    }
+                    MouseEffect::Modal(action) => match action {
+                        Action::Confirm | Action::Cancel => view.dismiss(),
+                        Action::ModalExpand if view.modal_diff.is_some() => {
+                            view.modal_diff_expanded = true;
+                        }
+                        Action::ModalCollapse if view.modal_diff.is_some() => {
+                            view.modal_diff_expanded = false;
+                        }
+                        _ => {}
+                    },
+                    MouseEffect::CopySelection(text) => copy_text = Some(text),
+                    MouseEffect::None => {}
+                }
+                if let Some(text) = copy_text {
+                    tui.draw(view)?;
+                    osc52_copy(&text)?;
+                }
             }
             continue;
         }
@@ -1477,204 +1720,20 @@ async fn drive(
                         .and_then(|m| m.items.get(m.selected).map(|it| (m.kind, it.value.clone())));
                     view.close_menu();
                     if let Some((kind, value)) = pick {
-                        match kind {
-                            MenuKind::Model => {
-                                view.output = switch_model(dir, pump, sel, &value);
-                                view.set_status(status_line(
-                                    dir,
-                                    &sel.label(),
-                                    task,
-                                    pump.last_usage(),
-                                    view.aden_active,
-                                    &trust,
-                                ));
-                            }
-                            MenuKind::Session => {
-                                let messages = session::load(&value);
-                                if messages.is_empty() {
-                                    view.output = format!("no session '{value}'");
-                                } else {
-                                    persisted = messages.len();
-                                    pump.load_conversation(messages);
-                                    // Switching sessions resets session-scoped approvals.
-                                    approvals.clear();
-                                    approved_commands.clear();
-                                    session = session::Session::open(&value);
-                                    view.output = transcript(pump.messages());
-                                    view.set_status(status_line(
-                                        dir,
-                                        &sel.label(),
-                                        task,
-                                        pump.last_usage(),
-                                        view.aden_active,
-                                        &trust,
-                                    ));
-                                }
-                            }
-                            MenuKind::Commands => {
-                                if value.starts_with("ADEN_UNDERSTAND:") {
-                                    let sym = value.strip_prefix("ADEN_UNDERSTAND:").unwrap_or("");
-                                    if pump.registry_mut().has_aden() {
-                                        match aden::pull(dir, aden::Pull::Understand(sym)) {
-                                            Ok(out) => {
-                                                append_aden(
-                                                    view,
-                                                    &format!("understand '{}'", sym),
-                                                    &out,
-                                                );
-                                                view.last_aden =
-                                                    Some(format!("understand '{}'", sym));
-                                            }
-                                            Err(e) => view.output.push_str(&format!(
-                                                "\naden: understand failed: {e}"
-                                            )),
-                                        }
-                                    } else {
-                                        view.output.push_str(&format!(
-                                            "\naden: (not present) would understand: {}",
-                                            sym
-                                        ));
-                                    }
-                                    view.snap_to_bottom();
-                                } else if value.starts_with("ADEN_VIEW:") {
-                                    let sym = value.strip_prefix("ADEN_VIEW:").unwrap_or("");
-                                    if pump.registry_mut().has_aden() {
-                                        match aden::launch_view(dir, Some(sym)) {
-                                            Ok(()) => {
-                                                view.output.push_str(&format!(
-                                                    "\naden: launched view for '{}'",
-                                                    sym
-                                                ));
-                                                view.last_aden = Some(format!("view '{}'", sym));
-                                            }
-                                            Err(e) => view
-                                                .output
-                                                .push_str(&format!("\naden: view failed: {e}")),
-                                        }
-                                    } else {
-                                        view.output.push_str(&format!(
-                                            "\naden: (not present) would view: {}",
-                                            sym
-                                        ));
-                                    }
-                                    view.snap_to_bottom();
-                                } else if value.starts_with("ADEN_IMPACT:") {
-                                    let sym = value.strip_prefix("ADEN_IMPACT:").unwrap_or("");
-                                    if pump.registry_mut().has_aden() {
-                                        match aden::pull(dir, aden::Pull::Impact(sym)) {
-                                            Ok(out) => {
-                                                append_aden(
-                                                    view,
-                                                    &format!("impact '{}'", sym),
-                                                    &out,
-                                                );
-                                                view.last_aden = Some(format!("impact '{}'", sym));
-                                            }
-                                            Err(e) => view
-                                                .output
-                                                .push_str(&format!("\naden: impact failed: {e}")),
-                                        }
-                                    } else {
-                                        view.output.push_str(&format!(
-                                            "\naden: (not present) would impact: {}",
-                                            sym
-                                        ));
-                                    }
-                                    view.snap_to_bottom();
-                                } else if value == "ADEN_COMMUNITIES" {
-                                    if pump.registry_mut().has_aden() {
-                                        match aden::communities(dir) {
-                                            Ok(out) => {
-                                                append_aden(view, "communities", &out);
-                                                view.last_aden = Some("communities".to_string());
-                                            }
-                                            Err(e) => view.output.push_str(&format!(
-                                                "\naden: communities failed: {e}"
-                                            )),
-                                        }
-                                    } else {
-                                        view.output.push_str(
-                                            "\naden: (not present) would show communities",
-                                        );
-                                    }
-                                    view.snap_to_bottom();
-                                } else if value == "ADEN_DOCTOR" {
-                                    if pump.registry_mut().has_aden() {
-                                        match aden::doctor(dir) {
-                                            Ok(out) => {
-                                                append_aden(view, "doctor", &out);
-                                                view.last_aden = Some("doctor".to_string());
-                                            }
-                                            Err(e) => view
-                                                .output
-                                                .push_str(&format!("\naden: doctor failed: {e}")),
-                                        }
-                                    } else {
-                                        view.output
-                                            .push_str("\naden: (not present) would run doctor");
-                                    }
-                                    view.snap_to_bottom();
-                                } else if value == "ADEN_AUDIT" {
-                                    if pump.registry_mut().has_aden() {
-                                        match aden::audit(dir) {
-                                            Ok(out) => {
-                                                append_aden(view, "audit", &out);
-                                                view.last_aden = Some("audit".to_string());
-                                            }
-                                            Err(e) => view
-                                                .output
-                                                .push_str(&format!("\naden: audit failed: {e}")),
-                                        }
-                                    } else {
-                                        view.output
-                                            .push_str("\naden: (not present) would run audit");
-                                    }
-                                    view.snap_to_bottom();
-                                } else {
-                                    // default: set input for / or : commands
-                                    view.input = value;
-                                    view.cursor_end();
-                                    view.refresh_suggestion();
-                                }
-                            }
-                            MenuKind::Palette => {
-                                if let Some(name) = value.strip_prefix("model:") {
-                                    view.output = switch_model(dir, pump, sel, name);
-                                    view.set_status(status_line(
-                                        dir,
-                                        &sel.label(),
-                                        task,
-                                        pump.last_usage(),
-                                        view.aden_active,
-                                        &trust,
-                                    ));
-                                } else if let Some(slug) = value.strip_prefix("session:") {
-                                    let messages = session::load(slug);
-                                    if messages.is_empty() {
-                                        view.output = format!("no session '{slug}'");
-                                    } else {
-                                        persisted = messages.len();
-                                        pump.load_conversation(messages);
-                                        approvals.clear();
-                                        approved_commands.clear();
-                                        session = session::Session::open(slug);
-                                        view.output = transcript(pump.messages());
-                                        view.set_status(status_line(
-                                            dir,
-                                            &sel.label(),
-                                            task,
-                                            pump.last_usage(),
-                                            view.aden_active,
-                                            &trust,
-                                        ));
-                                    }
-                                } else if let Some(text) = value.strip_prefix("input:") {
-                                    view.input = text.to_string();
-                                    view.cursor_end();
-                                    view.refresh_suggestion();
-                                }
-                            }
-                        }
+                        dispatch_menu_pick(
+                            view,
+                            pump,
+                            dir,
+                            sel,
+                            task,
+                            &trust,
+                            kind,
+                            value,
+                            &mut persisted,
+                            &mut approvals,
+                            &mut approved_commands,
+                            &mut session,
+                        );
                     }
                 }
                 None if palette => {

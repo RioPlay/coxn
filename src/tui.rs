@@ -220,6 +220,8 @@ pub struct View {
     /// Inline ghost-text suggestion (dim) for /commands as you type (Tab or
     /// Right to accept). Populated live for better discoverability of commands.
     pub suggestion: Option<String>,
+    /// In-progress transcript drag-select (M5): visual line indices `(start, end)`.
+    pub transcript_drag: Option<(usize, usize)>,
     /// Active transcript search (M2). `None` when no search has been opened.
     /// A search is "open" (interactive prompt active) while `query_open` is
     /// true; after Enter commits, `query_open` flips to false but `matches` /
@@ -891,7 +893,7 @@ impl View {
 /// This mirrors the Paragraph layout pass so that the render function can pin
 /// the scroll offset to the bottom without enabling the `unstable-rendered-line-info`
 /// ratatui feature.
-fn wrapped_line_count(text: &str, width: usize) -> usize {
+pub(crate) fn wrapped_line_count(text: &str, width: usize) -> usize {
     if width == 0 {
         return 0;
     }
@@ -1197,7 +1199,7 @@ fn paint_token(line: &str, _lang: &str) -> Span<'static> {
 // -- Centered-rect helper -------------------------------------------------
 
 /// A rectangle of `width` x `height` centered in `area`, clamped to fit.
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
     Rect {
