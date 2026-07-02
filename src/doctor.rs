@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::aden;
+use crate::codex_probe;
 use crate::openai;
 use crate::provider;
 use crate::sandbox;
@@ -86,11 +87,24 @@ pub fn run(dir: &Path) -> i32 {
                         println!("✗ {}: ollama not reachable @ {base}", instance.id);
                     }
                 }
-                provider::ProviderDriver::Codex | provider::ProviderDriver::ClaudeCli => {
-                    println!(
-                        "○ {}: CLI driver configured (execution deferred)",
-                        instance.id
-                    )
+                provider::ProviderDriver::Codex => {
+                    let bin = instance.binary.as_deref().unwrap_or("codex");
+                    let outcome = codex_probe::probe_instance(instance);
+                    let (is_blocking, line) =
+                        codex_probe::format_status_line(&instance.id, bin, &outcome);
+                    if is_blocking {
+                        blocking = true;
+                    }
+                    println!("{line}");
+                }
+                provider::ProviderDriver::ClaudeCli => {
+                    let bin = instance.binary.as_deref().unwrap_or("claude");
+                    if codex_probe::binary_installed(bin) {
+                        println!("○ {}: {bin} installed (auth probe deferred)", instance.id);
+                    } else {
+                        blocking = true;
+                        println!("✗ {}: {bin} not installed or not runnable", instance.id);
+                    }
                 }
                 provider::ProviderDriver::Unknown(driver) => {
                     blocking = true;

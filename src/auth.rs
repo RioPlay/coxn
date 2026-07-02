@@ -7,6 +7,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::codex_probe;
 use crate::openai;
 use crate::provider::{self, ProviderDriver};
 
@@ -155,15 +156,13 @@ fn status(dir: &Path) -> AuthReport {
             }
             ProviderDriver::Codex => {
                 let bin = instance.binary.as_deref().unwrap_or("codex");
-                if binary_responds(bin) {
-                    output.push_str(&format!("✓ {}: {bin} installed\n", instance.id));
-                } else {
+                let outcome = codex_probe::probe_instance(instance);
+                let (is_blocking, line) =
+                    codex_probe::format_status_line(&instance.id, bin, &outcome);
+                if is_blocking {
                     blocking = true;
-                    output.push_str(&format!(
-                        "✗ {}: {bin} not installed or not runnable\n",
-                        instance.id
-                    ));
                 }
+                output.push_str(&format!("{line}\n"));
             }
             ProviderDriver::ClaudeCli => {
                 let bin = instance.binary.as_deref().unwrap_or("claude");

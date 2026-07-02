@@ -279,7 +279,7 @@ What this revealed:
 
 New follow-up phases:
 
-* [ ] A7 Codex auth probe: spawn `codex app-server`, JSONL request/response
+* [x] A7 Codex auth probe: spawn `codex app-server`, JSONL request/response
   `initialize` -> `initialized` -> `account/read`; report account email/type and
   auth status. Use fake binary tests.
 * [ ] A8 Claude environment presets: document and example-config an
