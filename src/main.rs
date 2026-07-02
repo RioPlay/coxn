@@ -1275,6 +1275,21 @@ async fn drive(
             }
             continue;
         }
+        // Bracketed paste (M1): the terminal wraps the paste in
+        // `CSI ? 2004 h` .. `CSI ? 2004 l`; crossterm surfaces it as one
+        // `Event::Paste(String)` so the whole payload lands as one bulk insert
+        // at the cursor (see `View::input_push_str`). This bypasses the vim
+        // engine entirely -- a paste containing the literal `Escape\ni` does
+        // NOT flip into Normal mode mid-paste (the adversarial paste case).
+        if let Event::Paste(s) = ev {
+            // Either the modal/menu paths above already ate the key, or we are
+            // in normal Insert/Normal input composition: paste is always an
+            // input edit, never a confirm/select gesture.
+            if view.modal.is_none() && view.menu.is_none() {
+                view.input_push_str(&s);
+            }
+            continue;
+        }
         let Event::Key(key) = ev else {
             continue;
         };
@@ -1527,12 +1542,27 @@ async fn drive(
             continue;
         }
 
+        // Alt-Enter / Shift-Enter insert a literal `\n` so the input box can grow
+        // into a multi-line prompt (M1). These must bypass the vim engine:
+        // `Vim::handle_normal`/`handle_visual` return `Outcome::Submit` on
+        // plain Enter with no modifier check, so routing Alt-Enter through
+        // vim would submit instead of newline. `map_input_key` already maps
+        // these modifiers to `Action::Newline`; we synthesize a Pass outcome
+        // so the dispatch arm below treats it like Insert-mode typing.
+        let newline_enter = matches!(key.code, KeyCode::Enter)
+            && (key.modifiers.contains(KeyModifiers::ALT)
+                || key.modifiers.contains(KeyModifiers::SHIFT));
+
         // Route the key through the vim modal engine first. In Insert mode
         // (the default) nearly every key returns Pass, so existing emacs
         // bindings and plain typing are completely unaffected. Only Esc
         // (mode change), Normal-mode motions/operators, and scroll bindings
         // are ever consumed before the map_input_key path sees them.
-        let vim_outcome = view.vim.handle(&mut view.input, &mut view.cursor, key);
+        let vim_outcome = if newline_enter {
+            Outcome::Pass
+        } else {
+            view.vim.handle(&mut view.input, &mut view.cursor, key)
+        };
 
         // Resolve a vim-level Scroll before potentially falling through to the
         // map_input_key path so the arms below stay symmetric.
@@ -1976,6 +2006,7 @@ async fn drive(
                 }
             }
             Some(Action::Append(c)) => view.input_push(c),
+            Some(Action::Newline) => view.input_push('\n'),
             Some(Action::Backspace) => view.input_backspace(),
             Some(Action::CursorLeft) => view.cursor_left(),
             Some(Action::CursorRight) => {

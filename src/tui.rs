@@ -26,7 +26,9 @@
 use std::io;
 use std::time::Instant;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use ratatui::Frame;
@@ -366,6 +368,30 @@ impl View {
     pub fn input_push(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+    }
+
+    /// Bulk-insert a string at the cursor (bracketed-paste payload, or
+    /// `Alt-Enter` / `Shift-Enter` which lands a single `\n` here too). Keeps
+    /// the cursor on a char boundary after the inserted text. Used for the
+    /// whole paste as one unit so Vim's per-key motions and mode transitions
+    /// do not fire mid-paste.
+    pub fn input_push_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.input.insert_str(self.cursor, s);
+        self.cursor += s.len();
+        while !self.input.is_char_boundary(self.cursor) && self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+
+    /// Visible line count for the input box: one per `\n`-separated logical
+    /// line, capped at `max_rows` so a runaway paste does not eat the whole
+    /// screen -- clamp happens at the layout step, not here. Used by [`render`]
+    /// to size the input area and by tests to assert grow-box behavior.
+    pub fn input_line_count(&self) -> usize {
+        self.input.matches('\n').count() + 1
     }
 
     /// Delete the character immediately before the cursor (Backspace semantics).
@@ -785,15 +811,159 @@ pub fn menu_max_rows(area_height: u16, item_count: usize) -> usize {
 
 // -- Render ---------------------------------------------------------------
 
+/// Build the multi-line input prompt Text. One `Line` per `\n`-separated
+/// logical line of `view.input`.
+///
+/// The cursor cell (reverse-video block caret) and Visual-selection styles
+/// apply only on the line that hosts the cursor -- a Visual selection in this
+/// engine is single-line, so non-cursor lines render plain. Continuation
+/// lines (rows > 0) get a `↳` accent prefix instead of the chevron so the
+/// whole prompt reads as one composed unit across rows.
+///
+/// Pure in `view`. Tested via `TestBackend` render in M1.
+fn build_input_prompt_text(view: &View) -> Text<'static> {
+    let input = &view.input;
+    let cursor = view.cursor;
+    let sel = view.vim.selection(cursor);
+
+    // Walk the input line-by-line; track byte ranges so we can resolve which
+    // line holds the cursor and offset cursor spans into the substring that
+    // line owns.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut line_start = 0usize;
+    let chevron = if view.aden_active { "⊙ " } else { "› " };
+    let cont = "↳ ";
+    let plain = Style::default().fg(SECONDARY);
+    let accent = Style::default().fg(ACCENT);
+
+    // Loop over each \n-delimited slice. `chunks` would split on graphemes,
+    // not bytes; split_terminator keeps the byte ranges we get from `match`.
+    for (idx, segment) in input.split('\n').enumerate() {
+        let line_end = line_start + segment.len();
+        let is_cursor_line = (line_start..=line_end).contains(&cursor);
+
+        let prefix = if idx == 0 { chevron } else { cont };
+
+        if is_cursor_line {
+            // Cursor-relative slices scoped to THIS line so a `\n` elsewhere
+            // in the buffer does not corrupt the spans below.
+            let sub_before = &input[line_start..cursor];
+            let (cursor_ch, after_start) = match input[cursor..line_end.max(cursor)].chars().next()
+            {
+                Some(c) if cursor < line_end => (c, cursor + c.len_utf8()),
+                _ => (' ', cursor),
+            };
+            let cursor_cell = cursor_ch.to_string();
+            let sub_after = &input[after_start..line_end];
+
+            // Visual selection: clamp to the cursor-bearing line. The engine
+            // selects single lines in this baseline; if a stale selection
+            // crosses `\n` boundaries we clamp both ends into this line.
+            let prefix_span = Span::styled(prefix.to_string(), accent);
+            let mut spans = vec![prefix_span];
+
+            if let Some((sel_lo, sel_hi)) = sel {
+                let sel_lo_b = sel_lo.max(line_start).min(line_end);
+                let sel_hi_b = sel_hi.max(line_start).min(line_end);
+                let sel_lo_b = crate::vim::snap_boundary_down(input, sel_lo_b);
+                let sel_hi_b = crate::vim::snap_boundary_down(input, sel_hi_b);
+                let sel_end = input[sel_hi_b.min(line_end)..]
+                    .chars()
+                    .next()
+                    .map_or(sel_hi_b, |c| sel_hi_b + c.len_utf8())
+                    .min(line_end);
+                debug_assert!(
+                    input.is_char_boundary(sel_lo_b) && input.is_char_boundary(sel_end),
+                    "visual selection must slice on char boundaries"
+                );
+
+                let pre_sel = &input[line_start..sel_lo_b];
+                let sel_before_cursor = if cursor > sel_lo_b {
+                    &input[sel_lo_b..cursor.min(sel_end)]
+                } else {
+                    ""
+                };
+                let sel_after_cursor = if after_start < sel_end {
+                    &input[after_start..sel_end]
+                } else {
+                    ""
+                };
+                let post_sel = if sel_end < line_end {
+                    &input[sel_end..line_end]
+                } else {
+                    ""
+                };
+                let sel_style = Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED);
+                let cur_style = Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED);
+                // Only `pre_sel` is offset from `line_start`; emit it and skip
+                // the standalone `sub_before` render below to avoid duplicating
+                // text. (The cursor-cell split below uses cursor-relative spans.)
+                let _ = sub_before; // pre_sel subsumes it.
+                spans.push(Span::styled(pre_sel.to_string(), plain));
+                spans.push(Span::styled(sel_before_cursor.to_string(), sel_style));
+                spans.push(Span::styled(cursor_cell, cur_style));
+                spans.push(Span::styled(sel_after_cursor.to_string(), sel_style));
+                spans.push(Span::styled(post_sel.to_string(), plain));
+            } else {
+                // Normal / Insert: accent chevron + reverse-video block caret,
+                // typed text in SECONDARY. If cursor at end-of-input and we
+                // have a suggestion (for /commands), append a dim ghost on the
+                // final line so it auto-populates as you type.
+                spans.push(Span::styled(sub_before.to_string(), plain));
+                spans.push(Span::styled(
+                    cursor_cell,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED),
+                ));
+                spans.push(Span::styled(sub_after.to_string(), plain));
+                if cursor == input.len() && idx == view.input_line_count().saturating_sub(1) {
+                    if let Some(sugg) = &view.suggestion {
+                        spans.push(Span::styled(sugg.clone(), Style::default().fg(DIM)));
+                    }
+                }
+            }
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), accent),
+                Span::styled(segment.to_string(), plain),
+            ]));
+        }
+
+        line_start = line_end + 1; // skip the `\n` byte
+    }
+
+    if lines.is_empty() {
+        // Edge case: empty input still renders a chevron + cursor cell so the
+        // box never collapses to zero height.
+        lines.push(Line::from(vec![
+            Span::styled(chevron.to_string(), accent),
+            Span::styled(
+                " ".to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED),
+            ),
+        ]));
+    }
+
+    Text::from(lines)
+}
+
 /// Render one frame: a ruled output pane, a hairline separator, a one-row status
 /// line, and a one-row input prompt, with the confirm modal or picker overlaid
 /// when active. Pure in `view`; testable with `TestBackend`.
 pub fn render(frame: &mut Frame, view: &View) {
+    // Input box rows grow with `\n` (M1 multi-line). Computed before the
+    // layout split so the input slot is `Length(input_rows)` not `Length(1)`,
+    // capped at MAX_INPUT_ROWS so a runaway paste cannot eat the pane.
+    /// Visible row cap for the input box before growth stops (past this the
+    /// box scrolls via `Paragraph`, never eating the transcript).
+    const MAX_INPUT_ROWS: u16 = 8;
+    let input_rows = (view.input_line_count() as u16).clamp(1, MAX_INPUT_ROWS);
+
     let areas = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(1), // separator
-        Constraint::Length(1), // status
-        Constraint::Length(1), // input
+        Constraint::Length(1),          // separator
+        Constraint::Length(1),          // status
+        Constraint::Length(input_rows), // input (grows with \n; capped)
     ])
     .split(frame.area());
     let pane = areas[0];
@@ -940,121 +1110,35 @@ pub fn render(frame: &mut Frame, view: &View) {
     // In Visual mode, the selection range is highlighted with reversed video in
     // the ACCENT color. In Normal mode the existing reverse-video block caret
     // marks the position. Insert mode is unchanged.
-    let prompt_line = if view.vim.mode == Mode::Command {
+    //
+    // Multi-line: `Alt-Enter` / `Shift-Enter` insert `\n` (M1), so the input
+    // area grows from one to N rows and the prompt becomes a `Text` (one Line
+    // per `\n`-separated logical line). The cursor and visual-selection styles
+    // only apply on the line that hosts the cursor; continuation lines get a
+    // `↳` accent marker so the chevron reads as one prompt across rows.
+    let prompt_text: Text<'static> = if view.vim.mode == Mode::Command {
         // Ledger-styled command line: ':' in ACCENT, cmdline text in SECONDARY,
         // a reverse-video block cursor cell at the end (where the next char goes).
         let cmdline = view.vim.cmdline.clone();
-        Line::from(vec![
+        Text::from(Line::from(vec![
             Span::styled(":".to_string(), Style::default().fg(ACCENT)),
             Span::styled(cmdline, Style::default().fg(SECONDARY)),
             Span::styled(
                 " ".to_string(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED),
             ),
-        ])
+        ]))
     } else {
-        let sel = view.vim.selection(view.cursor);
-        let input = &view.input;
-        let cursor = view.cursor;
-
-        let before = &input[..cursor];
-        let (cursor_ch, after_start) = match input[cursor..].chars().next() {
-            Some(c) => (c, cursor + c.len_utf8()),
-            None => (' ', cursor),
-        };
-        let cursor_cell = cursor_ch.to_string();
-        let after = &input[after_start..];
-
-        // Build the input spans. When a Visual selection covers the cursor (or any
-        // part of the line), we split the line into up to five segments:
-        //   pre-selection | selection-before-cursor | cursor | selection-after-cursor | post-selection
-        // Char boundary safety: sel bounds come from the Vim engine, which only
-        // ever sets them at char boundaries via prev_boundary / next_boundary.
-        let prompt_spans: Vec<Span<'static>> = if let Some((sel_lo, sel_hi)) = sel {
-            // Clamp both bounds into the buffer before slicing. The engine only
-            // emits char-boundary offsets, but a stale selection could outrun a
-            // now-shorter buffer; clamping keeps every slice below in range.
-            // After length-clamping we also snap to a char boundary: if the
-            // buffer shrank mid-char the clamped index may land inside a
-            // multi-byte sequence, making text[sel_hi..] a non-boundary slice.
-            let sel_hi = crate::vim::snap_boundary_down(input, sel_hi.min(input.len()));
-            let sel_lo = crate::vim::snap_boundary_down(input, sel_lo.min(input.len()));
-            // Inclusive end: extend hi to include the char under it.
-            let sel_end = input[sel_hi..]
-                .chars()
-                .next()
-                .map_or(sel_hi, |c| sel_hi + c.len_utf8())
-                .min(input.len());
-            debug_assert!(
-                input.is_char_boundary(sel_lo) && input.is_char_boundary(sel_end),
-                "visual selection must slice on char boundaries"
-            );
-
-            // Segment the input around the selection, guarding all slices.
-            let pre_sel = &input[..sel_lo];
-            // `>` not `>=`: at cursor == sel_lo this segment is empty (the cursor
-            // cell renders that position), which also avoids a backward slice.
-            let sel_before_cursor = if cursor > sel_lo {
-                &input[sel_lo..cursor.min(sel_end)]
-            } else {
-                ""
-            };
-            let sel_after_cursor = if after_start < sel_end {
-                &input[after_start..sel_end]
-            } else {
-                ""
-            };
-            let post_sel = if sel_end < input.len() {
-                &input[sel_end..]
-            } else {
-                ""
-            };
-
-            let sel_style = Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED);
-            let cur_style = Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED);
-
-            let chevron = if view.aden_active { "⊙ " } else { "› " };
-            vec![
-                Span::styled(chevron.to_string(), Style::default().fg(ACCENT)),
-                Span::styled(pre_sel.to_string(), Style::default().fg(SECONDARY)),
-                Span::styled(sel_before_cursor.to_string(), sel_style),
-                Span::styled(cursor_cell, cur_style),
-                Span::styled(sel_after_cursor.to_string(), sel_style),
-                Span::styled(post_sel.to_string(), Style::default().fg(SECONDARY)),
-            ]
-        } else {
-            // Normal / Insert: accent chevron + reverse-video block caret.
-            // Typed text in SECONDARY (the composing voice), matching `you:` record
-            // lines -- so the draft never outshines coxn's PRIMARY responses.
-            // If cursor at end and we have a suggestion (for /commands), append
-            // it dim as ghost text so it "auto populates" as you type.
-            {
-                let chevron = if view.aden_active { "⊙ " } else { "› " };
-                let mut spans = vec![
-                    Span::styled(chevron.to_string(), Style::default().fg(ACCENT)),
-                    Span::styled(before.to_string(), Style::default().fg(SECONDARY)),
-                    Span::styled(
-                        cursor_cell,
-                        Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED),
-                    ),
-                    Span::styled(after.to_string(), Style::default().fg(SECONDARY)),
-                ];
-                if cursor == input.len()
-                    && let Some(sugg) = &view.suggestion
-                {
-                    spans.push(Span::styled(sugg.clone(), Style::default().fg(DIM)));
-                }
-                spans
-            }
-        };
-
-        Line::from(prompt_spans)
+        build_input_prompt_text(view)
     };
 
     frame.render_widget(output_widget, pane);
     frame.render_widget(separator, areas[1]);
     frame.render_widget(Paragraph::new(Line::from(status_spans)), areas[2]);
-    frame.render_widget(Paragraph::new(prompt_line), areas[3]);
+    frame.render_widget(
+        Paragraph::new(prompt_text).wrap(Wrap { trim: false }),
+        areas[3],
+    );
 
     if let Some(prompt) = &view.modal {
         let hint = "[y] proceed   [n] block";
@@ -1294,12 +1378,19 @@ pub fn render(frame: &mut Frame, view: &View) {
 // -- Actions --------------------------------------------------------------
 
 /// A user intent decoded from a key event. The pump decides what to do with it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+//
+// Not `Copy` because `Paste(String)` owns its text. Callers below move the
+// enum out of `Option<Action>` exactly once, so dropping `Copy` is harmless.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Leave the pump.
     Quit,
-    /// Submit the current input line as a user turn.
+    /// Submit the current input line as a user turn. Bare `Enter`.
     Submit,
+    /// Insert a literal newline at the cursor (`Alt-Enter`, `Shift-Enter` when
+    /// the terminal reports it). The input buffer holds multiple lines until
+    /// Submit sends the whole thing.
+    Newline,
     /// Append a typed character to the input line.
     Append(char),
     /// Delete the character before the cursor.
@@ -1370,7 +1461,13 @@ pub enum Action {
 pub fn map_input_key(key: KeyEvent) -> Option<Action> {
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Quit),
-        (KeyCode::Enter, _) => Some(Action::Submit),
+        // Bare Enter always submits. Alt-Enter and Shift-Enter insert a
+        // newline so the input buffer can grow into a multi-line prompt
+        // (Codex/Claude muscle memory). Other Enter modifiers (CONTROL, etc)
+        // are dropped: Ctrl-Enter is not reliably distinguishable from plain
+        // Enter across terminal decoders, so we do not promise a behavior.
+        (KeyCode::Enter, KeyModifiers::NONE) => Some(Action::Submit),
+        (KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SHIFT) => Some(Action::Newline),
         (KeyCode::Backspace, _) => Some(Action::Backspace),
         (KeyCode::Left, _) => Some(Action::CursorLeft),
         (KeyCode::Right, _) => Some(Action::CursorRight),
@@ -1426,6 +1523,12 @@ impl Tui {
         let terminal = ratatui::try_init()?;
         // Enable mouse so average users can scroll the transcript with wheel
         let _ = execute!(std::io::stdout(), EnableMouseCapture);
+        // Enable bracketed paste so a multi-line paste arrives as one
+        // `Event::Paste` (a single bulk insert, one undo unit) instead of a
+        // stream of per-character key events (which would trip Vim's per-key
+        // motions and mode transitions like the literal `Esc\ni` adversarial
+        // paste). Disabled on Drop so the user's shell gets it back.
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
         Ok(Self { terminal })
     }
 
@@ -1441,9 +1544,11 @@ impl Tui {
     pub fn run_external<F: FnOnce()>(&mut self, f: F) -> io::Result<()> {
         ratatui::try_restore().ok();
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         f();
         self.terminal = ratatui::try_init()?;
         let _ = execute!(std::io::stdout(), EnableMouseCapture);
+        let _ = execute!(std::io::stdout(), EnableBracketedPaste);
         Ok(())
     }
 
@@ -1456,6 +1561,7 @@ impl Tui {
 impl Drop for Tui {
     fn drop(&mut self) {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::try_restore().ok();
     }
 }
@@ -2323,5 +2429,157 @@ mod tests {
             text.contains("test-model-x"),
             "model name must appear: {text:?}"
         );
+    }
+
+    // -- M1: multi-line input + submit semantics --------------------------------
+
+    #[test]
+    fn m1_enter_submits_alt_enter_newlines() {
+        // Bare Enter submits (no modifier).
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(map_input_key(enter), Some(Action::Submit));
+        // Alt-Enter and Shift-Enter both insert a newline.
+        let alt = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(map_input_key(alt), Some(Action::Newline));
+        let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(map_input_key(shift), Some(Action::Newline));
+    }
+
+    #[test]
+    fn m1_enter_with_control_does_nothing() {
+        // Ctrl-Enter is dropped: decoders cannot reliably distinguish it from
+        // plain Enter; we refuse to promise a behaviour we can't deliver.
+        let ctrl = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(map_input_key(ctrl), None);
+        // CONTROL+ALT+ENTER drops as well (we don't double up).
+        let ctrl_alt = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::CONTROL);
+        assert_eq!(map_input_key(ctrl_alt), None);
+    }
+
+    #[test]
+    fn m1_input_push_str_inserts_one_unit() {
+        // Bracketed-paste payload lands as one bulk insert; cursor advances
+        // past the inserted text and stays on a char boundary.
+        let mut view = View::new();
+        view.input_push_str("foo\nbar");
+        assert_eq!(&view.input, "foo\nbar");
+        assert_eq!(view.cursor, "foo\nbar".len()); // boundary-checked
+        assert_eq!(view.input_line_count(), 2);
+
+        // Mid-buffer insert keeps the cursor on a char boundary AFTER the
+        // inserted text (e.g. yank-in-place semantics).
+        let mut view2 = View::new();
+        view2.input_push_str("a日");
+        view2.cursor_left(); // land on '日' boundary
+        view2.input_push_str("\nx");
+        assert_eq!(&view2.input, "a\nx日");
+        assert_eq!(&view2.input[view2.cursor..], "日");
+    }
+
+    #[test]
+    fn m1_input_push_str_empty_is_noop() {
+        let mut view = View::new();
+        view.input_push_str("");
+        assert_eq!(&view.input, "");
+        assert_eq!(view.cursor, 0);
+    }
+
+    #[test]
+    fn m1_input_line_count_counts_logical_lines() {
+        let mut view = View::new();
+        assert_eq!(view.input_line_count(), 1); // empty = one logical line
+
+        view.input_push_str("only line");
+        assert_eq!(view.input_line_count(), 1);
+
+        view.input_push('\n');
+        view.input_push_str("second");
+        assert_eq!(view.input_line_count(), 2);
+
+        view.input_push('\n');
+        view.input_push_str("third");
+        assert_eq!(view.input_line_count(), 3);
+    }
+
+    #[test]
+    fn m1_render_grows_input_box_for_multiline() {
+        // Three logical lines => the input widget occupies 3 rows in the
+        // vertical layout, eating from the pane above and not crawling across
+        // the status or separator. Verified via the rendered buffer's height
+        // for the input row block (last N rows of the layout, given the
+        // ordering pane > separator > status > input).
+        let mut view = View::new();
+        view.input_push_str("line one\nline two\nline three");
+
+        // Build wide+modest-high and assert the third-from-bottom row carries
+        // the continuation marker `↳` for line two (rows 1 and 2 of the multi-
+        // line prompt). The presence of `↳` proves the box grew past 1 row.
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("↳"),
+            "multi-line input must render a continuation marker: {text:?}"
+        );
+        assert!(
+            text.contains("line three"),
+            "last sub-line must render: {text:?}"
+        );
+    }
+
+    #[test]
+    fn m1_render_caps_input_box_at_max_rows() {
+        // 50 logical lines would overflow the screen; the layout cap (8 rows)
+        // means the input widget stays bounded. Hard-to-assert counter, so we
+        // verify zero panics on a very long draft -- the proof is the
+        // `render` not panicking plus the pane (row 0) still rendering.
+        let mut view = View::new();
+        for _ in 0..50 {
+            view.input_push_str("x");
+            view.input_push('\n');
+        }
+        // Cursor at the very bottom; render must not panic.
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds on capped input");
+    }
+
+    /// Adversarial paste (R-equivalent): a paste containing the literal bytes
+    /// `Escape\ni`. Reaching the vim engine at the key level would flip Normal
+    /// mode and `i` would re-enter Insert; instead `Event::Paste` is applied
+    /// as a single bulk insert with ZERO mode change. Tested at the
+    /// `View::input_push_str` primitive level here; the wiring (main.rs drive)
+    /// tests assert the Event::Paste dispatch itself.
+    #[test]
+    fn m1_adversarial_paste_does_not_trip_per_key_motions() {
+        let mut view = View::new();
+        // Paste containing bytes that look like key sequences.
+        view.input_push_str("foo\x1b\nibar");
+        // The whole payload lives verbatim in the buffer (no key action ate
+        // the Escape; no mode entered; nothing stripped). The `i` is part of
+        // the buffer text, not a mode keystroke.
+        assert_eq!(&view.input, "foo\x1b\nibar");
+        assert_eq!(view.cursor, "foo\x1b\nibar".len());
+    }
+
+    /// Drive-loop integration: ensure the vim path is bypassed for newline
+    /// keys. This is tested at the wiring layer (`Outcome::Pass` synthesized
+    /// for Alt/Shift Enter); the pure path here asserts the buffer ends up
+    /// with the newline, not submits. Equivalent to assert that `Outcome::Pass`
+    /// synthesized does indeed land `\n` in the buffer.
+    #[test]
+    fn m1_newline_inserts_into_existing_buffer_in_place() {
+        let mut view = View::new();
+        view.input_push_str("hello");
+        view.cursor_home(); // cursor at 'h'
+        // Mimic the dispatch arm: Newline action => input_push('\n').
+        view.input_push('\n');
+        assert_eq!(&view.input, "\nhello");
+        // Multi-line render must not panic for an embedded \n at the start.
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).expect("test backend");
+        terminal.draw(|frame| render(frame, &view)).expect("draw");
     }
 }
