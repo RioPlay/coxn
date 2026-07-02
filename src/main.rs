@@ -1349,8 +1349,19 @@ async fn drive(
 
         // A modal grabs input until answered.
         if view.modal.is_some() {
-            if matches!(map_modal_key(key), Some(Action::Confirm | Action::Cancel)) {
-                view.dismiss();
+            match map_modal_key(key) {
+                // Answers + dismiss:
+                Some(Action::Confirm) | Some(Action::Cancel) => view.dismiss(),
+                // Diff body expand/collapse (M3); only meaningful when a diff
+                // is attached; no-op otherwise. Toggle stays on the fence so
+                // repeated presses toggle, idiomatic with e/c keys.
+                Some(Action::ModalExpand) if view.modal_diff.is_some() => {
+                    view.modal_diff_expanded = true;
+                }
+                Some(Action::ModalCollapse) if view.modal_diff.is_some() => {
+                    view.modal_diff_expanded = false;
+                }
+                _ => {}
             }
             continue;
         }
@@ -2494,18 +2505,17 @@ async fn drive(
                         view.set_status(format!("error: {err}"));
                     }
                 }
-                // Surface a gate block from this turn as a confirm modal.
+                // Surface a gate block from this turn as a confirm modal. The block's
+                // message often carries diff-like text; confirm_with_diff
+                // routes it through paint_diff_line so +/- hunks render.
                 if let Some(block) = pump.take_block() {
                     view.output.push_str(&format!(
                         "\nsys: GATE BLOCKED — {} — change reverted\n{}",
                         block.verdict.label(),
                         block.message
                     ));
-                    view.confirm(format!(
-                        "GATE BLOCKED: {} — {}",
-                        block.verdict.label(),
-                        block.message
-                    ));
+                    let prompt = format!("GATE BLOCKED: {}", block.verdict.label());
+                    view.confirm_with_diff(prompt, block.message.clone());
                 }
                 // Persist any messages this turn added (user + assistant + tools).
                 let messages = pump.messages();

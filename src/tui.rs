@@ -115,6 +115,15 @@ pub struct View {
     /// and the modal key mapping applies. The pump sets this (e.g. on a blocked
     /// gate) and clears it once the user answers.
     pub modal: Option<String>,
+    /// A diff body shown inside the modal, alongside `modal`. Painted line-by-
+    /// line through [`paint_diff_line`] (green `+`, red `-`, cyan `@@`,
+    /// context unstyled). Used by the gate-block confirmation (M3) so the
+    /// user sees the rejected diff before answering; long hunks collapse via
+    /// `modal_diff_expanded`.
+    pub modal_diff: Option<String>,
+    /// Expand/collapse state for the modal diff body when it overflows the
+    /// default preview window.
+    pub modal_diff_expanded: bool,
     /// Scroll position as distance-from-bottom in visual lines: `0` pins to the
     /// bottom (auto-scroll, the default); a larger value scrolls back that many
     /// lines. Render clamps it to the available scrollback, so it never needs a
@@ -248,9 +257,27 @@ impl View {
         self.modal = Some(prompt.into());
     }
 
-    /// Dismiss the modal once answered.
+    /// Raise a confirmation modal with `prompt` and an optional `diff` body
+    /// painted line-by-line through [`paint_diff_line`] (M3). Used by the
+    /// gate-block confirmation so the user sees the rejected diff before
+    /// answering. Empty `diff` degrades to plain confirm-render.
+    pub fn confirm_with_diff(&mut self, prompt: impl Into<String>, diff: impl Into<String>) {
+        let diff_text = diff.into();
+        if diff_text.is_empty() {
+            self.modal_diff = None;
+            self.modal_diff_expanded = false;
+        } else {
+            self.modal_diff = Some(diff_text);
+            self.modal_diff_expanded = false;
+        }
+        self.confirm(prompt);
+    }
+
+    /// Dismiss the modal and any diff body alongside it.
     pub fn dismiss(&mut self) {
         self.modal = None;
+        self.modal_diff = None;
+        self.modal_diff_expanded = false;
     }
 
     /// Open a picker overlay (non-empty menus only).
@@ -811,6 +838,15 @@ const SAND: Color = Color::Rgb(139, 115, 85);
 const MAUVE: Color = Color::Rgb(155, 142, 160);
 /// sys: voice: one step above the rule, very quiet.
 const QUIET: Color = Color::Rgb(90, 82, 72);
+/// Diff hunk -- addition line (M3). Sage, matching the existing `OK` voice so
+/// diffs read as state changes not alarms.
+const DIFF_ADD: Color = Color::Rgb(122, 158, 126);
+/// Diff hunk -- deletion line (M3). Terracotta, matching `ERR` for the same
+/// reason; never alarm-red on a dark field.
+const DIFF_DEL: Color = Color::Rgb(196, 123, 90);
+/// Diff hunk -- `@@` header (M3). Cyan, the standard "hunk metadata" hue in
+/// most diff tools (Codex / Grok / git).
+const CYAN: Color = Color::Rgb(96, 142, 168);
 
 /// Known role prefixes, longest-match order (longest first to avoid prefix collisions).
 const ROLE_PREFIXES: &[&str] = &[
@@ -906,10 +942,35 @@ fn styled_output_with_search(
             s.matches.get(s.current).copied()
         }
     });
+    // Track whether the current line falls inside a ```diff fenced block (M3).
+    // Toggle on a fence-open / fence-close line so every line until the close
+    // gets routed through `paint_diff_line` for hunk coloring rather than the
+    // role-body palette. Markdown / AsciiDoc engines are not invoked; the
+    // detection is intentionally trivial (`trim_start == \`\`\`diff`).
+    let mut in_diff_block = false;
     let lines: Vec<Line<'static>> = output
         .lines()
         .enumerate()
         .map(|(idx, raw)| {
+            // \`\`\`diff fence tracking (M3).
+            let trimmed = raw.trim_start();
+            if trimmed == "```diff" || trimmed.starts_with("```diff ") {
+                in_diff_block = !in_diff_block;
+                // Render the fence marker as a dim accent so it stays legible
+                // without competing with the hunks.
+                return Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(raw.to_string(), Style::default().fg(DIM)),
+                ]);
+            }
+            if trimmed == "```" && in_diff_block {
+                in_diff_block = false;
+                return Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(raw.to_string(), Style::default().fg(DIM)),
+                ]);
+            }
+
             let live = pending && idx == last;
             let matched = matches.contains(&idx);
             let current = current_match_line == Some(idx);
@@ -924,6 +985,21 @@ fn styled_output_with_search(
             } else {
                 None
             };
+
+            // Inside a ```diff block: paint via paint_diff_line, overriding
+            // the role-body palette. Search highlight falls back to its
+            // normal match part (still applied to the styled span color via
+            // the `matched` overlay; for diff lines we keep search styling as
+            // the primary tint so the user sees where the query hit).
+            if in_diff_block {
+                let painted = paint_diff_line(raw);
+                let style = highlight.unwrap_or(painted.style);
+                return Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(painted.content.clone(), style),
+                ]);
+            }
+
             if let Some(prefix) = ROLE_PREFIXES.iter().find(|&&p| raw.starts_with(p)) {
                 owner_body = role_body_color(prefix);
                 let after = &raw[prefix.len()..];
@@ -949,6 +1025,59 @@ fn styled_output_with_search(
         })
         .collect();
     Text::from(lines)
+}
+
+// -- Diff hunk painting (M3) ----------------------------------------------
+
+/// Style a single unified-diff line. Returns a styled span over the same
+/// slice (no allocation, no parse):
+///
+/// * `+...`        -> green (addition)
+/// * `-...`        -> red (deletion)
+/// * `@@ ... @@`   -> cyan (hunk header)
+/// * `\`...` and `\\` interpretable diff trailers -> quiet / ignored by
+///   callers; treated as context here
+/// * other         -> context (DEFAULT-fg plain)
+///
+/// Adversarial: a `-` line that begins inside an `@@` hunk (the rare case
+/// where a contextual deletion includes the literal `+` byte) is still
+/// classified by its leading column, never by the `+` near the line end.
+///
+/// A future syntax pass can route each line through [`paint_token`] for
+/// language-aware styling; the stub here returns the line verbatim so the
+/// design is open-ended without paying the cost.
+fn paint_diff_line(line: &str) -> Span<'static> {
+    let style = diff_line_style(line);
+    Span::styled(line.to_string(), style)
+}
+
+/// Style decision for a single diff line. Pure and unit-testable.
+///
+/// Classification is by the first non-whitespace column only -- never by a
+/// later `+`/`-` byte inside the text. Shears the adversarial case where a
+/// deleted context line contains a literal `+` and would otherwise mis-tint.
+fn diff_line_style(line: &str) -> Style {
+    let trim = line.trim_start();
+    if trim.starts_with("@@") {
+        Style::default().fg(CYAN)
+    } else if trim.starts_with('+') {
+        Style::default().fg(DIFF_ADD)
+    } else if trim.starts_with('-') {
+        Style::default().fg(DIFF_DEL)
+    } else {
+        Style::default()
+    }
+}
+
+/// A stub for future per-token syntax shading. The line's classification as
+/// `+/-/@@` already happens at [`paint_diff_line`]; this gives a separate
+/// seam for *intra-line* token colouring (e.g. identifiers, strings).
+/// Today's zero-dep policy keeps it as identity (returns the line unaltered
+/// so anyone routing a styled line through here preserves it). NOTE: the
+/// returned string is cloned for ownership; the caller merges with style.
+#[allow(dead_code)] // future-syntax seam; intentionally stubbed
+fn paint_token(line: &str, _lang: &str) -> Span<'static> {
+    Span::raw(line.to_string())
 }
 
 // -- Centered-rect helper -------------------------------------------------
@@ -1376,11 +1505,57 @@ pub fn render(frame: &mut Frame, view: &View) {
     }
 
     if let Some(prompt) = &view.modal {
-        let hint = "[y] proceed   [n] block";
+        // Hunk preview budget (lines) before the diff body collapses with an
+        // `[e] expand` hint. Chosen so a typical 6-10 line change shows in full;
+        // longer changes (a `write_file` over a big file) start collapsed.
+        const DIFF_PREVIEW_ROWS: usize = 12;
+
+        let hint = if view.modal_diff.is_some() {
+            "[y] proceed   [n] block   [e] expand   [c] collapse"
+        } else {
+            "[y] proceed   [n] block"
+        };
+
+        // Build the diff body lines if any, painting each line via
+        // [`paint_diff_line`]. Long hunks collapse past DIFF_PREVIEW_ROWS.
+        let mut diff_lines: Vec<Line<'static>> = Vec::new();
+        let mut collapsed = false;
+        if let Some(diff) = &view.modal_diff {
+            let all: Vec<&str> = diff.lines().collect();
+            let total = all.len();
+            let expanded = view.modal_diff_expanded;
+            let show_end = if expanded {
+                total
+            } else {
+                DIFF_PREVIEW_ROWS.min(total)
+            };
+            for line in all.iter().take(show_end) {
+                diff_lines.push(Line::from(paint_diff_line(line)));
+            }
+            if total > DIFF_PREVIEW_ROWS {
+                collapsed = !expanded;
+                let line = if expanded {
+                    format!(
+                        "… +{} more lines (collapse: [c])",
+                        total - DIFF_PREVIEW_ROWS
+                    )
+                } else {
+                    format!("… +{} more lines (expand: [e])", total - DIFF_PREVIEW_ROWS)
+                };
+                diff_lines.push(Line::from(Span::styled(line, Style::default().fg(DIM))));
+            }
+        }
+        let _ = collapsed; // signalled in the `… +N more` line above
+
         // Floor the inner width so the hint line is never truncated on a narrow
-        // terminal (the hint is the modal's critical affordance).
-        let inner_width = prompt.chars().count().max(hint.chars().count()).max(40) as u16;
-        let area = centered_rect(inner_width + 4, 5, frame.area());
+        // terminal (the hint is the modal's critical affordance). The diff body
+        // is allowed to wrap inside the box (Paragraph::Wrap below).
+        let widest = prompt
+            .chars()
+            .count()
+            .max(hint.chars().count())
+            .max(diff_lines.iter().map(|l| l.width()).max().unwrap_or(0))
+            .max(40) as u16;
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(ACCENT))
@@ -1389,18 +1564,49 @@ pub fn render(frame: &mut Frame, view: &View) {
                 " confirm ",
                 Style::default().fg(DIM),
             )));
-        let body = Text::from(vec![
-            Line::from(Span::styled(prompt.clone(), Style::default().fg(PRIMARY))),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("[y]", Style::default().fg(ACCENT)),
-                Span::styled(" proceed   ", Style::default().fg(DIM)),
-                Span::styled("[n]", Style::default().fg(ACCENT)),
-                Span::styled(" block", Style::default().fg(DIM)),
-            ]),
-        ]);
+
+        let mut body_lines: Vec<Line<'static>> = Vec::with_capacity(2 + diff_lines.len() + 1);
+        body_lines.push(Line::from(Span::styled(
+            prompt.clone(),
+            Style::default().fg(PRIMARY),
+        )));
+        if !diff_lines.is_empty() {
+            body_lines.push(Line::from(""));
+            body_lines.extend(diff_lines);
+        }
+        body_lines.push(Line::from(""));
+        let mut hint_spans = vec![
+            Span::styled("[y]", Style::default().fg(ACCENT)),
+            Span::styled(" proceed   ", Style::default().fg(DIM)),
+            Span::styled("[n]", Style::default().fg(ACCENT)),
+            Span::styled(" block", Style::default().fg(DIM)),
+        ];
+        if view.modal_diff.is_some() {
+            hint_spans.push(Span::styled("   ", Style::default().fg(DIM)));
+            hint_spans.push(Span::styled("[e]", Style::default().fg(ACCENT)));
+            hint_spans.push(Span::styled(" expand   ", Style::default().fg(DIM)));
+            hint_spans.push(Span::styled("[c]", Style::default().fg(ACCENT)));
+            hint_spans.push(Span::styled(" collapse", Style::default().fg(DIM)));
+        }
+        body_lines.push(Line::from(hint_spans));
+        let body = Text::from(body_lines.clone());
+        let body_height = body_lines.len() as u16;
+        let _ = body_height; // see immediately below for area sizing.
+
+        // The modal area = body + 2 rows of border. Capped to the frame height
+        // so very long diffs do not run off-screen (the body then wraps inside).
+        let area_height = (body_height + 2).min(frame.area().height.saturating_sub(1));
+        let area = centered_rect(
+            widest.min(frame.area().width.saturating_sub(4)) + 4,
+            area_height,
+            frame.area(),
+        );
+
         frame.render_widget(Clear, area);
-        frame.render_widget(Paragraph::new(body).block(block), area);
+        frame.render_widget(
+            Paragraph::new(body).wrap(Wrap { trim: false }).block(block),
+            area,
+        );
     } else if let Some(menu) = &view.menu {
         // The picker overlay: a windowed slice of the item list. Only rows
         // [scroll, scroll+rows) are drawn so long lists stay reachable; the
@@ -1678,6 +1884,10 @@ pub enum Action {
     Confirm,
     /// Answer a confirm modal: block.
     Cancel,
+    /// Expand a modal diff body past the preview row budget (M3; `[e]`).
+    ModalExpand,
+    /// Collapse an expanded modal diff back to the preview window (M3; `[c]`).
+    ModalCollapse,
     /// ADEN understand on word at cursor (Ctrl-L; works from Insert for casual users).
     AdenUnderstand,
     /// ADEN asm on word at cursor (Ctrl-A).
@@ -1732,11 +1942,15 @@ pub fn map_input_key(key: KeyEvent) -> Option<Action> {
 }
 
 /// Map a key event while a confirm modal is up. `y`/Enter proceed; `n`/Esc
-/// block. The pump selects this mapping when [`View::modal`] is set.
+/// block. `e`/`c` expand/collapse the modal diff body when one is attached
+/// (M3); they are no-ops when there is no diff. The pump selects this
+/// mapping when [`View::modal`] is set.
 pub fn map_modal_key(key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Action::Confirm),
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
+        KeyCode::Char('e') | KeyCode::Char('E') => Some(Action::ModalExpand),
+        KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::ModalCollapse),
         _ => None,
     }
 }
@@ -2314,6 +2528,11 @@ mod tests {
         assert_eq!(map_modal_key(n), Some(Action::Cancel));
         assert_eq!(map_modal_key(esc), Some(Action::Cancel));
         assert_eq!(map_modal_key(other), None);
+        // M3: expand/collapse keys on the modal's diff body.
+        let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(map_modal_key(e), Some(Action::ModalExpand));
+        assert_eq!(map_modal_key(c), Some(Action::ModalCollapse));
     }
 
     #[test]
@@ -3033,5 +3252,131 @@ mod tests {
             reversed_in_top > 0,
             "matched line must highlight with REVERSED cells, found {reversed_in_top}"
         );
+    }
+
+    // -- M3: diff hunk painting ------------------------------------------------
+
+    #[test]
+    fn m3_paint_diff_line_classifies_by_leading_column_only() {
+        // Pure classifier -- no render needed.
+        let add = diff_line_style("+fn foo() {");
+        assert_eq!(add.fg, Some(DIFF_ADD));
+        let del = diff_line_style("-let old = 5;");
+        assert_eq!(del.fg, Some(DIFF_DEL));
+        let head = diff_line_style("@@ -1,3 +1,4 @@");
+        assert_eq!(head.fg, Some(CYAN));
+        let ctx = diff_line_style(" fn bar() {}");
+        assert_eq!(ctx.fg, None);
+        // Adversarial: a deletion line whose body contains a literal '+'
+        // (e.g. Rust arithmetic) must not be mis-tinted as an addition.
+        let minus_with_plus = diff_line_style("-let z = x + 1;");
+        assert_eq!(minus_with_plus.fg, Some(DIFF_DEL));
+        // Hunk header with a trailing `-` must not classify as deletion.
+        let head_with_dash = diff_line_style("@@ -3,1 +3,2 @@");
+        assert_eq!(head_with_dash.fg, Some(CYAN));
+    }
+
+    #[test]
+    fn m3_confirm_with_diff_paints_modal_diff_body() {
+        let mut view = View::new();
+        let diff = "@@ -1,1 +1,1 @@\n-old\n+new\n";
+        view.confirm_with_diff("GATE BLOCKED: scope-escape", diff);
+        assert!(view.modal.is_some());
+        assert!(view.modal_diff.is_some());
+        // The hint advertises the expand/collapse keys when a diff is attached.
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("[e]"), "expand hint present: {text:?}");
+        assert!(text.contains("[c]"), "collapse hint present: {text:?}");
+        // Both deletion and addition lines render inside the modal area.
+        assert!(text.contains("-old"), "deletion line in modal: {text:?}");
+        assert!(text.contains("+new"), "addition line in modal: {text:?}");
+    }
+
+    #[test]
+    fn m3_confirm_with_diff_collapses_long_hunks() {
+        // > DIFF_PREVIEW_ROWS triggers the ".. +N more lines" row.
+        let mut view = View::new();
+        let mut diff = String::from("@@ -1,1 +1,16 @@\n");
+        for i in 0..20 {
+            diff.push_str(&format!("+line{i}\n"));
+        }
+        view.confirm_with_diff("GATE BLOCKED", diff);
+        // Tall enough terminal to fit the FULL expanded diff (24+ rows), so
+        // both the collapse-state and the expand-state hints render.
+        let mut terminal = Terminal::new(TestBackend::new(60, 32)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("more lines"),
+            "long diff collapses with a hint: {text:?}"
+        );
+        // Expanding flips the hint.
+        view.modal_diff_expanded = true;
+        terminal.draw(|frame| render(frame, &view)).expect("redraw");
+        let text2 = buffer_text(&terminal);
+        assert!(
+            text2.contains("collapse"),
+            "expanded diff shows the collapse hint: {text2:?}"
+        );
+    }
+
+    #[test]
+    fn m3_confirm_with_empty_diff_degrades_to_plain_modal() {
+        let mut view = View::new();
+        view.confirm_with_diff("just a prompt", "");
+        assert!(view.modal_diff.is_none());
+        // No [e]/[c] hint when there is no diff body attached.
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("[e]"),
+            "no expand hint when diff empty: {text:?}"
+        );
+    }
+
+    #[test]
+    fn m3_render_paints_transcript_diff_fences() {
+        // Aden output and tool results often embed ``` ```diff ``` code
+        // fences; the transcript renderer should paint those lines.
+        let mut view = View::new();
+        view.push("coxn: here's the change\n```diff\n@@ -1,1 +1,1 @@\n-a\n+b\n```\n");
+        let mut terminal = Terminal::new(TestBackend::new(50, 12)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        // Walk the buffer by COLUMN (row_text byte indices would be wrong when
+        // a wide glyph like the gutter rule `|` eats 3 bytes for 1 column).
+        // Find the column where `-`/`+` sits, then assert the cell carries
+        // the DIFF_DEL / DIFF_ADD fg.
+        let buffer = terminal.backend().buffer();
+        let total_width: u16 = 50;
+        let mut found_del = false;
+        let mut found_add = false;
+        for y in 0..12u16 {
+            for x in 0..total_width.saturating_sub(1) {
+                let sym_dash = buffer[(x, y)].symbol() == "-";
+                let sym_plus = buffer[(x, y)].symbol() == "+";
+                let next_a = buffer[(x + 1, y)].symbol() == "a";
+                let next_b = buffer[(x + 1, y)].symbol() == "b";
+                let fg = buffer[(x, y)].style().fg;
+                if sym_dash && next_a && fg == Some(DIFF_DEL) {
+                    found_del = true;
+                }
+                if sym_plus && next_b && fg == Some(DIFF_ADD) {
+                    found_add = true;
+                }
+            }
+        }
+        assert!(found_del, "deletion line tinted: diff in transcript");
+        assert!(found_add, "addition line tinted: diff in transcript");
     }
 }
