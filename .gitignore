@@ -14,3 +14,9 @@
 
 # Agent worktrees and session scratch
 /.claude/
+/.codex/
+
+# aden machine-local state (re-derived per session; never committed)
+/.aden/savings.json
+/.aden/project.conf
+/.aden/store/
