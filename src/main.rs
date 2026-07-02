@@ -353,7 +353,7 @@ fn boot_status(model_label: &str, task: &str, aden_active: bool) -> String {
     if aden_active {
         detail.push_str("  K/gd ?");
     }
-    format!("{model_label}  |  {detail}")
+    format!("model: {model_label}  |  scope: {detail}")
 }
 
 /// The status line: the active model, then aden's savings estimate when there
@@ -368,11 +368,11 @@ fn status_line(
     trust: &Trust,
 ) -> String {
     let base = match aden::savings(dir) {
-        Some(savings) => format!("{model_label}  |  {savings}"),
+        Some(savings) => format!("model: {model_label}  |  scope: {savings}"),
         None => boot_status(model_label, task, aden_active),
     };
     let line = match usage {
-        Some(u) if u.prompt_tokens > 0 => format!("{base}  |  {}", ctx_meter(u.prompt_tokens)),
+        Some(u) if u.prompt_tokens > 0 => format!("{base}  |  ctx: {}", ctx_meter(u.prompt_tokens)),
         _ => base,
     };
     format!("{line}  |  {}", trust.status_tag())
@@ -1509,6 +1509,7 @@ async fn drive(
             aden_tip_shown = true;
         }
         view.refresh_suggestion();
+        view.refresh_mode_tip();
 
         // Keep the picker viewport pinned to the selection even on a resize
         // (handlers also re-pin on each key; this covers the no-key frame).
@@ -1524,6 +1525,7 @@ async fn drive(
             continue;
         }
         let ev = event::read()?;
+        view.touch_mode_tip();
         // M5: mouse scroll, picker clicks, modal hints, input cursor, transcript
         // drag-select + OSC52 copy (gated on COXN_CLIPBOARD).
         if let Event::Mouse(me) = ev {
@@ -1803,8 +1805,9 @@ async fn drive(
             continue;
         }
 
-        // `?` in Normal mode (now `g?`): toggle the help overlay.
+        // `g?`: toggle help overlay and flash the compact mode tip (M6).
         if vim_outcome == Outcome::ToggleHelp {
+            view.show_mode_tip();
             view.toggle_help();
             continue;
         }
@@ -2846,8 +2849,9 @@ mod tests {
     fn boot_status_ungated_when_no_task() {
         // No task -> must explicitly surface that only human approval gates edits.
         let s = boot_status("stub-model", "", false);
+        assert!(s.contains("model: stub-model"), "{s}");
         assert!(
-            s.contains("ungated (human approval only)"),
+            s.contains("scope: ungated (human approval only)"),
             "expected explicit ungated text in: {s}"
         );
         assert!(s.contains("/help"), "{s}");
@@ -2857,9 +2861,12 @@ mod tests {
     fn boot_status_task_text_when_task_set() {
         // A non-empty task string appears in the status line.
         let s = boot_status("stub-model", "task 'foo' (1 seed(s), gated)", false);
-        assert!(s.contains("task 'foo'"), "expected task text in: {s}");
+        assert!(
+            s.contains("scope: task 'foo'"),
+            "expected task text in: {s}"
+        );
         // Should not inject "ungated" when the task string is already set.
-        assert!(!s.starts_with("ungated"), "{s}");
+        assert!(!s.contains("ungated"), "{s}");
     }
 
     #[test]
