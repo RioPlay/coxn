@@ -25,7 +25,7 @@ pub(crate) enum Command {
     Trust,
     /// `/copy` writes the transcript to disk.
     Copy,
-    /// `/auth status|login <id>|set-key <id>` runs provider auth helpers.
+    /// `/auth status|setup [preset]|login <id>|set-key <id>` — provider auth helpers.
     Auth(Vec<String>),
     /// `/execute` runs the aden task partition sequentially (BatchIo).
     Execute {
@@ -159,6 +159,10 @@ mod tests {
         assert_eq!(
             parse_command("/auth login openrouter"),
             Command::Auth(vec!["login".to_string(), "openrouter".to_string()])
+        );
+        assert_eq!(
+            parse_command("/auth setup openrouter-claude"),
+            Command::Auth(vec!["setup".to_string(), "openrouter-claude".to_string()])
         );
         assert_eq!(parse_command("/model"), Command::Model(None));
         assert_eq!(

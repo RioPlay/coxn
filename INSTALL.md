@@ -30,7 +30,16 @@ Exit `0` = ready, `1` = blocking (no model), `2` = warnings (no bwrap, etc.).
 ## Provider profiles
 
 For local-first use, coxn auto-detects Ollama and LM Studio. For external
-OpenAI-compatible providers, add profiles to `.aden/config.toml`:
+providers, use the setup wizard or hand-edit `.aden/config.toml`:
+
+```sh
+coxn auth setup                  # list presets (Claude/GPT/Gemini/Grok via OpenRouter, OpenAI direct, local)
+coxn auth setup openrouter-claude
+coxn auth set-key openrouter < key.txt
+coxn auth status
+```
+
+Or add profiles manually:
 
 ```toml
 [provider.openrouter]

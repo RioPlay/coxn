@@ -24,6 +24,7 @@ pub struct AuthReport {
 pub fn report(dir: &Path, args: &[String]) -> AuthReport {
     match args.first().map(String::as_str) {
         Some("status") | None => status(dir),
+        Some("setup") => setup(dir, args.get(1).map(String::as_str)),
         Some("login") => {
             let Some(id) = args.get(1) else {
                 return AuthReport {
@@ -45,8 +46,38 @@ pub fn report(dir: &Path, args: &[String]) -> AuthReport {
         Some(other) => AuthReport {
             code: 2,
             output: format!(
-                "coxn auth: unknown subcommand {other}\nusage: coxn auth status | login <id> | set-key <id>\n"
+                "coxn auth: unknown subcommand {other}\nusage: coxn auth status | setup [preset] | login <id> | set-key <id>\n"
             ),
+        },
+    }
+}
+
+fn setup(dir: &Path, preset_id: Option<&str>) -> AuthReport {
+    let Some(id) = preset_id else {
+        let mut out =
+            String::from("provider presets (coxn auth setup <id> or /auth setup <id>):\n\n");
+        for p in provider::presets() {
+            let key = if p.needs_key {
+                format!("needs {}", provider::secret_env_name(p.instance_id))
+            } else {
+                "no key".to_string()
+            };
+            out.push_str(&format!("  {:<18} {} — {key}\n", p.id, p.label));
+        }
+        out.push_str("\nexample: coxn auth setup openrouter-claude\n");
+        return AuthReport {
+            code: 0,
+            output: out,
+        };
+    };
+    match provider::apply_preset(dir, id) {
+        Ok(msg) => AuthReport {
+            code: 0,
+            output: msg,
+        },
+        Err(e) => AuthReport {
+            code: 1,
+            output: format!("{e}\n"),
         },
     }
 }

@@ -1,3 +1,6 @@
+# Copy to .aden/config.toml or run: coxn auth setup <preset>
+# Secrets never go here — use COXN_KEY_<INSTANCE> or coxn auth set-key <id>
+
 [provider.local]
 driver = "openai_compat"
 base_url = "http://localhost:11434/v1"
@@ -8,8 +11,17 @@ driver = "openai_compat"
 base_url = "https://openrouter.ai/api/v1"
 enabled = false
 
+[provider.openai]
+driver = "openai_compat"
+base_url = "https://api.openai.com/v1"
+enabled = false
+
 [route]
 active = "local:qwen2.5-coder"
 scout = "local:qwen2.5-coder"
 synth = "openrouter:anthropic/claude-sonnet-4"
 orchestrate = "local:llama3"
+
+# Presets (coxn auth setup <id>):
+#   local-ollama, ollama-native, lmstudio
+#   openai, openrouter-claude, openrouter-gpt, openrouter-gemini, openrouter-grok
