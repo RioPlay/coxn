@@ -291,6 +291,7 @@ impl Model for StubModel {
 pub enum AnyModel {
     Stub(StubModel),
     OpenAiCompat(crate::openai::OpenAiCompatModel),
+    Ollama(crate::ollama::OllamaModel),
 }
 
 impl Model for AnyModel {
@@ -298,6 +299,7 @@ impl Model for AnyModel {
         match self {
             AnyModel::Stub(model) => model.call(request).await,
             AnyModel::OpenAiCompat(model) => model.call(request).await,
+            AnyModel::Ollama(model) => model.call(request).await,
         }
     }
 
@@ -311,6 +313,7 @@ impl Model for AnyModel {
         match self {
             AnyModel::Stub(model) => model.stream(request, on_delta).await,
             AnyModel::OpenAiCompat(model) => model.stream(request, on_delta).await,
+            AnyModel::Ollama(model) => model.stream(request, on_delta).await,
         }
     }
 }

@@ -73,7 +73,7 @@ DONE. Deps approved (P3.0) and the path verified live against LM Studio.
 * [x] P3.2b Tool-calling over the wire: `Message` carries tool_calls/tool_call_id; `Tool` carries JSON schemas; `advertised_defs` -> OpenAI `function` tools; assistant tool_calls + `tool` results threaded; response tool_calls parsed back. Tools read JSON-or-bare args. 2 commits, hermetic tests. Network e2e VERIFIED live (LM Studio gpt-oss-20b).
 * [x] P3.8 Model enumeration + switching: `openai::list_models` lists every model the provider advertises (loaded or not; auth header for cloud); `/model` lists with active marked, `/model <name|#>` switches via `Pump::set_model`. An unlisted name is allowed (backend JIT-loads). Verified live.
 * [x] P3.9 Streaming: `Model::stream` (default delegates to `call`; OpenAiCompat reads SSE, assembling text + tool-call deltas by index). `Pump::run_turn_streaming` threads a sink; `drive` repaints the reply per fragment. Verified live vs LM Studio gpt-oss-20b: text grows smoothly (56->1250 chars over ~5s) AND a streamed tool call drove a gated edit that persisted. Tool-calling-under-streaming works on LM Studio (the drop is Ollama-specific).
-* [ ] Ollama-native `/api/chat` profile -- DEFERRED: Ollama not installed/runnable here, so the protocol code cannot be live-validated (test-first). The OpenAI-compat path covers LM Studio/OpenAI/OpenRouter/vLLM; add the native profile when an Ollama instance is available to test against.
+* [x] Ollama-native `/api/chat` profile (`src/ollama.rs`, `AnyModel::Ollama`). Wire format unit-tested; live Ollama smoke test still pending on hosts without `ollama` installed.
 * [ ] Optional Anthropic-direct profile (native prompt caching, exact billing).
 
 == Phase 4 (coxn-side): the harness -- gated editing  -- DONE
@@ -84,7 +84,7 @@ verified against a real third-party codebase.
 
 * [x] P4.1 Action tools: `edit` (replace an exact unique string) and `write_file` (create/overwrite, makes parent dirs). Both `mutates() == true` and declare `target_path` so the pump can snapshot.
 * [x] P4.2 Apply -> gate -> revert: per DESIGN, aden reads the working-tree diff, so the pump applies the edit, runs `impact-diff --scope`, and on scope-escape/blast-leak reverts only that file (restore bytes / remove a new file) and feeds the verdict back. In-scope edits persist. No git, no new deps. Unit-tested (revert/persist/no-gate) + live.
-* [x] P4.3 Editing requires a scope: no task -> no gate -> mutating tools refused (never ungated), and the action tools are registered only when the scope actually gated.
+* [x] P4.3 Editing model: action tools are always advertised (model discovers them); every mutation requires explicit user approval (TurnIo). With scope: aden gate on top (approve -> apply for diff -> impact-diff --scope -> revert on escape/leak). Without scope ("ungated"): approval is the only gate and effects stand. (Superseded by actual F4 implementation; see note below.)
 * [x] P4.4 Task-mode operating preamble (`AGENT_PREAMBLE`): one sanctioned nudge so a weak model with the empty default prompt actually calls the action tools (gpt-oss-20b otherwise answers "I can't edit files"). Added only when gated.
 * [x] P4.5 Boot UX: paint a frame before the slow aden subprocess calls; defer the cosmetic savings probe off the boot path. No more blank/frozen terminal on a large repo.
 * [x] P4.6 README.md: quickstart, model selection, task mode, slash commands, the aden seam.
@@ -117,13 +117,130 @@ commits; 101 tests green, clippy/fmt clean, still six deps):
 
 == Phase 5 (later): multi-model workflows and sub-agents
 
-* [~] Sub-agent = pump instance (model by role + `aden scope` context + tool subset + budget); returns a dense result, not a transcript. PARTITION CONSUMPTION DONE: `agents.rs` parses aden's `scope --agents` index + orders by dependency; `/agents` shows the plan with per-role routed models (live-verified). The autonomous runner (one pump per sub-scope, auto-approved, dense-merge) is the remaining step -- gated on aden non-degenerate partitions + multiple loadable role-models to validate.
-* [ ] Execute `aden scope` manifests + overlap/order; coxn spawns/paces/merges. No planner in coxn (aden owns the partition).
-* [ ] Token-efficiency discipline: disjoint scopes, pull + dense-merge, cheap/local fan-out, one-model-per-subtask for cache, per-agent budgets + adaptive stopping. (Parallelism buys wall-clock, not tokens.)
+* [~] Sub-agent = pump instance (model by role + `aden scope` context + tool subset + budget); returns a dense result, not a transcript. PARTITION CONSUMPTION DONE: `agents.rs` parses aden's `scope --agents` index + orders by dependency; `/agents` shows the plan with per-role routed models (live-verified).
+* [x] Sequential runner: `/execute` spawns one `Pump` per sub-scope in dependency order, `BatchIo` auto-approve, dense merge upstream (`execute_partition` in main.rs). Live validation on real partitions still open.
+* [ ] Per-role tool subsets + per-scope token budgets + adaptive stopping.
+* [ ] Parallel execution (sequential first per routing.adoc).
+
+== Phase G (adoption): distribution and first-run -- DONE
+
+* [x] G1 CLI: `coxn --version`, `--help`, `coxn doctor` (`src/doctor.rs`)
+* [x] G2 Stub gate: offline stub blocks chat, `[r]` retry / `[q]` quit
+* [x] G3 Default preamble ungated (`AGENT_PREAMBLE_BASE` unless `COXN_BARE=1`)
+* [x] G4 crates.io metadata + GitHub Actions CI/release workflow
+* [x] G5 INSTALL.md + README prerequisites
+
+== Phase H (ergonomics): daily UX -- MOSTLY DONE
+
+* [x] Trust tiers: session-auto `read_file`, `/trust` toggle (`src/trust.rs`)
+* [x] `@path` input expansion (3 files, 8k cap)
+* [x] Native `grep` / `glob` tools (`src/tools.rs`)
+* [x] `/scope`, `/copy`
+* [~] Simple mode: vim defaults Insert; `COXN_VIM` opt-in deferred
+
+== Phase I (wedge visibility): gate demo -- PARTIAL
+
+* [x] Gate revert banner + confirm modal with verdict label
+* [x] Dirty-tree boot warning when task scope active
+* [x] `scripts/demo-sandbox.sh`
+* [x] `scripts/demo-scope-escape.sh` (deterministic wedge demo)
+* [ ] README GIF for scope-escape demo
+
+== Phase J (provider): Ollama native -- DONE (live smoke pending)
+
+* [x] `OllamaModel` `/api/chat` profile (streaming + tools on `:11434`) — see `src/ollama.rs`
+
+== Phase K (architecture): extract drive loop -- DONE (main.rs target met)
+
+* [x] Move `run_tui` + `drive` + TUI helpers out of `main.rs` into `src/drive.rs` (~2955 LOC). `main.rs` is CLI routing only (87 LOC). `build_registry`/`register_aden_tools` moved to `tools.rs`. `app.rs` holds model-selection + session wiring (222 LOC); `commands.rs` + `execute.rs` already extracted.
+
+== Phase M (automation): headless -- DONE
+
+* [x] `coxn once -p` with `COXN_AUTO_APPROVE=1` + `BatchIo`
+
+== Phase N (provider): profiles, auth, cloud opt-in -- MOSTLY DONE
+
+Spec: `docs/provider-auth-plan.adoc` (delegation plan; T3 Code patterns).
+
+* [x] N0 Spec lock: plan + this ledger (no code)
+* [x] N1 Provider instance types + `[provider.*]` config load (`src/provider.rs`)
+* [x] N2 `resolve_instance` / `instance:model` routing + secrets + `COXN_ALLOW_CLOUD` gate
+* [x] N3 `coxn auth status|login|set-key` + doctor per-instance rows
+* [x] N4 `/model`, `/execute`, status line wired to instances
+* [x] N5 Docs + example config (OpenRouter preset, INSTALL)
+* [ ] N6 (optional) CLI piggyback backend (`codex`/`claude` subprocess)
+* [ ] N7 (parallel) `main.rs` → `app.rs` extract (Phase K)
+* [x] N8 T3-derived hardening: provider slug/env validation, unknown-driver unavailable state, atomic secrets
+* [ ] N9 Codex app-server auth probe (`initialize` + `account/read`)
+* [x] N10 Provider environment presets (`coxn auth setup`, `/auth setup <id>`) for Ollama/LM Studio/OpenAI/OpenRouter
+* [ ] N10b CLI backend design (piggyback — see N6/N11)
+* [ ] N11 CLI-backed provider MVP (`AnyModel::CliPiggyback`)
+
+== Phase T (TUI frictionless): daily-driver chrome -- DONE
+
+Spec: `docs/tui-frictionless-plan.adoc`. Six deps unchanged.
+
+* [x] M1 Multiline input + submit semantics (Alt/Shift-Enter, bracketed paste)
+* [x] M2 Transcript search + context-sensitive `/` (aden grep → `gr`, help → `g?`)
+* [x] M3 Diff hunk rendering in approval modal + transcript
+* [x] M4 Fuzzy command palette (`Ctrl-Space`)
+* [x] M5 Mouse + OSC52 clipboard (`COXN_CLIPBOARD=on`)
+* [x] M6 Mode cheat-sheet + status-line chips
+
+== Phase O (next-generation harness): scoped execution and observability -- DONE (live partition validation open)
+
+Spec: `docs/next-generation-harness-plan.adoc` (KISS execution plan).
+
+* [~] O1 Architecture extraction: `src/commands.rs` owns slash parsing/completion;
+      `src/execute.rs` owns sequential + parallel partition execution;
+      `src/app.rs` owns the model-selection + session-wiring core (`Endpoint`,
+      `ModelSel`, `openai_model`/`ollama_model`, `resolve_instance_from_config`,
+      `resolve_role`, `task_config`, `AGENT_PREAMBLE_*`); `main.rs` is CLI
+      routing only (87 LOC); the TUI drive loop lives in `drive.rs` (Phase K
+      done; 298 tests green, no behaviour change).
+* [x] O2 Sequential sub-agent correctness: per-role `ToolPolicy` tool subsets and
+      per-scope budgets (`budget_from_manifest` -> prompt, usage in the run
+      report); adaptive stopping via the global hop cap + repeated-tool-error
+      abort; a configurable per-sub-agent turn cap (`Pump::set_max_turns`,
+      `COXN_SUBAGENT_MAX_TURNS`). Live gate validation:
+      `scripts/demo-scope-escape.sh` proves in-scope/scope-escape/revert against
+      real aden 0.2.0 on a fixture repo. A model-driven partition run (scout /
+      synth / orchestrate role selection end to end) is the remaining
+      live-validation open item -- it needs a live model; the gate wedge it
+      rests on is now demonstrated.
+* [x] O3 Run ledger: append-only JSONL events (`src/run_ledger.rs`) for run
+      start/resume, scope start/finish, and run finish; secret redaction;
+      `summarize`/`list`/`scope_statuses`/`latest_for_task`; `COXN_RUNS_DIR`
+      override (also a test hook). The opt-in parallel path records coarse
+      events (granular per-tool events are emitted only on the sequential path).
+* [x] O4 Resume: `run_ledger::latest_for_task` + `scope_statuses` feed
+      `RunLedger::open`; `/execute --resume` is parsed, plumbed, and drives
+      partition continuation (resume always takes the trusted sequential path).
+* [x] O5 Wedge demo: `scripts/demo-scope-escape.sh` (deterministic, no cloud
+      keys, requires `aden`) proves in-scope edit allowed, out-of-scope edit
+      blocked (exit 1), file reverted to HEAD, and `coxn doctor` labels the
+      sandbox state. README gained a "Why coxn is different" three-gate wedge
+      section (human / OS / blast-radius, blocked edit reverted).
+* [x] O6 Parallel execution: opt-in via `COXN_EXECUTE_JOBS` (default `1`,
+      clamped `1..=8`). Correctness invariant -- `impact-diff` judges the whole
+      working tree, so only READ-ONLY scopes run concurrently on worker threads
+      (their pump never invokes the gate); mutating scopes serialize on the
+      driving thread. `jobs == 1` (or `--resume`) takes the unchanged
+      sequential path. Non-Send pump state is built + run inside each worker
+      (`current_thread` runtime per thread); only Send-safe `ScopeInput`
+      crosses the boundary.
+* [x] O7 Provider expansion: native Ollama `/api/chat` backend
+      (`AnyModel::Ollama`, `src/ollama.rs`; NDJSON streaming, function tools,
+      usage from `prompt_eval_count`/`eval_count`, tool-call dedup) behind
+      `ProviderDriver::Ollama`, with `ollama_model`, `/auth` + `/doctor`
+      reachability probes. Live Ollama smoke test pending (no `ollama` binary on
+      this host); the wire format is unit-tested. Codex probe + CLI piggyback
+      backend remain open (Phase N9-N11).
 
 == Notes / decisions
 
 * Live validation (against a real third-party codebase, 42k-contract aden store): the full aden seam -- `scope`, `impact-diff --scope` (in-scope AND scope-escape on a dirty tree), `asm` (bare seeds resolve), `status` savings, `config` -- all confirmed against real aden 0.2.0. The TUI loop confirmed against LM Studio gpt-oss-20b: auto-detect, grounded reply on a real symbol, tool-calling round-trip.
+* Added vim-native aden symbol navigation (K / gd for Understand; ga for asm; gi for impact; gv for view; / for grep) + ex commands :view, :viz/:mermaid/:gm, :doctor, :impact. Pull::Impact via `aden query --impact`. Non-blocking spawn for view; full graceful degrade; 234 tests + fmt/clippy green. Directly advances the "vim motions + visual layer + self-audit" items.
 * Gated editing confirmed live on a throwaway repo: model called `edit` with correct JSON, coxn applied + gated in-scope, the change persisted on disk.
 * Known constraint: `impact-diff` judges the WHOLE working-tree diff vs HEAD, so a tree already dirty outside the scope mandate blocks every edit. coxn effectively expects a tree scoped to the task.
 * Open: merge the aden `feat/coxn-directional-prereqs` branch (PoC gate now satisfied) -- outward-facing, awaiting the user. Streaming/Ollama-native and sub-agents remain.

@@ -1,0 +1,393 @@
+= coxn TUI Frictionless Overhaul — Design Note
+:status: implemented (M1–M6 shipped on feat/tui-frictionless)
+:date: 2026-07-02
+:audience: /plan-eng-review skill, then implementer
+:parent: DESIGN.adoc, PLAN.adoc
+:toc: preamble
+:toclevels: 3
+
+Eliminate the relearning cost vs Claude Code / Codex CLI / Grok Code. The pump
+stays minimal; the chrome catches up. Six deps stays six.
+
+== Locked decisions
+
+These are settled; the review below pressures them but does not reopen them
+without cause.
+
+[%header,cols="1,3"]
+|===
+|Decision |Settled
+
+|Submit
+|LOCKED (R1, user-confirmed): `Enter` sends; `Alt-Enter` inserts newline;
+ `Shift-Enter` also inserts newline when the terminal reports it (permissive
+ via `KeyModifiers::SHIFT` on `Enter`). No `Ctrl-Enter` (decoders unreliable).
+ Bare `Enter` ALWAYS submits regardless of buffer line count — no
+ "non-final-line softens Enter" rule. Matches Codex/Claude muscle memory;
+ Alt-Enter is reliably reported.
+
+|Search key
+|Context-sensitive `/`. Quote-strings styled. Normal-mode `/` searches forward,
+ `?` backward, `n/N` next/prev (vim-native). Insert-mode `/foo` stays a slash
+ command. Aden symbol-grep rebinds to `gr`.
+
+|Diff rendering
+|Hunk coloring (green `+`, red `-`, cyan `@@`). No tree-sitter/syntect. A
+ `paint_token` hook is stubbed (passes through) so a future syntax decision is
+ one swap, not a refactor.
+
+|Palette
+|`Ctrl-Space` opens a type-to-filter fuzzy picker unifying `/model`,
+ `/session`, and slash-verb menus. `j/k` still works inside it.
+
+|Mouse + clipboard
+|Mouse capture (already imported), wheel scroll (already works), click-to-
+ select picker rows + approve/deny buttons; OSC52 copy on transcript
+ selection, gated on `COXN_CLIPBOARD=on` (default off).
+
+|Mode clarity
+|`INSERT/NORMAL/VISUAL/COMMAND` tag already in the status line. Add a one-line
+ cheat-sheet tip under it, toggled by `g?` (`?` moves to backward search).
+|===
+
+== Non-goals (do NOT break)
+
+* The three-gate safety model (human / OS / blast-radius).
+* Alt-screen rendering. Inline diffs are coloured, *not* syntax-highlighted.
+* Provider neutrality. No tooling depending on a specific backend.
+* The "dumb pump" law: coxn steers and renders; no intelligence moves in here.
+
+== Roadmap (atomic commits, M1 before M2)
+
+[cols="1,4,1",options="header"]
+|===
+|ID |What |Why sequential
+
+|M1 |Multiline input + submit semantics
+|Every later milestone assumes the input buffer can hold `\n`. Touches
+ `vim.rs::handle` `Outcome::Submit` wiring and the input render path; the
+ engine already treats `text` as a multiline string, the change is at the
+ *event wiring* (where `Enter` goes).
+
+|M2 |Transcript search + `/` rebinding
+|Once submit-vs-newline is settled, `Enter` in Normal-mode search and
+ Insert-mode submit no longer collide. Relocates aden-grep to `gr` and help
+ to `g?` — one CHANGELOG-visible key change.
+
+|M3 |Diff hunk rendering (approvals + transcript)
+|Paint-only, on top of the existing snapshot/revert path. Adds a stubbed
+ `paint_token` hook threaded through both render sites so a future syntax
+ swap is local.
+
+|M4 |Fuzzy command palette (`Ctrl-Space`)
+|Reuses the existing `Menu` widget; once M3's `paint_token` hook is in place
+ the palette can colour-code diffs in the matched items too.
+
+|M5 |Mouse + OSC52 clipboard
+|Adds click-to-select on M4's palette rows and M3's approve/deny buttons —
+ depends on those being rendered.
+
+|M6 |Mode cheat-sheet + status-line chip separation
+|Pure paint + a 5s idle timer on the tip. Cosmetic; lands last.
+|===
+
+== Per-milestone design
+
+=== M1 — Multiline input + submit semantics
+
+* `View::input` stays a `String` (already multiline-capable). `View::cursor`
+  stays a byte offset (the invariant it already maintains). No new type.
+* New `assume_paste_mode` triggered by bracketed-paste start/end escapes:
+  the whole paste lands as one undo unit and never trips Vim's per-key
+  motions. The bracketed-paste protocol is `CSI ? 2004 h` / `CSI ? 2004 l`.
+* Keys:
+  ** `Enter` → submit (any line, if the buffer ends non-blank on the last
+     line; if the buffer is multiline and the cursor is on a non-final line,
+     `Enter` inserts a newline instead — this matches how Codex's grow-box
+     behaves when the model is mid-multiline).
+  ** `Alt-Enter` → insert newline, always.
+  ** `Shift-Enter` → insert newline when reported. Otherwise treated as
+     `Enter` (permissive).
+  ** `Ctrl-Enter` → noop (decoders generally cannot distinguish; do not
+     promise behaviour we can't deliver honestly).
+* Tests: paste-safety unit (multi-line paste into a one-line buffer
+  preserves lines and is one undo unit); render test (input box grows in
+  rows; `Wrap` honoured); enter-vs-alt-enter mapping in Insert and Normal.
+
+NOTE: The `Vim` engine does NOT need changes — `text` is already a multiline
+      string and `cursor` a byte offset. The change is in the *event wiring*
+      in `main.rs`/`tui.rs` (where `Enter` dispatches) plus the render path
+      (input box must wrap on rows now, not one line). Flag this in the
+      commit body.
+
+=== M2 — Transcript search + `/` rebinding
+
+* New `View` fields: `search: Option<SearchState>`. `SearchState` holds
+  `query: String`, `matches: Vec<usize>` (visual-line indices into `output`),
+  `current: usize`, `direction: dir::Dir`. Render tints matched ranges.
+* Normal-mode `/` opens a one-line search field *under* the input (not a
+  modal — interactive search); `Enter` commits, `Esc` cancels, `n/N` next/prev.
+* Aden symbol-grep rebinds to `gr` in `vim.rs::handle` Normal dispatch.
+* Help overlay moves from `?` to `g?` (`g` prefix already exists for `gg`).
+* Tests: search-state transitions; `/` in Normal opens search, in Insert
+  stays a slash (bind test); `gr` from Normal emits `AdenGrep` not search;
+  help toggles on `g?`.
+* CHANGELOG: surface the `/` rebinding — it's the one visible break for
+  power users.
+
+=== M3 — Diff hunk rendering (approvals + transcripts)
+
+* `paint_diff_line(line: &str) -> Vec<(Style, &str)>` classifies `+`/`-`/
+  `@@`/context and returns styled spans. Four cases plus the adversarial
+  case (a `-` line inside an `@@` hunk — hunk context wins).
+* Approval modal: when the pending approval is `edit` or `write_file`,
+  render the unified diff (we already have before/after bytes on the
+  snapshot path — see `pump.rs` snapshot machinery) up to N lines, with a
+  `[e] expand` / `[c] collapse` toggle for long hunks. Keys map *on top of*
+  the existing `[o]/[s]/[d]/[x]` — no existing approvals change.
+* Transcript: `` ```diff `` fenced blocks render via the same helper. Plain
+  text unaffected.
+* `paint_token(line, lang) -> Vec<(Style, &str)>` is a stub that returns the
+  line unchanged; threaded through both render sites so a future "real
+  syntax" decision is one swap.
+* Tests: classifier (4 cases + adversarial); modal-render with a 3-line
+  diff (TestBackend); approval-key wiring expands/collapses without breaking
+  `[o]/[s]/[d]/[x]`.
+
+NOTE: The snapshot/revert path is unchanged — this is paint only. The
+      snapshot bytes already exist in `pump.rs` per Phase 4 revert machinery.
+
+=== M4 — Fuzzy command palette (`Ctrl-Space`)
+
+* Reuse the existing `Menu` widget; add `filter: String` and recompute
+  visible items by subsequence-match (case-insensitive). Pin `selected` to
+  the top match.
+* Palette items = slash verbs + every model + every saved session slug +
+  last 8 commands. Selecting acts like typing the equivalent `/verb` or
+  picking the `/model` row.
+* `Ctrl-Space` opens in every mode *except* the approval modal — modal
+  keys stay modal.
+* The existing `/model` and `/session` pickers stay as direct entry
+  points. The palette unifies discovery; it never replaces them.
+* Tests: fuzzy filter ranks subsequence matches; `selected` re-pins on
+  filter change; opening palette in Insert does not submit; opening inside
+  the modal is a no-op.
+
+=== M5 — Mouse + OSC52 clipboard
+
+* Mouse capture is already `EnableMouseCapture`d on enter. Add:
+  ** Click on a picker row → `MenuSelect` on that row.
+  ** Click on the approve/deny hint zone → answer the modal.
+  ** Drag-select in the transcript → selection buffer.
+  ** Click-to-place-cursor in the input box (positional).
+* On selection end (mouse-up or leaving the transcript region), emit OSC52
+  `\x1b]52;c;<base64>\x07` to stdout. Gate on `COXN_CLIPBOARD=on`; on
+  unsupported terminals the selection stays local.
+* Tests: picker click emits `MenuSelect` on the right row; modal answers
+  on click inside the hint zone; OSC52 base64 correctness.
+* Risk: alt-screen blocks native text selection. OSC52 is the standard
+  workaround but is not universally supported — that's why it's gated.
+
+=== M6 — Mode cheat-sheet + status-line chip separation
+
+* Under the existing mode tag, a dimmed one-line tip rotates per mode:
+  ** `INSERT: type. Enter send. Alt-Enter newline.`
+  ** `NORMAL: h/j/k/l. / search. gr grep. g? help.`
+  ** `VISUAL: v motion. d/y operate.`
+  ** `COMMAND: :view :grep :doctor :impact.`
+* Toggled by `g?`. Disappears after 5s of idle typing to avoid crowding
+  power users.
+* Status line: separate `scope:` / `model:` / `ctx:` / `mode:` chips with
+  consistent separators. Savings no longer clobbers model errors (already
+  fixed in Phase 3.6 — chip separation makes the mode tag legible at a
+  glance).
+* Tests: tip text per mode (4 cases); tip dismisses after idle; status
+  chips render in order.
+
+== Validation gate
+
+Per CLAUDE.md, each milestone:
+
+----
+cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings \
+  && cargo test --workspace
+----
+
+must be green before the next milestone starts. Non-negotiable.
+
+The deep PTY path (driving coxn under a real PTY with input) has no
+automated test today — under PLAN Phase O1 this is called out as "high
+blind-refactor risk". M1 and M2 touch the drive loop. Mitigation:
+exhaustive unit tests on pure logic + a manual PTY smoke for the wiring,
+committed instructions in each commit body (not an automated test).
+
+== Out of scope (logged, not done here)
+
+* tree-sitter/syntect real syntax (flagged via the `paint_token` stub).
+* A native streaming profile for servers that drop tool calls under
+  streaming (Phase 3b open item — independent).
+* The `main.rs` → `app.rs` extract (Phase K/O1 — do NOT confuse with
+  this — it is a separate refactor on the same files; running them
+  concurrently would collide).
+
+== Eng review findings
+
+Ground in the actual hot paths (M = main.rs, T = tui.rs, V = vim.rs, P =
+pump.rs):
+
+* `Outcome::Submit` emission: V:313 (Normal Enter), V:562 (Visual Enter);
+  Insert-style Enter goes via `Outcome::Pass` -> T:1373 `Some(Action::Submit)`.
+* Dispatch site: M:1952 `let action = if vim_outcome == Outcome::Submit`.
+* Snapshot machinery: `Pump<M>::run_gated_mutation` (P:404) snapshots the
+  target *before* applying, then reverts on a gate block — the before-bytes
+  exist only while the gated mutation is running; *after* bytes come from
+  the tool args.
+* Mouse capture already enabled; only `MouseEventKind::ScrollUp/ScrollDown`
+  is wired (M:1272-1273).
+
+=== R1 — Submit semantics (TASTE GATE, needs user)
+
+Plan currently says: bare `Enter` ALWAYS submits; `Alt-Enter` newline;
+`Shift-Enter` newline when reported; `Ctrl-Enter` noop.
+
+Code reality: `Enter` submits in BOTH Insert (via T:1373) and Normal/Visual
+(V:313, V:562). The plan's *first draft* of M1 said "if cursor is on a
+non-final line of a multiline buffer, `Enter` inserts a newline instead of
+submitting" — that breaks "Enter always sends" muscle memory. Codex and
+Claude Code do Enter-sends-always. DROPPED that conditional-Enter rule.
+
+The user's instinct in the taste-questions round was: Shift-Enter for
+newlines (familiar), maybe Ctrl-Enter for submit. Tradeoffs:
+
+[%header,cols="1,3,1"]
+|===
+|Submit / newline |Mouse memory |Reliability concern
+
+|Enter sends + Alt-Enter newline (current plan)
+|Codex / Claude Code default. Matches what most users have relearned
+ already. |Alt-Enter is reliably reported by terminal decoders. Safe.
+
+|Enter sends + Shift-Enter newline (user lean)
+|Most editors and Slack-style chat. Matches user's stated instinct.
+ |MANY terminals (gnome-terminal, kitty-older, weechat, vscode
+ integrated) report Shift-Enter as plain Enter — silently breaks newline.
+
+|Ctrl-Enter sends + Enter newline
+|Slack/Discord web pattern. Aggressive change vs Codex/Claude.
+ |Ctrl-Enter is also not universally distinct from plain Enter. And it
+ inverts the harness muscle memory (Codex/Claude users expect Enter to
+ send).
+|===
+
+Recommendation: Stick with Enter-sends + Alt-Enter-newline (current plan),
+ALSO accept Shift-Enter-newline when the terminal reports it (permissive —
+matches user instinct for the terminals that support it). Drop the
+"cursor-on-non-final-line softens Enter" rule. NO Ctrl-Enter binding — too
+unreliable to promise.
+
+This is the only review decision that needs the user. SURFACED at the end
+of this report.
+
+=== R2 — M3 design fix: diff is computed PRE-approve, not from snapshots
+
+The plan's M3 said "we already have before/after bytes on the snapshot path"
+for the approval modal. Wrong on read. The snapshot machinery (P:404) runs
+AT apply time, AFTER the user has approved. For the modal to show a diff
+BEFORE approval, we need to compute it from:
+
+* `edit`: the tool's args carry `target_path` + `old` (the exact unique
+  string to find) + `new`. Read the on-disk bytes for the file, do a
+  string-replace preview to get the after-bytes, line-diff the two. Cheap.
+* `write_file`: the tool's args carry `target_path` + `content`. If the
+  file exists on disk, read it for before; otherwise before = empty. After
+  = `content` from args.
+
+Updated M3 plan: the approval modal computes the diff from (tool args, disk
+bytes) at render time, BEFORE the user approves. The snapshot path is
+unchanged and runs AFTER approval. The `paint_diff_line` helper is shared.
+
+=== R3 — M1 collision: `j/k` is dual-purpose
+
+In a one-line input buffer, `j/k` in Normal mode scrolls the transcript
+ledger (V:42-53 `Scroll::LineDown/LineUp`). In a MULTILINE input buffer,
+`j/k` should move the cursor between input lines instead.
+
+Resolution: `j/k` move within the input buffer when it has >1 line; falls
+back to ledger scroll when single-line. Other ledger-scroll motions
+(`Ctrl-D`/`Ctrl-U`, `G`, `gg`) keep their ledger-scroll meaning regardless
+(this is the Codex/Claude convention; you scroll the chat with Ctrl-D/U and
+the input row navigates line-by-line with j/k). Test for this in M2 not M1
+(since M1 lands the multiline primitive).
+
+=== R4 — Vim engine single-line assumption (M1 risk)
+
+The plan's M1 NOTE says "the engine treats text as a multiline string and
+cursor a byte offset, so no engine changes". Half true. Verified:
+
+* `text` is `String`, `cursor` is byte offset - yes, both already
+  `\n`-tolerant at the type level.
+* Motions `0`, `$`, `w`, `b`, `e`, `yy`, `dd`, `cc` - need a real
+  read-against-code to confirm they navigate within a line vs across `\n`
+  cleanly. Test in M1: pass `"foo\nbar"` to every motion and assert
+  char-boundary correctness. If any motion panics on `\n`, fix it as part
+  of M1 (engine change, not wiring).
+
+=== R5 — Bracketed paste enabled alongside mouse (M1 + M5)
+
+If we enable mouse capture (`EnableMouseCapture`) and we want paste safety
+(bracketed-paste, `CSI ? 2004 h`/`l`), we should enable bracketed paste on
+enter too and disable on exit — symmetric with mouse. Otherwise large
+pastes can still trip Vim's per-key motions (the paste-safety layer needs
+the bracketed-paste marker to know the whole paste is one unit). Add this
+to the same `enter_raw_mode`/`leave_raw_mode` pair in tui.rs.
+
+OSC52 lives on stdout interleaved with ratatui's draw stream — must emit
+between frames, not mid-paint. M5 must buffer OSC52 writes for after the
+next flush.
+
+=== R6 — Scope: the diff hunk helper doubles for the gate-revert banner
+
+The gate-revert banner (T:already paints "EDIT BLOCKED by aden gate" with
+the verdict label). With M3 in place, that banner can ALSO render the
+reverted diff in dimmed red — free reuse, no extra surface. Add to M3's
+render match, not a separate milestone.
+
+=== R7 — Non-issue: fuzzy subsequence vs fuzzy word-prefix
+
+Codex's fuzzy uses subsequence (a la fzf); Claude Code uses subsequence too;
+Grok uses word-prefix. Subsequence is the shared default. Stick with
+subsequence — no decision needed, just note it.
+
+=== Test plan additions beyond the per-M lists
+
+* Adversarial M1: paste containing the bytes `Escape\ni` — bracketed paste
+  must NOT enter Normal mode mid-paste.
+* Adversarial M3: hunk header `@@ -1,3 +1,4 @@` followed immediately by a
+  `+` line that contains a literal `-` at column 0 — classifier must not
+  mislabel the `+` line as a deletion.
+* Adversarial M5: drag-select that ends on a `\x1b` OSC52 byte sequence —
+  selection buffer must stop at the escape, not extend into it.
+
+== GSTACK REVIEW REPORT
+:review_date: 2026-07-02
+:review_skill: /plan-eng-review
+:verdict: APPROVED_WITH_FIXES
+
+=== Summary
+
+* R1 (submit semantics) is the only taste gate remaining; surfaces to the
+  user. Recommendation: Enter-sends + Alt-Enter-newline + Shift-Enter-newline
+  when reported; drop conditional-Enter; no Ctrl-Enter.
+* R2 (M3 diff source) is a design fix — diffs compute from (tool args, disk)
+  at modal-render time, not from the post-approval snapshot path.
+* R3-R5 are real correctness gaps; folded into M1-M5 test plans.
+* R6 is a free reuse; R7 is a non-issue.
+* Six deps stays six. Three gates unchanged. Pump stays dumb.
+
+=== Plan-mode gate checklist
+
+* [x] Plan file ends with `## GSTACK REVIEW REPORT` footer (this section).
+* [x] Issues walked with tradeoffs + recommendations per skill protocol.
+* [x] One taste gate surfaced for the user (R1); the rest locked with
+      recommendations.
+* [x] Adversarial test cases appended to per-milestone test lists.

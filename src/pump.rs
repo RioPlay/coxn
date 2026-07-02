@@ -71,6 +71,12 @@ pub trait TurnIo {
     fn on_run_output(&mut self, _line: &str) -> bool {
         true
     }
+    /// Observe a tool call before it is dispatched.
+    fn on_tool_call(&mut self, _call: &ToolCall) {}
+    /// Observe the tool result after dispatch/gating.
+    fn on_tool_result(&mut self, _call: &ToolCall, _result: &str) {}
+    /// Observe token usage when the provider reports it.
+    fn on_usage(&mut self, _usage: Usage) {}
 }
 
 /// A silent [`TurnIo`]: stream nothing, allow every mutation. Test-only -- it
@@ -122,12 +128,10 @@ impl TurnIo for BatchIo {
     }
 }
 
-/// Dispatch a tool call, flattening the result/error into the text fed back to
-/// the model (an unknown tool or a tool error is information, not a failure).
-fn dispatch_result(tools: &ToolRegistry, call: &ToolCall) -> String {
+fn dispatch_result_with_error(tools: &ToolRegistry, call: &ToolCall) -> (String, Option<String>) {
     match tools.dispatch(call) {
-        Ok(out) => out,
-        Err(err) => err,
+        Ok(out) => (out, None),
+        Err(err) => (err.clone(), Some(err)),
     }
 }
 
@@ -158,6 +162,10 @@ pub struct Pump<M: Model> {
     /// Reasoning-effort level sent with each request (None = unset / provider
     /// default), set via `/think`.
     thinking: Option<ThinkingLevel>,
+    /// Per-pump turn (tool-hop) cap; `None` falls back to `MAX_TOOL_HOPS`.
+    /// Sub-agents set a tighter bound so a stalling scope returns a dense
+    /// failure to its dependents instead of grinding the global cap.
+    max_turns: Option<usize>,
 }
 
 impl<M: Model> Pump<M> {
@@ -174,7 +182,19 @@ impl<M: Model> Pump<M> {
             last_usage: None,
             last_edited: None,
             thinking: None,
+            max_turns: None,
         }
+    }
+
+    /// Set a per-pump turn cap (the most tool hops before the pump stops
+    /// a stalling sub-agent). `None` restores the default `MAX_TOOL_HOPS`.
+    /// Used by `/execute` to bound each sub-scope independently of the global cap.
+    pub fn set_max_turns(&mut self, cap: Option<usize>) {
+        self.max_turns = cap.filter(|c| *c > 0);
+    }
+
+    fn effective_max_turns(&self) -> usize {
+        self.max_turns.unwrap_or(MAX_TOOL_HOPS)
     }
 
     /// Set the reasoning-effort level sent with each request (`/think`).
@@ -277,7 +297,9 @@ impl<M: Model> Pump<M> {
     /// partial tool calls; a declined tool is skipped; a cancel-turn approval
     /// ends the turn after feeding results for the remaining calls.
     pub async fn run_turn_streaming(&mut self, io: &mut dyn TurnIo) -> Result<String, ModelError> {
-        for _ in 0..MAX_TOOL_HOPS {
+        let mut last_tool_error: Option<String> = None;
+        let max_turns = self.effective_max_turns();
+        for _ in 0..max_turns {
             let request = self.request();
             // Wrap the sink to notice a cancellation request mid-stream.
             let mut cancelled = false;
@@ -292,6 +314,9 @@ impl<M: Model> Pump<M> {
             // Track context size: the latest hop that reports usage wins.
             if response.usage.is_some() {
                 self.last_usage = response.usage;
+                if let Some(usage) = response.usage {
+                    io.on_usage(usage);
+                }
             }
             if cancelled {
                 // User aborted: record the partial text, drop partial tool calls,
@@ -319,10 +344,11 @@ impl<M: Model> Pump<M> {
             // tool-call/result pairing stays valid even on a mid-turn cancel.
             let mut end_turn = false;
             for call in &response.tool_calls.clone() {
-                let result = if end_turn {
-                    "turn cancelled by the user".to_string()
+                io.on_tool_call(call);
+                let (result, tool_error) = if end_turn {
+                    ("turn cancelled by the user".to_string(), None)
                 } else if self.tools.mutates(&call.name) {
-                    match io.approve(call) {
+                    let result = match io.approve(call) {
                         Approval::Allow => {
                             if !self.tools.revertible(&call.name) {
                                 self.run_command_streaming(call, io).await
@@ -335,18 +361,33 @@ impl<M: Model> Pump<M> {
                             end_turn = true;
                             "turn cancelled by the user".to_string()
                         }
-                    }
+                    };
+                    (result, None)
                 } else {
-                    dispatch_result(&self.tools, call)
+                    dispatch_result_with_error(&self.tools, call)
                 };
+                io.on_tool_result(call, &result);
                 self.messages
                     .push(Message::tool_result(call.id.clone(), result));
+                if let Some(err) = tool_error {
+                    if last_tool_error.as_deref() == Some(err.as_str()) {
+                        return Err(ModelError::Backend(format!(
+                            "repeated tool error; stopping sub-agent: {err}"
+                        )));
+                    }
+                    last_tool_error = Some(err);
+                } else {
+                    last_tool_error = None;
+                }
             }
             if end_turn {
                 return Ok(content);
             }
         }
-        Err(ModelError::Backend("tool-hop cap reached".to_string()))
+        Err(ModelError::Backend(format!(
+            "tool-hop cap reached ({} turns)",
+            max_turns
+        )))
     }
 
     /// Apply a mutating tool, then let aden's gate accept or reject the result.
@@ -597,6 +638,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_tool_error_stops_the_turn() {
+        let bad_call_1 = ModelResponse {
+            message: Message::new(Role::Assistant, "try"),
+            tool_calls: vec![ToolCall {
+                id: "t1".to_string(),
+                name: "missing".to_string(),
+                arguments: String::new(),
+            }],
+            usage: None,
+        };
+        let bad_call_2 = ModelResponse {
+            message: Message::new(Role::Assistant, "again"),
+            tool_calls: vec![ToolCall {
+                id: "t2".to_string(),
+                name: "missing".to_string(),
+                arguments: String::new(),
+            }],
+            usage: None,
+        };
+        let model = ScriptedModel::new(vec![bad_call_1, bad_call_2, assistant("unreached")]);
+        let mut pump = Pump::new(model, echo_registry());
+        pump.push_user("go");
+        let err = pump.run_turn().await.expect_err("repeated error stops");
+        assert!(
+            err.to_string().contains("repeated tool error"),
+            "unexpected error: {err}"
+        );
+        let tool_errors = pump
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.content == "unknown tool: missing")
+            .count();
+        assert_eq!(tool_errors, 2);
+    }
+
+    #[tokio::test]
     async fn hop_cap_stops_a_looping_model() {
         // A model that always asks for a tool exhausts the hop cap.
         let script: Vec<ModelResponse> = (0..MAX_TOOL_HOPS + 1)
@@ -607,6 +684,31 @@ mod tests {
         pump.push_user("loop");
         let err = pump.run_turn().await.expect_err("cap reached");
         assert!(matches!(err, ModelError::Backend(_)));
+    }
+
+    #[tokio::test]
+    async fn per_pump_turn_cap_is_independent_of_global() {
+        // A tighter per-pump cap fires before the global MAX_TOOL_HOPS.
+        let cap = 3;
+        let script: Vec<ModelResponse> = (0..cap + 1).map(|_| calls_echo("again", "x")).collect();
+        let model = ScriptedModel::new(script);
+        let mut pump = Pump::new(model, echo_registry());
+        pump.set_max_turns(Some(cap));
+        pump.push_user("loop");
+        let err = pump.run_turn().await.expect_err("per-pump cap reached");
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("{} turns", cap)), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn zero_or_absent_cap_falls_back_to_global() {
+        // set_max_turns(Some(0)) restores the global default (no panic, no early stop).
+        let model = ScriptedModel::new(vec![calls_echo("one", "x"), assistant("done")]);
+        let mut pump = Pump::new(model, echo_registry());
+        pump.set_max_turns(Some(0));
+        pump.push_user("go");
+        let out = pump.run_turn().await.expect("turn completes");
+        assert_eq!(out, "done");
     }
 
     use crate::gate::{Gate, GateOutcome, GateVerdict};

@@ -95,6 +95,16 @@ impl GateVerdict {
     pub fn proceed(&self) -> bool {
         matches!(self, GateVerdict::InScope)
     }
+
+    /// Short label for status lines and gate banners.
+    pub fn label(&self) -> &'static str {
+        match self {
+            GateVerdict::InScope => "in-scope",
+            GateVerdict::ScopeEscape => "scope-escape",
+            GateVerdict::BlastLeak => "blast-leak",
+            GateVerdict::Error(_) => "gate-error",
+        }
+    }
 }
 
 /// A gate verdict plus the human-readable message aden surfaced with it.

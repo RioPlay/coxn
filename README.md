@@ -16,6 +16,44 @@ The split:
 The name is coxswain shorthand (`cox'n`): the cox steers the boat and calls the
 cadence but never rows. See `DESIGN.adoc` for the full design and laws.
 
+## Why coxn is different
+
+coxn sits behind three independent gates, each of which can stop an action the
+others permit. An edit that the model wants, that you approve, and that compiles
+still does not land if it escapes the scope:
+
+- **Human gate** — every mutating tool call asks for approval before it runs.
+  `run_command` approval is scoped to the *exact command string*, so a
+  near-identical command re-prompts.
+- **OS gate** — `run_command` runs inside a `bwrap` namespace with no network by
+  default and the environment scrubbed (API keys never leak in). The prompt
+  labels `[sandbox]` vs `[NO SANDBOX]` honestly.
+- **Blast-radius gate** — with a task scope active, coxn applies an edit, runs
+  `aden impact-diff --scope`, and **reverts the file on a scope-escape** before
+  its result is accepted. A change outside the manifest's file mandate never
+  persists, even if the model made it and you approved it.
+
+The wedge is visible in one minute:
+
+```sh
+bash scripts/demo-scope-escape.sh
+```
+
+It builds a throwaway repo, shows an in-scope edit allowed, an out-of-scope edit
+blocked and reverted, and the sandbox state. No cloud keys required.
+
+## Prerequisites
+
+1. **A model** — Ollama/LM Studio running locally, or `COXN_MODEL_BASE_URL` + `COXN_MODEL_KEY`
+2. **Optional:** `bwrap` for sandboxed `run_command` (Linux)
+3. **Optional:** `aden` ≥ 0.2.0 for blast-radius scope gate
+
+```sh
+coxn doctor   # one-screen health check
+```
+
+Install: see [INSTALL.md](INSTALL.md). `cargo install --path .` from this repo.
+
 ## Quickstart
 
 ### Standalone (no aden needed)
@@ -54,16 +92,42 @@ when aden is absent or no task is set.
 Resolution order:
 
 1. `COXN_MODEL_BASE_URL` (+ optional `COXN_MODEL_NAME`, `COXN_MODEL_KEY`) in env
-2. `aden config` values (`model.base_url`, `model.name`) -- only when aden is present
-3. local auto-detect (Ollama `:11434`, then LM Studio `:1234`)
-4. offline stub
+2. `.aden/config.toml` provider profiles: `[provider.*]` plus `[route].active`
+3. legacy `aden config` values (`model.base_url`, `model.name`) -- only when aden is present
+4. local auto-detect (Ollama `:11434`, then LM Studio `:1234`)
+5. offline stub
 
 Any OpenAI-compatible endpoint works: LM Studio, Ollama, vLLM, OpenRouter,
-OpenAI. Secrets come from `COXN_MODEL_KEY`, never a committed config file.
+OpenAI. Secrets come from environment variables or `~/.config/coxn/secrets/`,
+never a committed config file.
+
+Example `.aden/config.toml`:
+
+```toml
+[provider.local]
+driver = "openai_compat"
+base_url = "http://localhost:11434/v1"
+enabled = true
+
+[provider.openrouter]
+driver = "openai_compat"
+base_url = "https://openrouter.ai/api/v1"
+enabled = false
+
+[route]
+active = "local:qwen2.5-coder"
+scout = "local:qwen2.5-coder"
+synth = "openrouter:anthropic/claude-sonnet-4"
+```
+
+Cloud instances are never used accidentally. Enable the provider in config and
+set a key such as `COXN_KEY_OPENROUTER`; without a key, set `COXN_ALLOW_CLOUD=1`
+explicitly. coxn makes no background LLM calls; model calls are user-initiated.
 
 At runtime, `/model` lists every model the provider advertises and `/model
-<name|#>` switches mid-session. Tab-completion and arrow-navigation are available
-in the picker.
+<name|#>` switches mid-session on the active instance. `/model
+<instance>/<name>` switches instance, and `/model @<role>` uses the `[route]`
+mapping. Tab-completion and arrow-navigation are available in the picker.
 
 ## Tools and the safety model
 
@@ -141,6 +205,8 @@ status line is honest about which mode is active.
 | `COXN_MODEL_BASE_URL` | OpenAI-compatible endpoint base URL |
 | `COXN_MODEL_NAME` | Model name to request |
 | `COXN_MODEL_KEY` | API key (never written to config) |
+| `COXN_KEY_<INSTANCE>` | API key for a named provider instance, e.g. `COXN_KEY_OPENROUTER` |
+| `COXN_ALLOW_CLOUD` | Allow a cloud provider instance without a key when set to `1` |
 | `COXN_ADEN_BIN` | Path to aden binary (default: `aden` on PATH) |
 | `COXN_TASK_NAME` | Task name; activates aden scope gate |
 | `COXN_TASK_SEEDS` | Comma-separated seed symbols for the scope |
@@ -162,6 +228,25 @@ status line is honest about which mode is active.
 /edit [path]     open the last-edited file (or path) in $EDITOR
 /clear           clear the conversation (keeps the task scope)
 /quit            leave coxn
+/scope           show active task scope (COXN_TASK_*)
+/trust           toggle read_file session-auto approval
+/copy            save transcript to ~/.local/share/coxn/last-transcript.txt
+/auth status     check configured provider auth
+/auth login <id> print native login or key setup command
+/execute         run aden task partition sequentially
+```
+
+CLI:
+
+```
+coxn doctor              health check
+coxn auth status         check configured provider auth
+coxn auth login <id>     print native login or key setup command
+coxn auth set-key <id>   write ~/.config/coxn/secrets/<id>.key from stdin
+coxn once -p "prompt"    headless turn (COXN_AUTO_APPROVE=1)
+```
+
+Use `@path/to/file` in messages to inject file contents (up to 3 files).
 ```
 
 `/model` and `/session` open an arrow-navigable picker (Up/Down, Enter, Esc).
@@ -180,6 +265,13 @@ Keys:
 | Ctrl-K / Ctrl-U | Cut to end / cut to start |
 | Ctrl-Y | Yank (paste) |
 | Left/Right Home/End | Move cursor |
+| K / gd | (Normal) aden understand symbol at cursor |
+| ga | (Normal) aden asm context for symbol at cursor |
+| gi | (Normal) aden impact for symbol at cursor |
+| gv | (Normal) launch aden view for symbol at cursor |
+| / | (Normal) aden grep on symbol at cursor |
+
+: ex commands in Normal/Command mode include `:view`, `:gm`/`:viz` (mermaid), `:doctor`, `:impact`, `:understand`, `:grep`, `:ask`.
 
 ## Model routing by role
 

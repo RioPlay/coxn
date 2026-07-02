@@ -12,6 +12,14 @@ use std::process::{Command, Stdio};
 
 use crate::gate::{Gate, GateOutcome, GateVerdict};
 
+/// Env flag for read-only aden subprocesses. Suppresses `ensure_fresh` silent
+/// `gen` so coxn (or MCP) can own explicit indexing without store lock fights.
+const ADEN_SKIP_AUTO_GEN: &str = "ADEN_SKIP_AUTO_GEN";
+
+fn read_only_aden_env(cmd: &mut Command) {
+    cmd.env(ADEN_SKIP_AUTO_GEN, "1");
+}
+
 /// The aden binary to invoke. `COXN_ADEN_BIN` overrides it (e.g. to point at a
 /// dev build or the offline branch); otherwise `aden` on PATH.
 fn aden_bin() -> String {
@@ -96,6 +104,8 @@ pub enum Pull<'a> {
     Ask(&'a str),
     /// A symbol's definition and call sites (`aden locate`).
     Locate(&'a str),
+    /// Blast radius / downstream impact (`aden query --impact`).
+    Impact(&'a str),
 }
 
 /// Run the blast-radius gate for `manifest` against the working tree at `dir`.
@@ -120,6 +130,7 @@ pub fn scope_agents(
     budget: u64,
 ) -> Result<String, AdenError> {
     let mut cmd = Command::new(aden_bin());
+    read_only_aden_env(&mut cmd);
     cmd.arg("scope").arg("--agents").arg(name);
     for s in seeds {
         cmd.arg("--seed").arg(s);
@@ -133,8 +144,18 @@ pub fn pull(dir: &Path, what: Pull) -> Result<String, AdenError> {
     pull_with(&aden_bin(), dir, what)
 }
 
+/// One explicit write: incremental `aden gen --quiet`. coxn calls this at boot
+/// (when aden is available) so every later read can set [`ADEN_SKIP_AUTO_GEN`]
+/// without fighting the store lock.
+pub fn ensure_indexed(dir: &Path) -> Result<(), AdenError> {
+    let mut cmd = Command::new(aden_bin());
+    cmd.arg("gen").arg("--quiet").arg(dir);
+    run_text(cmd).map(|_| ())
+}
+
 fn gate_with(bin: &str, dir: &Path, manifest: &Path) -> GateOutcome {
     let mut cmd = Command::new(bin);
+    read_only_aden_env(&mut cmd);
     cmd.arg("impact-diff").arg("--scope").arg(manifest).arg(dir);
     match cmd.output() {
         Ok(out) => GateOutcome {
@@ -156,6 +177,7 @@ fn scope_with(
     budget: u64,
 ) -> Result<String, AdenError> {
     let mut cmd = Command::new(bin);
+    read_only_aden_env(&mut cmd);
     cmd.arg("scope").arg(name);
     for s in seeds {
         cmd.arg("--seed").arg(s);
@@ -165,8 +187,72 @@ fn scope_with(
     run_text(cmd)
 }
 
+/// Extract the seeds array from a scope manifest JSON (written by `aden scope`
+/// or `aden scope --agents`). Used by the sub-agent runner so each sub-scope
+/// can assemble its own aden-provided context via the same pull-Asms pattern
+/// as top-level load_task, without requiring coxn to understand the full
+/// manifest shape beyond the seeds list.
+#[allow(dead_code)] // Phase 5 sub-agent runner substrate (used by execute + tests)
+pub fn seeds_from_manifest(path: &Path) -> Result<Vec<String>, AdenError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AdenError::Spawn(format!("reading manifest {}: {}", path.display(), e)))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| AdenError::Failed {
+        code: None,
+        stderr: format!("invalid json in {}: {}", path.display(), e),
+    })?;
+    let seeds = v
+        .get("seeds")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(seeds)
+}
+
+/// Extract `context.budget` from a scope manifest JSON.
+///
+/// Missing or non-numeric budgets return `Ok(None)` so callers can fall back to
+/// the task-level budget without treating older manifests as errors.
+/// Extract the manifest's `files` mandate (repo-relative paths the scope may
+/// touch). Used by the parallel scheduler to verify two scopes' working-tree
+/// mandates are disjoint before running them concurrently. Missing or
+/// non-array `files` returns `Ok(vec![])` so a manifest without a mandate is
+/// treated as no-known-files (never parallelizable, always serialized).
+pub fn files_from_manifest(path: &Path) -> Result<Vec<String>, AdenError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AdenError::Spawn(format!("reading manifest {}: {}", path.display(), e)))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| AdenError::Failed {
+        code: None,
+        stderr: format!("invalid json in {}: {}", path.display(), e),
+    })?;
+    Ok(v.get("files")
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+pub fn budget_from_manifest(path: &Path) -> Result<Option<u64>, AdenError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AdenError::Spawn(format!("reading manifest {}: {}", path.display(), e)))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| AdenError::Failed {
+        code: None,
+        stderr: format!("invalid json in {}: {}", path.display(), e),
+    })?;
+    Ok(v.get("context")
+        .and_then(|c| c.get("budget"))
+        .and_then(|b| b.as_u64()))
+}
+
 fn pull_with(bin: &str, dir: &Path, what: Pull) -> Result<String, AdenError> {
     let mut cmd = Command::new(bin);
+    read_only_aden_env(&mut cmd);
     match what {
         Pull::Asm(anchor) => {
             cmd.arg("asm").arg("--from").arg(anchor).arg(dir);
@@ -182,6 +268,14 @@ fn pull_with(bin: &str, dir: &Path, what: Pull) -> Result<String, AdenError> {
         }
         Pull::Locate(symbol) => {
             cmd.arg("locate").arg(symbol).arg(dir);
+        }
+        Pull::Impact(symbol) => {
+            cmd.arg("query")
+                .arg("--impact")
+                .arg(symbol)
+                .arg("--format")
+                .arg("table")
+                .arg(dir);
         }
     }
     run_text(cmd)
@@ -210,11 +304,9 @@ impl Gate for AdenGate {
 /// A compact savings summary for the status line, from `aden status`. `None`
 /// when aden cannot run, the command fails, or no savings are recorded.
 pub fn savings(dir: &Path) -> Option<String> {
-    let out = Command::new(aden_bin())
-        .arg("status")
-        .arg(dir)
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(aden_bin());
+    read_only_aden_env(&mut cmd);
+    let out = cmd.arg("status").arg(dir).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -239,7 +331,9 @@ pub fn config_get(dir: &Path, key: &str) -> Option<String> {
 }
 
 fn config_get_with(bin: &str, dir: &Path, key: &str) -> Option<String> {
-    let out = Command::new(bin)
+    let mut cmd = Command::new(bin);
+    read_only_aden_env(&mut cmd);
+    let out = cmd
         .arg("config")
         .arg("get")
         .arg(key)
@@ -264,6 +358,87 @@ fn run_text(mut cmd: Command) -> Result<String, AdenError> {
             stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         })
     }
+}
+
+/// Launch `aden view [anchor]` in the background (browser UI).
+/// Non-blocking; returns immediately after spawn. The viewer is the canonical
+/// rich graph surface; coxn does not duplicate it.
+pub fn launch_view(dir: &Path, anchor: Option<&str>) -> std::io::Result<()> {
+    let bin = aden_bin();
+    let mut cmd = Command::new(&bin);
+    read_only_aden_env(&mut cmd);
+    cmd.arg("view");
+    if let Some(a) = anchor {
+        cmd.arg(a);
+    }
+    cmd.arg(dir);
+    // Fire and forget; --no-open is user choice via aden flags/env if wanted.
+    let _ = cmd.spawn()?;
+    Ok(())
+}
+
+/// Export a diagram (default Mermaid) for an anchor or whole relevant slice.
+/// `aden viz` supports Mermaid/DOT/JSON via flags; default to mermaid text.
+pub fn diagram(dir: &Path, anchor: Option<&str>) -> Result<String, AdenError> {
+    let mut cmd = Command::new(aden_bin());
+    read_only_aden_env(&mut cmd);
+    cmd.arg("viz");
+    if let Some(a) = anchor {
+        cmd.arg(a);
+    }
+    // Prefer mermaid when supported; fall back to default output.
+    // Many installs accept --format mermaid; if not, the text still contains ```mermaid
+    cmd.arg("--format").arg("mermaid");
+    cmd.arg(dir);
+    run_text(cmd)
+}
+
+/// Run `aden doctor` and return its diagnostic text (environment + repo health).
+pub fn doctor(dir: &Path) -> Result<String, AdenError> {
+    let mut cmd = Command::new(aden_bin());
+    read_only_aden_env(&mut cmd);
+    cmd.arg("doctor").arg(dir);
+    run_text(cmd)
+}
+
+/// Run `aden communities` for functional code clusters.
+pub fn communities(dir: &Path) -> Result<String, AdenError> {
+    let mut cmd = Command::new(aden_bin());
+    read_only_aden_env(&mut cmd);
+    cmd.arg("communities").arg(dir);
+    run_text(cmd)
+}
+
+/// Run `aden audit` (OWASP-aligned).
+pub fn audit(dir: &Path) -> Result<String, AdenError> {
+    let mut cmd = Command::new(aden_bin());
+    read_only_aden_env(&mut cmd);
+    cmd.arg("audit").arg(dir);
+    run_text(cmd)
+}
+
+/// List graph anchors/symbols (for palette, search). Uses `aden list --json`.
+/// Returns newline separated anchors (filtered if provided).
+pub fn list_symbols(dir: &Path, filter: Option<&str>) -> Result<String, AdenError> {
+    let mut cmd = Command::new(aden_bin());
+    read_only_aden_env(&mut cmd);
+    cmd.arg("list").arg("--json");
+    if let Some(f) = filter {
+        cmd.arg("--filter").arg(f);
+    }
+    cmd.arg(dir);
+    let json = run_text(cmd)?;
+    // Parse json to extract anchors array, join with \n for lines().
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json)
+        && let Some(arr) = val.get("anchors").and_then(|a| a.as_array())
+    {
+        let lines: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        return Ok(lines.join("\n"));
+    }
+    Ok(json)
 }
 
 #[cfg(all(test, unix))]
@@ -367,5 +542,55 @@ mod tests {
         let bad = fake_aden("scope-bad", 1, "");
         let err = pull_with(bad.to_str().unwrap(), &dir, Pull::Understand("x"));
         assert!(matches!(err, Err(AdenError::Failed { code: Some(1), .. })));
+    }
+
+    #[test]
+    fn seeds_from_manifest_parses_seeds_array() {
+        let _serial = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir();
+        let man = dir.join(format!("coxn-test-manifest-{}.json", std::process::id()));
+        std::fs::write(&man, r#"{"name":"t","seeds":["foo","bar"]}"#).unwrap();
+        let seeds = seeds_from_manifest(&man).expect("parses");
+        assert_eq!(seeds, vec!["foo".to_string(), "bar".to_string()]);
+        let _ = std::fs::remove_file(&man);
+    }
+
+    #[test]
+    fn budget_from_manifest_reads_context_budget() {
+        let _serial = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir();
+        let man = dir.join(format!(
+            "coxn-test-budget-manifest-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&man, r#"{"name":"t","context":{"budget":4096}}"#).unwrap();
+        assert_eq!(budget_from_manifest(&man).expect("parses"), Some(4096));
+
+        std::fs::write(&man, r#"{"name":"t","context":{}}"#).unwrap();
+        assert_eq!(budget_from_manifest(&man).expect("parses"), None);
+        let _ = std::fs::remove_file(&man);
+    }
+
+    #[test]
+    fn files_from_manifest_reads_files_mandate() {
+        let _serial = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir();
+        let man = dir.join(format!(
+            "coxn-test-files-manifest-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&man, r#"{"name":"t","files":["src/a.rs","src/b.rs"]}"#).unwrap();
+        assert_eq!(
+            files_from_manifest(&man).expect("parses"),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+
+        // No `files` key => empty mandate (never parallelizable).
+        std::fs::write(&man, r#"{"name":"t"}"#).unwrap();
+        assert_eq!(
+            files_from_manifest(&man).expect("parses"),
+            Vec::<String>::new()
+        );
+        let _ = std::fs::remove_file(&man);
     }
 }
