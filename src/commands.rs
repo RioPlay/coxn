@@ -65,8 +65,8 @@ pub(crate) fn parse_command(input: &str) -> Command {
     }
 }
 
-/// Slash command verbs, for Tab completion.
-const COMMANDS: &[&str] = &[
+/// Slash command verbs, for Tab completion and the fuzzy palette (M4).
+pub(crate) const COMMANDS: &[&str] = &[
     "help", "model", "auth", "think", "tools", "agents", "execute", "scope", "trust", "copy",
     "session", "resume", "runs", "edit", "clear", "quit",
 ];

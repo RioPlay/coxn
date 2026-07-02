@@ -53,6 +53,8 @@ pub enum MenuKind {
     Session,
     /// Command palette / slash commands (sets the input line).
     Commands,
+    /// Fuzzy unified palette (M4): slash verbs, models, sessions, recent input.
+    Palette,
 }
 
 /// One selectable row: the `value` acted on, and the `label` shown.
@@ -81,9 +83,67 @@ pub struct Menu {
     pub count: Option<u32>,
     /// A bare `g` was typed; the next key resolves `gg` (top) or cancels.
     pub pending_g: bool,
+    /// Type-to-filter query (M4 [`MenuKind::Palette`] only).
+    pub filter: String,
+    /// Full catalog before filtering (M4 palette only; empty for other pickers).
+    pub catalog: Vec<MenuItem>,
+}
+
+/// Lower score = tighter match. `None` = no subsequence fit.
+pub fn fuzzy_score(query: &str, haystack: &str) -> Option<u32> {
+    let q: Vec<char> = query
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let h: Vec<char> = haystack.to_lowercase().chars().collect();
+    let mut qi = 0usize;
+    let mut score = 0u32;
+    let mut last_pos: Option<usize> = None;
+    for (pos, c) in h.iter().enumerate() {
+        if qi < q.len() && *c == q[qi] {
+            score += match last_pos {
+                Some(lp) => (pos - lp) as u32,
+                None => pos as u32,
+            };
+            last_pos = Some(pos);
+            qi += 1;
+        }
+    }
+    (qi == q.len()).then_some(score)
 }
 
 impl Menu {
+    /// Recompute [`Menu::items`] from [`Menu::catalog`] + [`Menu::filter`].
+    /// Pins [`Menu::selected`] to the top match (index 0).
+    pub fn apply_palette_filter(&mut self) {
+        if self.kind != MenuKind::Palette {
+            return;
+        }
+        let q = self.filter.trim();
+        if q.is_empty() {
+            self.items = self.catalog.clone();
+        } else {
+            let mut ranked: Vec<(u32, usize)> = self
+                .catalog
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| fuzzy_score(q, &item.label).map(|s| (s, i)))
+                .collect();
+            ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            self.items = ranked
+                .iter()
+                .map(|(_, i)| self.catalog[*i].clone())
+                .collect();
+        }
+        self.selected = 0;
+        self.scroll = 0;
+        self.count = None;
+        self.pending_g = false;
+    }
     /// Re-pin `scroll` so `selected` stays within `[scroll, scroll+rows)`,
     /// scrolling only when the selection leaves the window.
     fn clamp_scroll(&mut self, rows: usize) {
@@ -282,6 +342,17 @@ impl View {
 
     /// Open a picker overlay (non-empty menus only).
     pub fn open_menu(&mut self, menu: Menu) {
+        if !menu.items.is_empty() {
+            self.menu = Some(menu);
+        }
+    }
+
+    /// Open the fuzzy unified palette (M4). `menu.catalog` must be populated.
+    pub fn open_palette(&mut self, mut menu: Menu) {
+        if menu.kind != MenuKind::Palette || menu.catalog.is_empty() {
+            return;
+        }
+        menu.apply_palette_filter();
         if !menu.items.is_empty() {
             self.menu = Some(menu);
         }
@@ -525,6 +596,49 @@ impl View {
             KeyCode::PageDown => Some(Action::MenuPageDown),
             KeyCode::PageUp => Some(Action::MenuPageUp),
             // Unknown: drop the count, eat the key (picker owns input).
+            _ => None,
+        }
+    }
+
+    /// Keys while the fuzzy palette (M4) is open: type-to-filter plus j/k
+    /// navigation. Returns `None` when the menu is not a palette (caller
+    /// should fall back to [`map_menu_key`]).
+    pub fn map_palette_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let menu = self.menu.as_mut()?;
+        if menu.kind != MenuKind::Palette {
+            return None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::Char('c') && ctrl {
+            menu.count = None;
+            menu.pending_g = false;
+            return Some(Action::MenuCancel);
+        }
+
+        match key.code {
+            KeyCode::Enter => Some(Action::MenuSelect),
+            KeyCode::Esc => Some(Action::MenuCancel),
+            KeyCode::Backspace => {
+                menu.filter.pop();
+                menu.apply_palette_filter();
+                None
+            }
+            KeyCode::Char('j') | KeyCode::Down if !ctrl => Some(Action::MenuStep(1)),
+            KeyCode::Char('k') | KeyCode::Up if !ctrl => Some(Action::MenuStep(-1)),
+            KeyCode::Char('n') if ctrl => Some(Action::MenuStep(1)),
+            KeyCode::Char('p') if ctrl => Some(Action::MenuStep(-1)),
+            KeyCode::Char('G') if !ctrl => Some(Action::MenuBottom),
+            KeyCode::Home => Some(Action::MenuTop),
+            KeyCode::End => Some(Action::MenuBottom),
+            KeyCode::Char('d') if ctrl => Some(Action::MenuPageDown),
+            KeyCode::Char('u') if ctrl => Some(Action::MenuPageUp),
+            KeyCode::PageDown => Some(Action::MenuPageDown),
+            KeyCode::PageUp => Some(Action::MenuPageUp),
+            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                menu.filter.push(c);
+                menu.apply_palette_filter();
+                None
+            }
             _ => None,
         }
     }
@@ -1613,41 +1727,62 @@ pub fn render(frame: &mut Frame, view: &View) {
         // selected row carries a › marker and bold primary text. Overflow
         // above/below is signalled by ▴/▾ in the title so the user knows there
         // is more to scroll to.
-        let hint = "j/k ↑↓  G/gg  PgUp/Dn  Enter  Esc";
+        let hint = if menu.kind == MenuKind::Palette {
+            "type to filter  j/k  Enter  Esc"
+        } else {
+            "j/k ↑↓  G/gg  PgUp/Dn  Enter  Esc"
+        };
         let count = menu.items.len();
         let rows = menu_max_rows(frame.area().height, count);
         let start = menu.scroll.min(count);
         let end = (start + rows).min(count);
+        let filter_line = if menu.kind == MenuKind::Palette {
+            format!("filter: {}", menu.filter)
+        } else {
+            String::new()
+        };
         let width = menu
             .items
             .iter()
             .map(|i| i.label.chars().count())
-            .chain([menu.title.chars().count(), hint.chars().count()])
+            .chain([
+                menu.title.chars().count(),
+                hint.chars().count(),
+                filter_line.chars().count(),
+            ])
             .max()
             .unwrap_or(0) as u16;
-        let mut lines: Vec<Line<'static>> = menu
-            .items
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(end.saturating_sub(start))
-            .map(|(i, item)| {
-                if i == menu.selected {
-                    Line::from(vec![
-                        Span::styled("› ", Style::default().fg(ACCENT)),
-                        Span::styled(
-                            item.label.clone(),
-                            Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
-                        ),
-                    ])
-                } else {
-                    Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(item.label.clone(), Style::default().fg(SECONDARY)),
-                    ])
-                }
-            })
-            .collect();
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if menu.kind == MenuKind::Palette {
+            lines.push(Line::from(vec![
+                Span::styled("filter: ", Style::default().fg(DIM)),
+                Span::styled(menu.filter.clone(), Style::default().fg(ACCENT)),
+                Span::styled("_", Style::default().fg(ACCENT)),
+            ]));
+        }
+        lines.extend(
+            menu.items
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .map(|(i, item)| {
+                    if i == menu.selected {
+                        Line::from(vec![
+                            Span::styled("› ", Style::default().fg(ACCENT)),
+                            Span::styled(
+                                item.label.clone(),
+                                Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
+                            ),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(item.label.clone(), Style::default().fg(SECONDARY)),
+                        ])
+                    }
+                }),
+        );
         lines.push(Line::from(""));
         // Same ACCENT-key / DIM-verb split the modal hint uses, so both overlays
         // treat affordances identically. `hint` above still sizes the box.
@@ -1689,7 +1824,11 @@ pub fn render(frame: &mut Frame, view: &View) {
         let help_lines: Vec<Line<'static>> = [
             // COCKPIT - ADEN graph harness for high velocity coding
             ("COCKPIT (ADEN graph)", None),
-            ("Tab", Some("palette: ADEN symbols+actions first")),
+            (
+                "Ctrl-Space",
+                Some("fuzzy palette: commands, models, sessions"),
+            ),
+            ("Tab", Some("ADEN symbols+actions palette")),
             (
                 "ADEN items",
                 Some("direct: understand/view/impact + comms/doctor/audit"),
@@ -1704,7 +1843,7 @@ pub fn render(frame: &mut Frame, view: &View) {
                 "Ctrl+L on a word",
                 Some("pulls ADEN context (also Ctrl+A/I/V/G)"),
             ),
-            ("Tab", Some("opens command palette / suggestions")),
+            ("Ctrl-Space / Tab", Some("command palette / suggestions")),
             ("? or /help", Some("this help")),
             ("mouse wheel", Some("scrolls transcript")),
             ("", None),
@@ -1745,7 +1884,7 @@ pub fn render(frame: &mut Frame, view: &View) {
             ("COMMANDS", None),
             (":q", Some("quit")),
             (":help  ?", Some("this overlay")),
-            ("Tab", Some("palette (ADEN symbols + actions)")),
+            ("Ctrl-Space", Some("fuzzy palette; Tab for ADEN symbols")),
             (":model", Some("switch model")),
             (":tools", Some("list active tools")),
             (":clear", Some("new conversation")),
@@ -2145,6 +2284,8 @@ mod tests {
             scroll: 0,
             count: None,
             pending_g: false,
+            filter: String::new(),
+            catalog: Vec::new(),
         });
         // Clamps at the ends (vim-like; no wrap).
         v.menu_move(-1);
@@ -2166,6 +2307,8 @@ mod tests {
             scroll: 0,
             count: None,
             pending_g: false,
+            filter: String::new(),
+            catalog: Vec::new(),
         });
         assert!(v.menu.is_none());
     }
@@ -2186,6 +2329,8 @@ mod tests {
             scroll: 0,
             count: None,
             pending_g: false,
+            filter: String::new(),
+            catalog: Vec::new(),
         });
         v
     }
@@ -2266,6 +2411,8 @@ mod tests {
             scroll: 0,
             count: None,
             pending_g: false,
+            filter: String::new(),
+            catalog: Vec::new(),
         });
         let rows = menu_max_rows(10, 20);
         assert_eq!(rows, 6);
@@ -2296,6 +2443,82 @@ mod tests {
         v.menu_page(-1, rows);
         let after = v.menu.as_ref().unwrap().selected;
         assert_eq!(before - after, rows, "page moves one full viewport");
+    }
+
+    #[test]
+    fn fuzzy_subsequence_ranks_tighter_matches_first() {
+        assert!(fuzzy_score("mdl", "model  qwen2.5-coder").is_some());
+        assert!(fuzzy_score("zzz", "model  qwen2.5-coder").is_none());
+        assert!(fuzzy_score("", "anything").is_some());
+        let tight = fuzzy_score("ses", "session  foo").unwrap();
+        let loose = fuzzy_score("s", "session  foo").unwrap();
+        assert!(tight >= loose);
+    }
+
+    #[test]
+    fn palette_filter_repins_selection_to_top_match() {
+        let catalog = vec![
+            MenuItem {
+                value: "a".into(),
+                label: "model alpha".into(),
+            },
+            MenuItem {
+                value: "b".into(),
+                label: "session beta".into(),
+            },
+            MenuItem {
+                value: "c".into(),
+                label: "/help".into(),
+            },
+        ];
+        let mut menu = Menu {
+            kind: MenuKind::Palette,
+            title: "palette".into(),
+            items: catalog.clone(),
+            catalog,
+            selected: 2,
+            scroll: 1,
+            count: None,
+            pending_g: false,
+            filter: String::new(),
+        };
+        menu.filter.push_str("ses");
+        menu.apply_palette_filter();
+        assert_eq!(menu.selected, 0);
+        assert_eq!(menu.scroll, 0);
+        assert_eq!(menu.items.len(), 1);
+        assert!(menu.items[0].label.contains("session"));
+    }
+
+    #[test]
+    fn palette_key_types_filter_without_submit_action() {
+        let catalog = vec![menu_item("model one"), menu_item("session two")];
+        let mut v = View::new();
+        v.open_palette(Menu {
+            kind: MenuKind::Palette,
+            title: "palette".into(),
+            items: catalog.clone(),
+            catalog,
+            selected: 0,
+            scroll: 0,
+            count: None,
+            pending_g: false,
+            filter: String::new(),
+        });
+        let k = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert_eq!(v.map_palette_key(k('m')), None);
+        assert_eq!(v.menu.as_ref().unwrap().filter, "m");
+        assert_eq!(v.map_palette_key(k('j')), Some(Action::MenuStep(1)));
+        assert_eq!(
+            v.map_palette_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::MenuSelect)
+        );
+    }
+
+    #[test]
+    fn ctrl_space_does_not_map_to_submit() {
+        let cs = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        assert_ne!(map_input_key(cs), Some(Action::Submit));
     }
 
     #[test]

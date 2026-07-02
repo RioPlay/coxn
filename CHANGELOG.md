@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (TUI frictionless — M4)
+
+- **Fuzzy command palette** (`Ctrl-Space`): subsequence-filtered picker unifying
+  slash verbs, advertised models, saved sessions, and the last eight submitted
+  commands. Type-to-filter with `j`/`k` navigation; `/model` and `/session`
+  direct pickers unchanged. Tab still opens the ADEN-oriented commands menu.
+
 ### Added (next-generation harness)
 
 - **Parallel `/execute`** (opt-in): `COXN_EXECUTE_JOBS` (default `1`, clamped
