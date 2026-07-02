@@ -24,7 +24,7 @@
 //! edges.
 
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -43,6 +43,9 @@ use crate::vim::{Mode, Vim};
 /// column of padding. Subtracted from the pane width when computing wrap/scroll
 /// so the math matches what the [`Paragraph`] actually lays out inside the block.
 pub const PANE_GUTTER: u16 = 2;
+
+/// Mode cheat-sheet tip dismisses after this much idle time (M6).
+pub const MODE_TIP_IDLE: Duration = Duration::from_secs(5);
 
 /// What a [`Menu`] selects, so the event loop knows how to act on Enter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +215,11 @@ pub struct View {
     /// Whether the help overlay is currently shown. Toggled by `?` in Normal
     /// mode or `:help` / `/help`. Closed by `Esc`, `q`, or a second `?`.
     pub show_help: bool,
+    /// Compact one-line mode tip under the mode tag (M6). Shown briefly after
+    /// `g?` and dismissed after [`MODE_TIP_IDLE`].
+    pub show_mode_tip: bool,
+    /// When the mode tip auto-hides; extended on user activity while visible.
+    pub mode_tip_until: Option<Instant>,
     /// Whether aden is active this session. Drives the status-line badge.
     /// Set by the event loop each time capabilities are (re-)probed.
     pub aden_active: bool,
@@ -439,6 +447,31 @@ impl View {
     /// Toggle the help overlay on or off.
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+    }
+
+    /// Show the compact mode tip and start (or refresh) its idle timer.
+    pub fn show_mode_tip(&mut self) {
+        self.show_mode_tip = true;
+        self.mode_tip_until = Some(Instant::now() + MODE_TIP_IDLE);
+    }
+
+    /// Extend the mode-tip idle timer while the user is active.
+    pub fn touch_mode_tip(&mut self) {
+        if self.show_mode_tip {
+            self.mode_tip_until = Some(Instant::now() + MODE_TIP_IDLE);
+        }
+    }
+
+    /// Hide the mode tip when its idle timer has elapsed.
+    pub fn refresh_mode_tip(&mut self) {
+        if self.show_mode_tip
+            && self
+                .mode_tip_until
+                .is_some_and(|until| Instant::now() >= until)
+        {
+            self.show_mode_tip = false;
+            self.mode_tip_until = None;
+        }
     }
 
     /// Close the help overlay.
@@ -1365,6 +1398,16 @@ fn build_input_prompt_text(view: &View) -> Text<'static> {
 /// Render one frame: a ruled output pane, a hairline separator, a one-row status
 /// line, and a one-row input prompt, with the confirm modal or picker overlaid
 /// when active. Pure in `view`; testable with `TestBackend`.
+/// One-line mode cheat-sheet copy (M6).
+pub(crate) fn mode_tip_text(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Insert => "type. Enter send. Alt-Enter newline.",
+        Mode::Normal => "h/j/k/l. / search. gr grep. g? help.",
+        Mode::Visual => "v motion. d/y operate.",
+        Mode::Command => ":view :grep :doctor :impact.",
+    }
+}
+
 pub fn render(frame: &mut Frame, view: &View) {
     // Input box rows grow with `\n` (M1 multi-line). Computed before the
     // layout split so the input slot is `Length(input_rows)` not `Length(1)`,
@@ -1471,13 +1514,20 @@ pub fn render(frame: &mut Frame, view: &View) {
     // Non-Insert modes render in ACCENT (an actionable state the user entered
     // intentionally); Insert renders in DIM so it recedes in steady-state typing.
     {
-        let tag = format!("-- {} -- ", view.vim.mode.tag());
+        let tag = format!("mode: {} ", view.vim.mode.tag());
         let color = if view.vim.mode == Mode::Insert {
             DIM
         } else {
             ACCENT
         };
         status_spans.push(Span::styled(tag, Style::default().fg(color)));
+    }
+    // M6: one-line cheat-sheet tip under the mode tag; brief after `g?`.
+    if view.show_mode_tip {
+        status_spans.push(Span::styled(
+            format!("{} ", mode_tip_text(view.vim.mode)),
+            Style::default().fg(DIM),
+        ));
     }
     // Status fields, segmented by meaning so the row is readable at a glance.
     // main.rs joins fields with "  |  "; splitting here is the seam between data
@@ -3141,6 +3191,44 @@ mod tests {
             text.contains("aden"),
             "aden badge must appear when active: {text:?}"
         );
+    }
+
+    #[test]
+    fn m6_mode_tip_text_per_mode() {
+        assert!(mode_tip_text(Mode::Insert).contains("Enter send"));
+        assert!(mode_tip_text(Mode::Normal).contains("g? help"));
+        assert!(mode_tip_text(Mode::Visual).contains("d/y"));
+        assert!(mode_tip_text(Mode::Command).contains(":doctor"));
+    }
+
+    #[test]
+    fn m6_mode_tip_dismisses_after_idle() {
+        let mut view = View::new();
+        view.show_mode_tip();
+        assert!(view.show_mode_tip);
+        view.mode_tip_until = Some(Instant::now() - Duration::from_millis(1));
+        view.refresh_mode_tip();
+        assert!(!view.show_mode_tip);
+    }
+
+    #[test]
+    fn m6_status_chips_render_in_order() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut view = View::new();
+        view.set_status(
+            "model: gpt-4  |  scope: task 'foo'  |  ctx: ~1.2k ctx  |  trust: read-auto",
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        let model_pos = text.find("model:").expect("model chip");
+        let scope_pos = text.find("scope:").expect("scope chip");
+        let ctx_pos = text.find("ctx:").expect("ctx chip");
+        assert!(model_pos < scope_pos, "{text}");
+        assert!(scope_pos < ctx_pos, "{text}");
     }
 
     #[test]

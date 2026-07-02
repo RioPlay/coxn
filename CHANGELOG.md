@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (TUI frictionless — M6)
+
+- **Mode cheat-sheet + status chips**: `g?` flashes a dim one-line tip per vim
+  mode (`INSERT`/`NORMAL`/`VISUAL`/`COMMAND`); auto-hides after 5s idle.
+  Status string uses labeled chips (`model:`, `scope:`, `ctx:`) and the mode
+  tag reads `mode: INSERT` for at-a-glance parsing.
+
 ### Added (TUI frictionless — M5)
 
 - **Mouse + OSC52 clipboard**: picker row clicks select; gate-modal hint zone
