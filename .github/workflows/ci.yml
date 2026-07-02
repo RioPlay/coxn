@@ -13,6 +13,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - run: bash scripts/check-no-secrets.sh
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test

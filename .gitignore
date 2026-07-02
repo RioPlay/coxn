@@ -9,8 +9,13 @@
 *~
 .DS_Store
 
-# Local env, not committed
+# Local env and secrets — never commit
 /.env
+/.env.*
+*.key
+*.pem
+*.p12
+secrets/
 
 # Agent worktrees and session scratch
 /.claude/
@@ -19,4 +24,11 @@
 # aden machine-local state (re-derived per session; never committed)
 /.aden/savings.json
 /.aden/project.conf
+/.aden/config.toml
 /.aden/store/
+# Only the example template is tracked:
+# !.aden/config.toml.example
+
+# coxn runtime data (outside repo by default; guard copy/paste accidents)
+.coxn/
+last-transcript.txt

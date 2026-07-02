@@ -9,8 +9,8 @@ background API spend (Track B, separate repo).
 
 Reference repos:
 
-* *coxn* — `REPO_ROOT` (primary)
-* *T3 Code* — `T3CODE_REPO` (patterns + optional Track B)
+* *coxn* — this repo (primary)
+* *T3 Code* — sibling reference repo (patterns + optional Track B)
 * *Design contracts* — `docs/routing.adoc`, `DESIGN.adoc`, `PLAN.adoc`
 
 == Laws (do not violate)
@@ -241,7 +241,7 @@ export COXN_KEY_openrouter=sk-or-...
 
 === T3-derived gap review after first Track A pass
 
-Source files reviewed in `T3CODE_REPO`:
+Source files reviewed in the T3 Code repo:
 
 * `packages/contracts/src/providerInstance.ts`
 * `apps/server/src/provider/ProviderInstanceEnvironment.ts`
@@ -316,7 +316,7 @@ Before marking Track A done:
 
 == Track B — T3 Code UX visibility + API cost opt-in (optional, other repo)
 
-*Repo:* `T3CODE_REPO` — only if product owner wants T3 patches,
+*Repo:* T3 Code — only if product owner wants T3 patches,
 not coxn. T3 is early WIP; confirm contribution policy (`CONTRIBUTING.md`).
 
 === B1 — Tool visibility (web)
@@ -413,7 +413,7 @@ not coxn. T3 is early WIP; confirm contribution policy (`CONTRIBUTING.md`).
 == Handoff prompt (paste to delegate agent)
 
 ----
-Implement Track A of docs/provider-auth-plan.adoc in REPO_ROOT
+Implement Track A of docs/provider-auth-plan.adoc in this coxn repo
 on branch fix/audit-coxn-hygiene (or new branch off it). Follow laws in DESIGN.adoc.
 Work in commit order §Suggested commit order. Run cargo test && cargo clippy after
 each batch. Do not commit .aden/savings.json or .aden/project.conf. Reference T3
