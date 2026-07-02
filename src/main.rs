@@ -547,6 +547,8 @@ fn model_menu(sel: &ModelSel) -> Option<Menu> {
         scroll: 0,
         count: None,
         pending_g: false,
+        filter: String::new(),
+        catalog: Vec::new(),
     })
 }
 
@@ -576,7 +578,71 @@ fn session_menu() -> Option<Menu> {
         scroll: 0,
         count: None,
         pending_g: false,
+        filter: String::new(),
+        catalog: Vec::new(),
     })
+}
+
+/// Fuzzy unified palette (M4): slash verbs, models, sessions, recent commands.
+fn palette_menu(sel: &ModelSel, history: &[String]) -> Menu {
+    let mut catalog: Vec<MenuItem> = Vec::new();
+
+    for cmd in crate::commands::COMMANDS {
+        catalog.push(MenuItem {
+            label: format!("/{cmd}"),
+            value: format!("input:/{cmd} "),
+        });
+    }
+
+    if let Some(model_picker) = model_menu(sel) {
+        for item in model_picker.items {
+            catalog.push(MenuItem {
+                label: format!("model  {}", item.label),
+                value: format!("model:{}", item.value),
+            });
+        }
+    }
+
+    for s in session::list() {
+        catalog.push(MenuItem {
+            label: format!(
+                "session  {:>4}  {}  {}",
+                session::relative_age(s.age_secs),
+                s.slug,
+                s.preview
+            ),
+            value: format!("session:{}", s.slug),
+        });
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for line in history.iter().rev() {
+        let t = line.trim();
+        if t.is_empty() || !seen.insert(t.to_string()) {
+            continue;
+        }
+        let preview: String = t.chars().take(48).collect();
+        let ell = if t.chars().count() > 48 { "…" } else { "" };
+        catalog.push(MenuItem {
+            label: format!("recent  {preview}{ell}"),
+            value: format!("input:{t}"),
+        });
+        if seen.len() >= 8 {
+            break;
+        }
+    }
+
+    Menu {
+        kind: MenuKind::Palette,
+        title: "palette  Ctrl-Space".to_string(),
+        items: catalog.clone(),
+        catalog,
+        selected: 0,
+        scroll: 0,
+        count: None,
+        pending_g: false,
+        filter: String::new(),
+    }
 }
 
 /// Simple command palette for discoverability (average users). Tab on empty input or / opens this.
@@ -679,6 +745,8 @@ fn commands_menu() -> Option<Menu> {
         scroll: 0,
         count: None,
         pending_g: false,
+        filter: String::new(),
+        catalog: Vec::new(),
     })
 }
 
@@ -1347,6 +1415,21 @@ async fn drive(
             }
         }
 
+        // M4: fuzzy palette — Ctrl-Space in any mode except the approval modal.
+        if view.modal.is_none()
+            && key.code == KeyCode::Char(' ')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if view
+                .menu
+                .as_ref()
+                .is_none_or(|m| m.kind != MenuKind::Palette)
+            {
+                view.open_palette(palette_menu(sel, &view.history));
+            }
+            continue;
+        }
+
         // A modal grabs input until answered.
         if view.modal.is_some() {
             match map_modal_key(key) {
@@ -1371,7 +1454,16 @@ async fn drive(
             let (_, term_h) = pane_dims(tui);
             let count = view.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
             let rows = menu_max_rows(term_h, count);
-            match view.map_menu_key(key) {
+            let palette = view
+                .menu
+                .as_ref()
+                .is_some_and(|m| m.kind == MenuKind::Palette);
+            let action = if palette {
+                view.map_palette_key(key)
+            } else {
+                view.map_menu_key(key)
+            };
+            match action {
                 Some(Action::MenuStep(d)) => view.menu_step(d, rows),
                 Some(Action::MenuTop) => view.menu_top(rows),
                 Some(Action::MenuBottom) => view.menu_bottom(rows),
@@ -1545,8 +1637,48 @@ async fn drive(
                                     view.refresh_suggestion();
                                 }
                             }
+                            MenuKind::Palette => {
+                                if let Some(name) = value.strip_prefix("model:") {
+                                    view.output = switch_model(dir, pump, sel, name);
+                                    view.set_status(status_line(
+                                        dir,
+                                        &sel.label(),
+                                        task,
+                                        pump.last_usage(),
+                                        view.aden_active,
+                                        &trust,
+                                    ));
+                                } else if let Some(slug) = value.strip_prefix("session:") {
+                                    let messages = session::load(slug);
+                                    if messages.is_empty() {
+                                        view.output = format!("no session '{slug}'");
+                                    } else {
+                                        persisted = messages.len();
+                                        pump.load_conversation(messages);
+                                        approvals.clear();
+                                        approved_commands.clear();
+                                        session = session::Session::open(slug);
+                                        view.output = transcript(pump.messages());
+                                        view.set_status(status_line(
+                                            dir,
+                                            &sel.label(),
+                                            task,
+                                            pump.last_usage(),
+                                            view.aden_active,
+                                            &trust,
+                                        ));
+                                    }
+                                } else if let Some(text) = value.strip_prefix("input:") {
+                                    view.input = text.to_string();
+                                    view.cursor_end();
+                                    view.refresh_suggestion();
+                                }
+                            }
                         }
                     }
+                }
+                None if palette => {
+                    // Filter edit consumed the key; redraw.
                 }
                 _ => {}
             }
