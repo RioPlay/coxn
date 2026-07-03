@@ -163,9 +163,8 @@ mod tests {
 
     #[tokio::test]
     async fn piggyback_turn_from_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("coxn-codex-model-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = crate::cli_ndjson::test_support::fake_cli_test_lock();
+        let dir = crate::cli_ndjson::test_support::unique_temp_dir("coxn-codex-model");
         let fake = write_fake_codex(&dir, FakeCodexMode::TextTurn);
         let model =
             CodexPiggybackModel::new(fake.to_string_lossy(), "test-model", None, vec![], &dir);

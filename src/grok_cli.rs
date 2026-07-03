@@ -169,25 +169,18 @@ fn on_grok_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
-
-    fn write_fake_grok(dir: &Path, body: &str) -> PathBuf {
-        let path = dir.join("fake-grok");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
+    use crate::cli_ndjson::test_support::{
+        fake_cli_test_lock, unique_temp_dir, write_executable_script,
+    };
 
     #[tokio::test]
     async fn stream_turn_from_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("coxn-grok-cli-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = fake_cli_test_lock();
+        let dir = unique_temp_dir("coxn-grok-cli");
         let body = r#"echo '{"type":"text","data":"P"}'
 echo '{"type":"text","data":"ONG"}'
 echo '{"type":"end","stopReason":"EndTurn"}'"#;
-        let fake = write_fake_grok(&dir, body);
+        let fake = write_executable_script(&dir, "fake-grok", body);
         let model =
             GrokCliPiggybackModel::new(fake.to_string_lossy(), "test-model", None, vec![], &dir);
         let response = model

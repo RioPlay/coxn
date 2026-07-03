@@ -215,26 +215,18 @@ fn assistant_text(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn write_fake_claude(dir: &Path, body: &str) -> PathBuf {
-        let path = dir.join("fake-claude");
-        let script = format!("#!/bin/sh\n{body}\n");
-        std::fs::write(&path, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
+    use crate::cli_ndjson::test_support::{
+        fake_cli_test_lock, unique_temp_dir, write_executable_script,
+    };
 
     #[tokio::test]
     async fn stream_turn_from_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("coxn-claude-cli-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = fake_cli_test_lock();
+        let dir = unique_temp_dir("coxn-claude-cli");
         let body = r#"echo '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"P"}}}'
 echo '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"ONG"}}}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"PONG","usage":{"input_tokens":10,"output_tokens":2}}'"#;
-        let fake = write_fake_claude(&dir, body);
+        let fake = write_executable_script(&dir, "fake-claude", body);
         let model =
             ClaudeCliPiggybackModel::new(fake.to_string_lossy(), "test-model", None, vec![], &dir);
         let response = model

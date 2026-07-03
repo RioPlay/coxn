@@ -179,6 +179,68 @@ pub enum StreamControl {
     Done,
 }
 
+/// Helpers for hermetic fake-CLI subprocess tests (unique dirs, atomic executable writes).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Serializes fake-CLI subprocess tests — avoids ETXTBSY when parallel tests
+    /// rewrite executables while siblings are still spawning.
+    pub static FAKE_CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    pub fn fake_cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        FAKE_CLI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn process_boot_id() -> u64 {
+        std::fs::read_to_string(format!("/proc/{}/starttime", std::process::id()))
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .map(|t| (t * 1_000_000.0) as u64)
+            .unwrap_or(0)
+    }
+
+    pub fn unique_temp_dir(prefix: &str) -> PathBuf {
+        for attempt in 0..64 {
+            let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let boot = process_boot_id();
+            let dir = std::env::temp_dir().join(format!(
+                "{prefix}-{}-{boot}-{seq}-{nanos}-{attempt}",
+                std::process::id()
+            ));
+            if std::fs::create_dir(&dir).is_ok() {
+                return dir;
+            }
+        }
+        panic!("failed to allocate unique temp dir for {prefix}");
+    }
+
+    /// Write `body` as an executable shell script without ETXTBSY races under parallel tests.
+    pub fn write_executable_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        let tmp = dir.join(format!(".{name}.part"));
+        let script = format!("#!/bin/sh\n{body}\n");
+        std::fs::write(&tmp, script).expect("write script");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp, &path).expect("install script");
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

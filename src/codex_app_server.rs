@@ -494,14 +494,17 @@ pub mod test_support {
 
     pub fn write_fake_codex(dir: &Path, mode: FakeCodexMode) -> PathBuf {
         let path = dir.join("fake-codex");
+        let tmp = dir.join(".fake-codex.part");
         let script = match mode {
             FakeCodexMode::AuthOnly => AUTH_ONLY_SCRIPT,
             FakeCodexMode::TextTurn => TEXT_TURN_SCRIPT,
         };
-        fs::write(&path, script).unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
+        fs::write(&tmp, script).unwrap();
+        let mut perms = fs::metadata(&tmp).unwrap().permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
+        fs::set_permissions(&tmp, perms).unwrap();
+        let _ = fs::remove_file(&path);
+        fs::rename(&tmp, &path).unwrap();
         path
     }
 
@@ -558,9 +561,8 @@ mod tests {
 
     #[test]
     fn account_read_from_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("coxn-codex-app-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = crate::cli_ndjson::test_support::fake_cli_test_lock();
+        let dir = crate::cli_ndjson::test_support::unique_temp_dir("coxn-codex-app");
         let fake = write_fake_codex(&dir, FakeCodexMode::AuthOnly);
         let config =
             CodexAppServerConfig::for_probe(fake.to_string_lossy().to_string(), None, vec![]);
@@ -572,9 +574,8 @@ mod tests {
 
     #[test]
     fn complete_text_turn_from_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("coxn-codex-turn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = crate::cli_ndjson::test_support::fake_cli_test_lock();
+        let dir = crate::cli_ndjson::test_support::unique_temp_dir("coxn-codex-turn");
         let fake = write_fake_codex(&dir, FakeCodexMode::TextTurn);
         let config =
             CodexAppServerConfig::for_turn(fake.to_string_lossy().to_string(), None, vec![], &dir);
