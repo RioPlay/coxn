@@ -28,6 +28,7 @@ mod session;
 mod tools;
 mod trust;
 mod tui;
+mod ui;
 mod vim;
 
 use std::io;

@@ -259,6 +259,8 @@ pub struct View {
     pub suggestion: Option<String>,
     /// In-progress transcript drag-select (M5): visual line indices `(start, end)`.
     pub transcript_drag: Option<(usize, usize)>,
+    /// TUI 3.0 structured state (`COXN_TUI3=1`). Conversation + activity channels.
+    pub ui3: Option<crate::ui::Ui3State>,
     /// Active transcript search (M2). `None` when no search has been opened.
     /// A search is "open" (interactive prompt active) while `query_open` is
     /// true; after Enter commits, `query_open` flips to false but `matches` /
@@ -348,6 +350,78 @@ impl View {
     /// Set the status line.
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
+    }
+
+    /// Enable TUI 3.0 structured state when `COXN_TUI3` is set.
+    pub fn init_ui3(&mut self) {
+        if crate::ui::enabled() {
+            self.ui3 = Some(crate::ui::Ui3State::default());
+        }
+    }
+
+    /// Sync conversation turn cards from pump messages.
+    pub fn sync_turns(&mut self, messages: &[crate::model::Message]) {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.sync_turns(messages);
+        }
+    }
+
+    pub fn set_chrome(&mut self, chrome: crate::ui::ChromeState) {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.chrome = chrome;
+        }
+    }
+
+    pub fn activity_push(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.activity.push(title, body);
+        }
+    }
+
+    pub fn activity_start_live(&mut self, title: impl Into<String>) {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.activity.start_live(title);
+        }
+    }
+
+    pub fn activity_append_live(&mut self, chunk: &str) {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.activity.append_live(chunk);
+        }
+    }
+
+    pub fn activity_finish_live(&mut self) {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.activity.finish_live();
+        }
+    }
+
+    /// Replace the live activity body (streaming `/execute`, `!cmd`).
+    pub fn activity_set_live(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.activity.live_title = Some(title.into());
+            ui3.activity.live_body = body.into();
+        }
+    }
+
+    /// True when structured TUI 3.0 state is active.
+    pub fn ui3_active(&self) -> bool {
+        self.ui3.is_some()
+    }
+
+    pub fn set_live_turn(&mut self, body: impl Into<String>, run_buf: impl Into<String>) {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.live = Some(crate::ui::LiveTurn {
+                body: body.into(),
+                run_buf: run_buf.into(),
+            });
+        }
+    }
+
+    pub fn clear_live_turn(&mut self) {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.live = None;
+        }
     }
 
     /// Raise a gate confirmation modal with `prompt`. Block on the user's answer
@@ -1524,19 +1598,29 @@ fn modal_title(view: &View) -> &'static str {
 }
 
 pub fn render(frame: &mut Frame, view: &View) {
-    // Input box rows grow with `\n` (M1 multi-line). Computed before the
-    // layout split so the input slot is `Length(input_rows)` not `Length(1)`,
-    // capped at MAX_INPUT_ROWS so a runaway paste cannot eat the pane.
     let input_rows = (view.input_line_count() as u16).clamp(1, crate::layout::MAX_INPUT_ROWS);
 
-    let areas = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),          // separator
-        Constraint::Length(1),          // status
-        Constraint::Length(input_rows), // input (grows with \n; capped)
-    ])
-    .split(frame.area());
-    let pane = areas[0];
+    let (pane, areas) = if let Some(ref ui3) = view.ui3 {
+        let v3 = crate::layout::areas_v3(frame.area(), view);
+        let elapsed = view.pending_since.map(|since| since.elapsed());
+        let pending = elapsed.is_some();
+        crate::ui::render_chrome(frame, v3.chrome, &ui3.chrome);
+        crate::ui::render_conversation(frame, v3.conversation, ui3, pending);
+        crate::ui::render_activity(frame, v3.activity, &ui3.activity);
+        (
+            v3.conversation,
+            [v3.conversation, v3.separator, v3.status, v3.input],
+        )
+    } else {
+        let areas = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(input_rows),
+        ])
+        .split(frame.area());
+        (areas[0], [areas[0], areas[1], areas[2], areas[3]])
+    };
 
     // Animation phase: every motion below is a pure function of elapsed millis,
     // redrawn each 100ms tick. Idle (no turn in flight) means no motion.
@@ -1544,52 +1628,44 @@ pub fn render(frame: &mut Frame, view: &View) {
     let pending = elapsed.is_some();
     let elapsed_ms = elapsed.map(|e| e.as_millis()).unwrap_or(0);
 
-    // -- Output pane: ruled gutter, sigils, wrapped, scrollable ---
-    let content_width = pane.width.saturating_sub(PANE_GUTTER);
-    let total_lines = wrapped_line_count(&view.output, content_width as usize);
-    let pane_height = pane.height as usize;
-
-    // scroll_offset is distance-from-bottom: 0 pins to the bottom (show the last
-    // `pane_height` lines); a larger value backs up, clamped to the scrollback.
-    let max_scrollback = total_lines.saturating_sub(pane_height) as u16;
-    let from_bottom = view.scroll_offset.min(max_scrollback);
-    let scroll_row = max_scrollback - from_bottom;
-
-    // Search snap (M2): if a committed search holds a current match, pin the
-    // viewport to that line so `n`/`N` brings the match into view. The user's
-    // manual scroll (`Up/Down`, PgUp/Dn) is reset by the snap -- matches always
-    // come to the user instead of the user having to find them.
-    let search_is_committed = view
-        .search
-        .as_ref()
-        .map(|s| !s.query_open && s.matches.len() > 1)
-        .unwrap_or(false);
-    let snapped_scroll_row = if search_is_committed {
-        // Center the match vertically inside the pane; clamp at the scrollback edges.
-        view.search_match_line()
-            .map(|target_line| {
-                let target = (target_line as u16).saturating_sub((pane_height as u16) / 2);
-                target.min(max_scrollback)
-            })
-            .unwrap_or(scroll_row)
-    } else {
-        scroll_row
-    };
-
-    // The left rule is the Block border; one column of padding sets text off it.
-    let output_widget = Paragraph::new(styled_output_with_search(
-        &view.output,
-        pending,
-        view.search.as_ref(),
-    ))
-    .block(
-        Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(RULE))
-            .padding(Padding::new(1, 0, 0, 0)),
-    )
-    .wrap(Wrap { trim: false })
-    .scroll((snapped_scroll_row, 0));
+    // -- Output pane (legacy): ruled gutter, sigils, wrapped, scrollable ---
+    if view.ui3.is_none() {
+        let content_width = pane.width.saturating_sub(PANE_GUTTER);
+        let total_lines = wrapped_line_count(&view.output, content_width as usize);
+        let pane_height = pane.height as usize;
+        let max_scrollback = total_lines.saturating_sub(pane_height) as u16;
+        let from_bottom = view.scroll_offset.min(max_scrollback);
+        let scroll_row = max_scrollback - from_bottom;
+        let search_is_committed = view
+            .search
+            .as_ref()
+            .map(|s| !s.query_open && s.matches.len() > 1)
+            .unwrap_or(false);
+        let snapped_scroll_row = if search_is_committed {
+            view.search_match_line()
+                .map(|target_line| {
+                    let target = (target_line as u16).saturating_sub((pane_height as u16) / 2);
+                    target.min(max_scrollback)
+                })
+                .unwrap_or(scroll_row)
+        } else {
+            scroll_row
+        };
+        let output_widget = Paragraph::new(styled_output_with_search(
+            &view.output,
+            pending,
+            view.search.as_ref(),
+        ))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(RULE))
+                .padding(Padding::new(1, 0, 0, 0)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((snapped_scroll_row, 0));
+        frame.render_widget(output_widget, pane);
+    }
 
     // -- Separator: a hairline that breathes while a turn runs ---
     // A `└` corner on the first column joins the left rule to the hairline so the
@@ -1734,7 +1810,6 @@ pub fn render(frame: &mut Frame, view: &View) {
         build_input_prompt_text(view)
     };
 
-    frame.render_widget(output_widget, pane);
     frame.render_widget(separator, areas[1]);
     frame.render_widget(Paragraph::new(Line::from(status_spans)), areas[2]);
     // Search prompt (M2): an editing search overlays the input row with its

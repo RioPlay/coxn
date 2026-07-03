@@ -27,6 +27,7 @@ use crate::tui::{
     Action, Menu, MenuItem, MenuKind, ModalKind, ToolApprovalChoice, Tui, View, map_input_key,
     map_modal_key, map_tool_approval_key, menu_max_rows,
 };
+use crate::ui::ChromeState;
 use crate::vim::{Outcome, Scroll};
 use crate::{
     aden, agents, auth, doctor, execute, gate, openai, provider, run_ledger, sandbox, session,
@@ -180,7 +181,12 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
     // (model resolution, scope, asm context) run -- which can take several
     // seconds on a large repo.
     let mut view = View::new();
-    view.output = welcome(caps.available);
+    view.init_ui3();
+    if view.ui3_active() {
+        view.activity_push("coxn", welcome(caps.available));
+    } else {
+        view.output = welcome(caps.available);
+    }
     view.set_status("starting coxn...".to_string());
     view.refresh_suggestion();
     let mut tui = Tui::new()?;
@@ -205,16 +211,27 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
     // slowest aden spawn and is purely cosmetic, so defer it to the first
     // post-turn refresh and let the user reach the prompt sooner.
     view.set_status(boot_status(&sel.label(), &task.status, caps.available));
+    view.set_chrome(chrome_state(
+        dir,
+        &sel.label(),
+        &task.status,
+        None,
+        caps.available,
+        &Trust::default(),
+    ));
     if trust::auto_approve_enabled() {
-        view.output
-            .push_str("\nsys: WARNING — COXN_AUTO_APPROVE=1 bypasses the human approval gate\n");
+        append_sys_note(
+            &mut view,
+            "\nsys: WARNING — COXN_AUTO_APPROVE=1 bypasses the human approval gate\n",
+        );
     }
     // Offline stub: block chat until a model is reachable (not a silent echo toy).
     if !vim::enabled() {
         view.show_mode_tip();
     }
     if sel.is_offline_stub() {
-        view.output.push_str(
+        append_sys_note(
+            &mut view,
             "\n\nsys: ⚠ offline — no model reachable yet\n\
              sys: fix: /auth setup · start Ollama/LM Studio · set COXN_MODEL_BASE_URL\n\
              sys: [r] retry  [q] quit  (slash commands still work)",
@@ -227,7 +244,8 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
         .is_some()
         && doctor::git_dirty(dir)
     {
-        view.output.push_str(
+        append_sys_note(
+            &mut view,
             "\nsys: warn — dirty git tree may block scoped edits (commit or stash first)",
         );
     }
@@ -297,6 +315,59 @@ fn ctx_meter(prompt_tokens: u32) -> String {
         format!("~{:.1}k ctx", prompt_tokens as f64 / 1000.0)
     } else {
         format!("~{prompt_tokens} ctx")
+    }
+}
+
+/// Chrome bar fields for TUI 3.0 (parallel to [`status_line`]).
+fn chrome_state(
+    dir: &Path,
+    model_label: &str,
+    task: &str,
+    usage: Option<Usage>,
+    aden_active: bool,
+    trust: &Trust,
+) -> ChromeState {
+    let scope = match aden::savings(dir) {
+        Some(savings) => savings,
+        None if task.is_empty() => "ungated".to_string(),
+        None => task.to_string(),
+    };
+    let model = match usage {
+        Some(u) if u.prompt_tokens > 0 => format!("{model_label} {}", ctx_meter(u.prompt_tokens)),
+        _ => model_label.to_string(),
+    };
+    let task_gated = !task.is_empty() && task.contains("gated");
+    ChromeState {
+        model,
+        task: scope,
+        trust: trust.ladder_tag(task_gated).to_string(),
+        aden_active,
+    }
+}
+
+/// Sync conversation pane and legacy output from pump messages.
+fn refresh_conversation(view: &mut View, messages: &[Message]) {
+    view.output = transcript(messages);
+    view.sync_turns(messages);
+    view.clear_live_turn();
+}
+
+/// Boot/sys note: activity drawer when ui3, else append to output.
+fn append_sys_note(view: &mut View, note: &str) {
+    if view.ui3_active() {
+        view.activity_push("sys", note.trim_start_matches('\n'));
+    } else {
+        view.output.push_str(note);
+    }
+}
+
+/// Slash/listing output: activity when ui3 without wiping conversation.
+fn show_slash_output(view: &mut View, title: &str, body: String, messages: &[Message]) {
+    if view.ui3_active() {
+        view.activity_push(title, body);
+        refresh_conversation(view, messages);
+    } else {
+        view.output = body;
     }
 }
 
@@ -1101,16 +1172,22 @@ fn copy_transcript(view: &View) -> String {
 
 /// Append exit / cancel footer after a streaming `!command` run.
 fn append_bang_footer(view: &mut View, outcome: &sandbox::RunOutcome, cancelled: bool) {
-    if cancelled {
-        view.output.push_str("err: cancelled\n");
+    let line = if cancelled {
+        "err: cancelled\n".to_string()
     } else if outcome.timed_out {
-        view.output.push_str("err: timed out\n");
+        "err: timed out\n".to_string()
     } else if let Some(code) = outcome.exit_code {
         if code == 0 {
-            view.output.push_str("ok: exit 0\n");
+            "ok: exit 0\n".to_string()
         } else {
-            view.output.push_str(&format!("err: exit {code}\n"));
+            format!("err: exit {code}\n")
         }
+    } else {
+        return;
+    };
+    view.output.push_str(&line);
+    if view.ui3_active() {
+        view.activity_append_live(&line);
     }
 }
 
@@ -1122,20 +1199,33 @@ async fn run_bang_shell_streaming(
     view: &mut View,
     tui: &mut Tui,
 ) {
-    view.output.push('\n');
-    view.output.push_str(&format!("you: !{command}\n"));
-    if bwrap {
-        view.output.push_str("cmd: sandboxed\n");
-    } else {
-        view.output.push_str("cmd: NO SANDBOX\n");
+    let header = format!(
+        "you: !{command}\n{}",
+        if bwrap {
+            "cmd: sandboxed"
+        } else {
+            "cmd: NO SANDBOX"
+        }
+    );
+    if view.ui3_active() {
+        view.activity_set_live(format!("!{command}"), &header);
     }
+    view.output.push('\n');
+    view.output.push_str(&header);
+    view.output.push('\n');
     view.snap_to_bottom();
     let _ = tui.draw(view);
 
     let mut cancelled = false;
+    let mut live_body = header;
     let outcome = sandbox::run_streaming(dir, command, false, bwrap, &mut |line| {
         view.output.push_str(line);
         view.output.push('\n');
+        if view.ui3_active() {
+            live_body.push_str(line);
+            live_body.push('\n');
+            view.activity_set_live(format!("!{command}"), &live_body);
+        }
         view.snap_to_bottom();
         let _ = tui.draw(view);
         if poll_user_cancel() {
@@ -1147,6 +1237,9 @@ async fn run_bang_shell_streaming(
     .await;
 
     append_bang_footer(view, &outcome, cancelled);
+    if view.ui3_active() {
+        view.activity_finish_live();
+    }
     view.snap_to_bottom();
     let _ = tui.draw(view);
 }
@@ -1382,6 +1475,9 @@ impl DriveIo<'_> {
         } else {
             format!("{}\n\ncoxn: {}\n{}", self.prior, self.buf, self.run_buf)
         };
+        if self.view.ui3_active() {
+            self.view.set_live_turn(&self.buf, &self.run_buf);
+        }
         let _ = self.tui.draw(self.view);
     }
 }
@@ -1542,7 +1638,12 @@ fn dispatch_menu_pick(
 ) {
     match kind {
         MenuKind::Model => {
-            view.output = switch_model(dir, pump, sel, &value);
+            show_slash_output(
+                view,
+                "/model",
+                switch_model(dir, pump, sel, &value),
+                pump.messages(),
+            );
             view.set_status(status_line(
                 dir,
                 &sel.label(),
@@ -1555,14 +1656,19 @@ fn dispatch_menu_pick(
         MenuKind::Session => {
             let messages = session::load(&value);
             if messages.is_empty() {
-                view.output = format!("no session '{value}'");
+                show_slash_output(
+                    view,
+                    "/session",
+                    format!("no session '{value}'"),
+                    pump.messages(),
+                );
             } else {
                 *persisted = messages.len();
                 pump.load_conversation(messages);
                 approvals.clear();
                 approved_commands.clear();
                 *session = session::Session::open(&value);
-                view.output = transcript(pump.messages());
+                refresh_conversation(view, pump.messages());
                 view.set_status(status_line(
                     dir,
                     &sel.label(),
@@ -1674,7 +1780,12 @@ fn dispatch_menu_pick(
         }
         MenuKind::Palette => {
             if let Some(name) = value.strip_prefix("model:") {
-                view.output = switch_model(dir, pump, sel, name);
+                show_slash_output(
+                    view,
+                    "/model",
+                    switch_model(dir, pump, sel, name),
+                    pump.messages(),
+                );
                 view.set_status(status_line(
                     dir,
                     &sel.label(),
@@ -1686,14 +1797,19 @@ fn dispatch_menu_pick(
             } else if let Some(slug) = value.strip_prefix("session:") {
                 let messages = session::load(slug);
                 if messages.is_empty() {
-                    view.output = format!("no session '{slug}'");
+                    show_slash_output(
+                        view,
+                        "/session",
+                        format!("no session '{slug}'"),
+                        pump.messages(),
+                    );
                 } else {
                     *persisted = messages.len();
                     pump.load_conversation(messages);
                     approvals.clear();
                     approved_commands.clear();
                     *session = session::Session::open(slug);
-                    view.output = transcript(pump.messages());
+                    refresh_conversation(view, pump.messages());
                     view.set_status(status_line(
                         dir,
                         &sel.label(),
@@ -1746,9 +1862,19 @@ async fn drive(
     loop {
         // Keep the aden badge on the status line in sync with caps each frame.
         view.aden_active = caps.available;
+        view.set_chrome(chrome_state(
+            dir,
+            &sel.label(),
+            task,
+            pump.last_usage(),
+            caps.available,
+            &trust,
+        ));
         if caps.available && !aden_tip_shown {
-            view.output.push('\n');
-            view.output.push_str("sys: tip — aden active for smart context. Ctrl+L (or K in Normal) on symbol words. Tab for commands. ? help.");
+            append_sys_note(
+                view,
+                "\nsys: tip — aden active for smart context. Ctrl+L (or K in Normal) on symbol words. Tab for commands. ? help.",
+            );
             aden_tip_shown = true;
         }
         view.refresh_suggestion();
@@ -2308,11 +2434,21 @@ async fn drive(
                     refresh_discovery(dir, pump, sel, true);
                     match model_menu(dir, sel) {
                         Some(menu) => view.open_menu(menu),
-                        None => view.output = model_listing(dir, sel),
+                        None => show_slash_output(
+                            view,
+                            "/model",
+                            model_listing(dir, sel),
+                            pump.messages(),
+                        ),
                     }
                 }
                 ExCmd::Model(Some(target)) => {
-                    view.output = switch_model(dir, pump, sel, &target);
+                    show_slash_output(
+                        view,
+                        "/model",
+                        switch_model(dir, pump, sel, &target),
+                        pump.messages(),
+                    );
                     view.set_status(status_line(
                         dir,
                         &sel.label(),
@@ -2324,11 +2460,18 @@ async fn drive(
                 }
                 ExCmd::Tools => {
                     refresh_discovery(dir, pump, sel, true);
-                    view.output = pump.tool_catalog();
+                    show_slash_output(view, "/tools", pump.tool_catalog(), pump.messages());
                 }
                 ExCmd::Clear => {
                     pump.clear_conversation();
-                    view.output = welcome(view.aden_active);
+                    let welcome_text = welcome(view.aden_active);
+                    if view.ui3_active() {
+                        view.activity_push("coxn", &welcome_text);
+                        view.output = welcome_text;
+                        view.sync_turns(pump.messages());
+                    } else {
+                        view.output = welcome_text;
+                    }
                     view.last_aden = None;
                     session = session::Session::create();
                     persisted = 0;
@@ -2727,7 +2870,12 @@ async fn drive(
                             refresh_discovery(dir, pump, sel, true);
                             match model_menu(dir, sel) {
                                 Some(menu) => view.open_menu(menu),
-                                None => view.output = model_listing(dir, sel),
+                                None => show_slash_output(
+                                    view,
+                                    "/model",
+                                    model_listing(dir, sel),
+                                    pump.messages(),
+                                ),
                             }
                         }
                         Command::Model(Some(target)) => {
@@ -2746,7 +2894,12 @@ async fn drive(
                             };
                             match resolved {
                                 Ok(target) => {
-                                    view.output = switch_model(dir, pump, sel, &target);
+                                    show_slash_output(
+                                        view,
+                                        "/model",
+                                        switch_model(dir, pump, sel, &target),
+                                        pump.messages(),
+                                    );
                                     view.set_status(status_line(
                                         dir,
                                         &sel.label(),
@@ -2756,13 +2909,15 @@ async fn drive(
                                         &trust,
                                     ));
                                 }
-                                Err(msg) => view.output = msg,
+                                Err(msg) => {
+                                    show_slash_output(view, "/model", msg, pump.messages());
+                                }
                             }
                         }
                         Command::Tools => {
                             // Pick up aden tools that came online since boot.
                             refresh_discovery(dir, pump, sel, true);
-                            view.output = pump.tool_catalog();
+                            show_slash_output(view, "/tools", pump.tool_catalog(), pump.messages());
                         }
                         Command::Agents => {
                             refresh_discovery(dir, pump, sel, true);
@@ -2770,23 +2925,29 @@ async fn drive(
                             // that came online after boot (stale `caps` has
                             // available=false until we re-check).
                             let live_caps = aden::probe(dir);
-                            view.output = agents_listing(dir, &live_caps);
+                            show_slash_output(
+                                view,
+                                "/agents",
+                                agents_listing(dir, &live_caps),
+                                pump.messages(),
+                            );
                         }
                         Command::Think(arg) => {
-                            view.output = match arg.as_deref().map(ThinkingLevel::parse) {
+                            let body = match arg.as_deref().map(ThinkingLevel::parse) {
                                 Some(Some(level)) => {
                                     pump.set_thinking(level);
                                     format!("reasoning effort: {}", level.label())
                                 }
                                 _ => "usage: /think [off|low|med|high]".to_string(),
                             };
+                            show_slash_output(view, "/think", body, pump.messages());
                         }
                         Command::OpenEditor(arg) => {
                             let full = match arg {
                                 Some(a) => Some(dir.join(a)),
                                 None => pump.last_edited(),
                             };
-                            view.output = match full {
+                            let body = match full {
                                 None => "no file to open (usage: /edit <path>)".to_string(),
                                 Some(path) => {
                                     let editor = std::env::var("VISUAL")
@@ -2804,20 +2965,27 @@ async fn drive(
                                     }
                                 }
                             };
+                            show_slash_output(view, "/edit", body, pump.messages());
                         }
                         Command::Session => match session_menu() {
                             Some(menu) => view.open_menu(menu),
-                            None => view.output = session_listing(&session.slug()),
+                            None => show_slash_output(
+                                view,
+                                "/session",
+                                session_listing(&session.slug()),
+                                pump.messages(),
+                            ),
                         },
                         Command::Runs(slug) => {
-                            view.output = match slug {
+                            let body = match slug {
                                 Some(slug) => run_ledger::summarize(&slug)
                                     .unwrap_or_else(|e| format!("run '{slug}' unavailable: {e}")),
                                 None => runs_listing(),
                             };
+                            show_slash_output(view, "/runs", body, pump.messages());
                         }
                         Command::Resume(slug) => {
-                            view.output = match slug {
+                            let body = match slug {
                                 Some(slug) => {
                                     let messages = session::load(&slug);
                                     if messages.is_empty() {
@@ -2831,7 +2999,7 @@ async fn drive(
                                         trust.seed_approvals(&mut approvals);
                                         session = session::Session::open(&slug);
                                         persisted = n;
-                                        let out = transcript(pump.messages());
+                                        refresh_conversation(view, pump.messages());
                                         view.set_status(status_line(
                                             dir,
                                             &sel.label(),
@@ -2840,15 +3008,25 @@ async fn drive(
                                             view.aden_active,
                                             &trust,
                                         ));
-                                        out
+                                        String::new()
                                     }
                                 }
                                 None => "usage: /resume <slug>  (see /session)".to_string(),
                             };
+                            if !body.is_empty() {
+                                show_slash_output(view, "/resume", body, pump.messages());
+                            }
                         }
                         Command::Clear => {
                             pump.clear_conversation();
-                            view.output = welcome(view.aden_active);
+                            let welcome_text = welcome(view.aden_active);
+                            if view.ui3_active() {
+                                view.activity_push("coxn", &welcome_text);
+                                view.output = welcome_text;
+                                view.sync_turns(pump.messages());
+                            } else {
+                                view.output = welcome_text;
+                            }
                             // A cleared conversation starts a fresh session file
                             // and forgets session-level tool approvals.
                             session = session::Session::create();
@@ -2865,7 +3043,9 @@ async fn drive(
                                 &trust,
                             ));
                         }
-                        Command::Scope => view.output = scope_listing(),
+                        Command::Scope => {
+                            show_slash_output(view, "/scope", scope_listing(), pump.messages());
+                        }
                         Command::Trust => {
                             let note = trust.toggle_read();
                             if matches!(trust.read, trust::TrustLevel::Session) {
@@ -2873,7 +3053,7 @@ async fn drive(
                             } else {
                                 approvals.remove("read_file");
                             }
-                            view.output = note;
+                            show_slash_output(view, "/trust", note, pump.messages());
                             view.set_status(status_line(
                                 dir,
                                 &sel.label(),
@@ -2883,24 +3063,34 @@ async fn drive(
                                 &trust,
                             ));
                         }
-                        Command::Copy => view.output = copy_transcript(view),
-                        Command::Undo => view.output = undo_last_edit(dir, pump),
-                        Command::Export => view.output = export_transcript(pump),
+                        Command::Copy => {
+                            show_slash_output(view, "/copy", copy_transcript(view), pump.messages())
+                        }
+                        Command::Undo => show_slash_output(
+                            view,
+                            "/undo",
+                            undo_last_edit(dir, pump),
+                            pump.messages(),
+                        ),
+                        Command::Export => show_slash_output(
+                            view,
+                            "/export",
+                            export_transcript(pump),
+                            pump.messages(),
+                        ),
                         Command::Auth(args) => {
-                            if args.first().is_some_and(|arg| arg == "set-key") {
-                                view.output =
-                                    "run key storage from your shell: coxn auth set-key <id> < key.txt\n"
-                                        .to_string();
+                            let body = if args.first().is_some_and(|arg| arg == "set-key") {
+                                "run key storage from your shell: coxn auth set-key <id> < key.txt\n"
+                                    .to_string()
                             } else {
                                 let result = auth::report(dir, &args);
-                                view.output = result.output;
+                                let mut out = result.output;
                                 if result.code != 0 {
-                                    view.output.push_str(&format!(
-                                        "status: auth exited {}\n",
-                                        result.code
-                                    ));
+                                    out.push_str(&format!("status: auth exited {}\n", result.code));
                                 }
-                            }
+                                out
+                            };
+                            show_slash_output(view, "/auth", body, pump.messages());
                         }
                         Command::Execute { resume } => {
                             let preview = execute_preview_text(dir, caps, resume);
@@ -2925,28 +3115,40 @@ async fn drive(
                                         format!("{prior_output}\n\nsys: /execute\n{report}")
                                     }
                                 };
+                                if view.ui3_active() {
+                                    view.activity_start_live("/execute");
+                                }
                                 let mut on_execute_progress = |report: &str| {
-                                    view.output = format_execute_report(report);
+                                    if view.ui3_active() {
+                                        view.activity_set_live("/execute", report);
+                                    } else {
+                                        view.output = format_execute_report(report);
+                                    }
                                     view.snap_to_bottom();
                                     let _ = tui.draw(view);
                                 };
                                 let mut poll_cancel = || poll_user_cancel();
-                                view.output = format_execute_report(
-                                    &execute::execute_partition(
-                                        dir,
-                                        caps,
-                                        sel,
-                                        bwrap,
-                                        resume,
-                                        execute::ExecuteProgress::new(
-                                            &mut on_execute_progress,
-                                            Some(&mut poll_cancel),
-                                        ),
-                                    )
-                                    .await,
-                                );
+                                let report = execute::execute_partition(
+                                    dir,
+                                    caps,
+                                    sel,
+                                    bwrap,
+                                    resume,
+                                    execute::ExecuteProgress::new(
+                                        &mut on_execute_progress,
+                                        Some(&mut poll_cancel),
+                                    ),
+                                )
+                                .await;
+                                if view.ui3_active() {
+                                    view.activity_set_live("/execute", &report);
+                                    view.activity_finish_live();
+                                    view.output = format_execute_report(&report);
+                                } else {
+                                    view.output = format_execute_report(&report);
+                                }
                             } else {
-                                view.output.push_str("\nsys: partition cancelled\n");
+                                append_sys_note(view, "\nsys: partition cancelled\n");
                             }
                             view.set_status(status_line(
                                 dir,
@@ -2957,9 +3159,12 @@ async fn drive(
                                 &trust,
                             ));
                         }
-                        Command::Unknown(c) => {
-                            view.output = format!("unknown command: /{c}  (try /help)");
-                        }
+                        Command::Unknown(c) => show_slash_output(
+                            view,
+                            "unknown",
+                            format!("unknown command: /{c}  (try /help)"),
+                            pump.messages(),
+                        ),
                     }
                     continue;
                 }
@@ -2971,9 +3176,13 @@ async fn drive(
                     view.set_status(note);
                 }
                 if sel.is_offline_stub() {
-                    view.output =
+                    show_slash_output(
+                        view,
+                        "offline",
                         "no model reachable — use /auth setup, /auth status, /model, or [r] retry"
-                            .to_string();
+                            .to_string(),
+                        pump.messages(),
+                    );
                     view.set_status(
                         "OFFLINE STUB  |  /auth setup  /model  [r] retry  [q] quit".to_string(),
                     );
@@ -3029,12 +3238,15 @@ async fn drive(
                 let turn_elapsed = view.pending_since.take().map(|s| s.elapsed());
                 match result {
                     Ok(_) => {
-                        view.output = transcript(pump.messages());
+                        refresh_conversation(view, pump.messages());
                         // A quiet per-turn timing footer in the transcript -- the
                         // record keeps it after the live status bar moves on.
                         if let Some(e) = turn_elapsed.filter(|_| !cancelled) {
-                            view.output
-                                .push_str(&format!("\nsys: done in {:.1}s", e.as_secs_f64()));
+                            let note = format!("\nsys: done in {:.1}s", e.as_secs_f64());
+                            view.output.push_str(&note);
+                            if view.ui3_active() {
+                                view.activity_push("sys", note.trim_start_matches('\n'));
+                            }
                         }
                         // Refresh the model + savings + context status after the turn.
                         let status = status_line(
@@ -3054,7 +3266,7 @@ async fn drive(
                     Err(err) => {
                         // Keep the error visible (don't let the savings refresh
                         // clobber it); the partial transcript still renders.
-                        view.output = transcript(pump.messages());
+                        refresh_conversation(view, pump.messages());
                         view.set_status(format!("error: {err}"));
                     }
                 }

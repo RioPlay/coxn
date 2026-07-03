@@ -53,10 +53,11 @@ pub struct ModalHit {
 
 /// Split the frame the same way `render` does.
 pub fn frame_layout(frame: Rect, view: &View) -> FrameLayout {
-    let areas = layout::frame_areas(frame, view);
+    let main = layout::main_pane(frame, view);
+    let input = layout::input_area(frame, view);
     FrameLayout {
-        pane: areas[0],
-        input: areas[3],
+        pane: main,
+        input,
         menu: view.menu.as_ref().map(|m| menu_hit(frame, m)),
         modal: view.modal.as_ref().and_then(|_| modal_hit(frame, view)),
     }

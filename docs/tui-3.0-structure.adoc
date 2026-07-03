@@ -1,0 +1,52 @@
+= coxn TUI 3.0 — structured shell
+:status: in progress
+:date: 2026-07-02
+:parent: docs/tui-2.0-plan.adoc
+
+North star: **daily-driver structure** — conversation, activity, and chrome are
+spatially distinct; the harness stays gate-honest.
+
+== Enable
+
+`COXN_TUI3=1` (or `on`/`true`/`yes`). Default off until dogfood passes.
+
+== Regions
+
+[cols="1,3"]
+|===
+| Chrome (1 row) | Model · task/scope · trust · aden — always visible
+| Conversation (flex) | Turn cards from `pump.messages()` — never replaced by slash/execute
+| Activity (8 rows) | `/execute`, `!cmd`, slash listings, system feed
+| Status (1 row) | Spinner, elapsed, scroll marker (legacy fields during migration)
+| Composer (1–8 rows) | Input; unchanged
+|===
+
+== Data ownership
+
+| Channel | Source | Updated by
+| Conversation | `View.ui3.turns` ← `Message[]` | `sync_turns` after each turn; live buffer during stream
+| Activity | `View.ui3.activity` | `push_activity`, `set_activity_body`, streaming append
+| Chrome | `View.ui3.chrome` | `set_chrome` on status refresh
+| Legacy `output` | Dual-written during migration | `/copy` fallback until PR5
+
+== Routing rules
+
+* Chat turns → conversation only
+* `/execute`, `!cmd`, `/model` listing → activity (not conversation wipe)
+* Modals / menus / help → overlays (unchanged)
+
+== PR stack
+
+. PR0–1: spec + `src/ui` turn model + card text
+. PR2: layout + chrome + `render_v3`
+. PR3: activity routing for execute + bang
+. PR4: slash commands off `view.output`
+. PR5: remove dual-write; `DriveIo` → live turn card
+. PR6: collapse tools, reasoning toggle, polish
+
+== Daily-drive gates (see scratch/gated-loop/CHECKLIST.md)
+
+* Chrome answers model + task without scrolling
+* `/execute` does not erase conversation pane
+* User vs tool vs system identifiable in <3s
+* 30-min dogfood: would open tomorrow

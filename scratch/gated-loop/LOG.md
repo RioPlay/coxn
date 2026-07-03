@@ -38,6 +38,20 @@
 **Residual (accepted / backlog):**
 - Cancel during single-scope `run_turn_streaming` (needs TurnIo hook)
 - Parallel wave in-flight workers not interrupted on cancel
+
+### Pass 3 — 2026-07-02 (TUI 3.0 wiring)
+
+**Scope:** PR2–4 — structured layout + drive.rs routing
+
+**Shipped:**
+- `COXN_TUI3=1` opt-in: chrome / conversation / activity regions
+- `drive.rs`: boot init, chrome refresh, `sync_turns`, live turn streaming
+- Activity routing: `/execute`, `!cmd`, slash listings (conversation preserved)
+- Dual-write `view.output` retained for `/copy` migration
+
+**Tests:** 320 pass; clippy clean
+
+**Next:** dogfood gates, PR5 remove dual-write, PR6 polish
 - Other env vars in tests without locks (lower priority)
 
 **Quick fix after re-review:** `partition cancelled` appends instead of replacing transcript
