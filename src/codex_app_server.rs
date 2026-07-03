@@ -152,11 +152,11 @@ impl CodexAppServerSession {
         model: &str,
         cwd: &str,
         prompt: &str,
-        on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<TurnCompletion, String> {
         self.initialize()?;
         let thread_id = self.start_ephemeral_thread(model, cwd)?;
-        self.run_turn(&thread_id, prompt, on_delta)
+        self.run_turn(&thread_id, prompt, io)
     }
 
     fn start_ephemeral_thread(&mut self, model: &str, cwd: &str) -> Result<String, String> {
@@ -180,7 +180,7 @@ impl CodexAppServerSession {
         &mut self,
         thread_id: &str,
         prompt: &str,
-        mut on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<TurnCompletion, String> {
         let id = self.next_id();
         let params = serde_json::json!({
@@ -214,9 +214,7 @@ impl CodexAppServerSession {
                                     value.pointer("/params/delta").and_then(|v| v.as_str())
                                 {
                                     text.push_str(delta);
-                                    if let Some(cb) = on_delta.as_deref_mut()
-                                        && !cb(delta)
-                                    {
+                                    if !io.on_delta(delta) {
                                         let _ = self.child.kill();
                                         break;
                                     }
@@ -255,6 +253,10 @@ impl CodexAppServerSession {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !io.on_idle() {
+                        let _ = self.child.kill();
+                        break;
+                    }
                     if self
                         .child
                         .try_wait()
@@ -578,7 +580,12 @@ mod tests {
             CodexAppServerConfig::for_turn(fake.to_string_lossy().to_string(), None, vec![], &dir);
         let mut session = CodexAppServerSession::spawn(&config).expect("spawn");
         let result = session
-            .complete_text_turn("test-model", &dir.display().to_string(), "ping", None)
+            .complete_text_turn(
+                "test-model",
+                &dir.display().to_string(),
+                "ping",
+                &mut crate::pump::SilentIo,
+            )
             .expect("turn");
         assert_eq!(result.text, "PONG");
         let _ = std::fs::remove_dir_all(&dir);

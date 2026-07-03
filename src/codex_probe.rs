@@ -80,6 +80,7 @@ pub fn format_status_line(
     }
 }
 
+#[allow(dead_code)]
 pub fn binary_installed(bin: &str) -> bool {
     codex_app_server::binary_installed(bin)
 }

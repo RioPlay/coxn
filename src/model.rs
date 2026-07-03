@@ -246,11 +246,12 @@ pub trait Model {
     async fn stream(
         &self,
         request: ModelRequest,
-        on_delta: &mut dyn FnMut(&str) -> bool,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<ModelResponse, ModelError> {
         let response = self.call(request).await?;
         if !response.message.content.is_empty() {
-            on_delta(&response.message.content);
+            io.on_idle();
+            io.on_delta(&response.message.content);
         }
         Ok(response)
     }
@@ -299,6 +300,8 @@ pub enum AnyModel {
     OpenAiCompat(crate::openai::OpenAiCompatModel),
     Ollama(crate::ollama::OllamaModel),
     CodexPiggyback(crate::codex_model::CodexPiggybackModel),
+    ClaudeCliPiggyback(crate::claude_cli::ClaudeCliPiggybackModel),
+    GrokCliPiggyback(crate::grok_cli::GrokCliPiggybackModel),
 }
 
 impl Model for AnyModel {
@@ -308,6 +311,8 @@ impl Model for AnyModel {
             AnyModel::OpenAiCompat(model) => model.supports_tool_calling(),
             AnyModel::Ollama(model) => model.supports_tool_calling(),
             AnyModel::CodexPiggyback(model) => model.supports_tool_calling(),
+            AnyModel::ClaudeCliPiggyback(model) => model.supports_tool_calling(),
+            AnyModel::GrokCliPiggyback(model) => model.supports_tool_calling(),
         }
     }
 
@@ -317,6 +322,8 @@ impl Model for AnyModel {
             AnyModel::OpenAiCompat(model) => model.call(request).await,
             AnyModel::Ollama(model) => model.call(request).await,
             AnyModel::CodexPiggyback(model) => model.call(request).await,
+            AnyModel::ClaudeCliPiggyback(model) => model.call(request).await,
+            AnyModel::GrokCliPiggyback(model) => model.call(request).await,
         }
     }
 
@@ -325,13 +332,15 @@ impl Model for AnyModel {
     async fn stream(
         &self,
         request: ModelRequest,
-        on_delta: &mut dyn FnMut(&str) -> bool,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<ModelResponse, ModelError> {
         match self {
-            AnyModel::Stub(model) => model.stream(request, on_delta).await,
-            AnyModel::OpenAiCompat(model) => model.stream(request, on_delta).await,
-            AnyModel::Ollama(model) => model.stream(request, on_delta).await,
-            AnyModel::CodexPiggyback(model) => model.stream(request, on_delta).await,
+            AnyModel::Stub(model) => model.stream(request, io).await,
+            AnyModel::OpenAiCompat(model) => model.stream(request, io).await,
+            AnyModel::Ollama(model) => model.stream(request, io).await,
+            AnyModel::CodexPiggyback(model) => model.stream(request, io).await,
+            AnyModel::ClaudeCliPiggyback(model) => model.stream(request, io).await,
+            AnyModel::GrokCliPiggyback(model) => model.stream(request, io).await,
         }
     }
 }

@@ -94,8 +94,13 @@ Resolution order:
 1. `COXN_MODEL_BASE_URL` (+ optional `COXN_MODEL_NAME`, `COXN_MODEL_KEY`) in env
 2. `.aden/config.toml` provider profiles: `[provider.*]` plus `[route].active`
 3. legacy `aden config` values (`model.base_url`, `model.name`) -- only when aden is present
-4. local auto-detect (Ollama `:11434`, then LM Studio `:1234`)
-5. offline stub
+4. logged-in CLIs on PATH (grok → claude → codex), then native Ollama (`:11434`)
+5. HTTP auto-detect (LM Studio `:1234`, Ollama OpenAI-compat)
+6. offline stub (use Ctrl-Space → **setup** presets, or `/auth setup <id>`)
+
+**First run:** `coxn` → Ctrl-Space → pick `setup grok-cli`, `setup ollama-native`, or
+`setup openrouter-claude`. Setup hot-reloads the model immediately; cloud keys paste
+via `/auth set-key <instance>`.
 
 Any OpenAI-compatible endpoint works: LM Studio, Ollama, vLLM, OpenRouter,
 OpenAI. Secrets come from environment variables or `~/.config/coxn/secrets/`,
@@ -240,6 +245,7 @@ status line is honest about which mode is active.
 /export          save transcript to ~/.local/share/coxn/exports/
 /copy            save transcript to ~/.local/share/coxn/last-transcript.txt
 /auth status     check configured provider auth
+/auth list       list provider presets
 /auth login <id> print native login or key setup command
 /execute         run aden task partition (live progress; transcript preserved)
 ```
@@ -249,6 +255,7 @@ CLI:
 ```
 coxn doctor              health check
 coxn auth status         check configured provider auth
+coxn auth list           list provider presets
 coxn auth login <id>     print native login or key setup command
 coxn auth set-key <id>   write ~/.config/coxn/secrets/<id>.key from stdin
 coxn once -p "prompt"    headless turn (COXN_AUTO_APPROVE=1)

@@ -15,7 +15,9 @@ use std::path::Path;
 
 use std::path::PathBuf;
 
+use crate::claude_cli::{self, CLAUDE_CLI_SCHEME, ClaudeCliPiggybackModel};
 use crate::codex_model::{self, CODEX_ENDPOINT_SCHEME, CodexPiggybackModel};
+use crate::grok_cli::{self, GROK_CLI_SCHEME, GrokCliPiggybackModel};
 use crate::model::{AnyModel, StubModel};
 use crate::{aden, ollama, openai, provider};
 
@@ -76,6 +78,70 @@ pub(crate) fn openai_model(
                 instance_id,
                 base_url,
                 key,
+                source: source.into(),
+            }),
+        },
+    )
+}
+
+/// Build a Claude Code CLI piggyback model paired with its selection state.
+pub(crate) fn claude_cli_model(
+    instance_id: String,
+    binary: String,
+    model: String,
+    home_path: Option<String>,
+    env: Vec<(String, String)>,
+    cwd: PathBuf,
+    source: impl Into<String>,
+) -> (AnyModel, ModelSel) {
+    let endpoint = format!("{CLAUDE_CLI_SCHEME}{binary}");
+    let backend = AnyModel::ClaudeCliPiggyback(ClaudeCliPiggybackModel::new(
+        binary.clone(),
+        model.clone(),
+        home_path,
+        env,
+        cwd,
+    ));
+    (
+        backend,
+        ModelSel {
+            name: model,
+            endpoint: Some(Endpoint {
+                instance_id,
+                base_url: endpoint,
+                key: None,
+                source: source.into(),
+            }),
+        },
+    )
+}
+
+/// Build a Grok Build CLI piggyback model paired with its selection state.
+pub(crate) fn grok_cli_model(
+    instance_id: String,
+    binary: String,
+    model: String,
+    home_path: Option<String>,
+    env: Vec<(String, String)>,
+    cwd: PathBuf,
+    source: impl Into<String>,
+) -> (AnyModel, ModelSel) {
+    let endpoint = format!("{GROK_CLI_SCHEME}{binary}");
+    let backend = AnyModel::GrokCliPiggyback(GrokCliPiggybackModel::new(
+        binary.clone(),
+        model.clone(),
+        home_path,
+        env,
+        cwd,
+    ));
+    (
+        backend,
+        ModelSel {
+            name: model,
+            endpoint: Some(Endpoint {
+                instance_id,
+                base_url: endpoint,
+                key: None,
                 source: source.into(),
             }),
         },
@@ -201,7 +267,7 @@ pub(crate) fn resolve_instance_from_config(
                 .binary
                 .clone()
                 .unwrap_or_else(|| "codex".to_string());
-            if !crate::codex_app_server::binary_installed(&binary) {
+            if !crate::discover::cli_instance_ready(instance) {
                 return None;
             }
             let cwd = std::env::current_dir().ok()?;
@@ -219,11 +285,91 @@ pub(crate) fn resolve_instance_from_config(
                 source,
             ))
         }
-        provider::ProviderDriver::ClaudeCli | provider::ProviderDriver::Unknown(_) => None,
+        provider::ProviderDriver::ClaudeCli => {
+            let binary = instance
+                .binary
+                .clone()
+                .unwrap_or_else(|| "claude".to_string());
+            if !crate::discover::cli_instance_ready(instance) {
+                return None;
+            }
+            let cwd = std::env::current_dir().ok()?;
+            Some(claude_cli_model(
+                instance.id.clone(),
+                binary,
+                selection.model,
+                instance.home_path.clone(),
+                instance.env.clone(),
+                cwd,
+                source,
+            ))
+        }
+        provider::ProviderDriver::GrokCli => {
+            let binary = instance
+                .binary
+                .clone()
+                .unwrap_or_else(|| "grok".to_string());
+            if !crate::discover::cli_instance_ready(instance) {
+                return None;
+            }
+            let cwd = std::env::current_dir().ok()?;
+            Some(grok_cli_model(
+                instance.id.clone(),
+                binary,
+                selection.model,
+                instance.home_path.clone(),
+                instance.env.clone(),
+                cwd,
+                source,
+            ))
+        }
+        provider::ProviderDriver::Unknown(_) => None,
     }
 }
 
 /// Rebuild the active Codex backend after `/model` switches model name.
+pub(crate) fn rebuild_claude_cli_model(
+    dir: &Path,
+    sel: &ModelSel,
+    model_name: String,
+) -> Option<AnyModel> {
+    let endpoint = sel.endpoint.as_ref()?;
+    let binary = claude_cli::binary_from_endpoint(&endpoint.base_url)?;
+    let cfg = provider::load_config(dir);
+    let instance = cfg.instance(&endpoint.instance_id)?;
+    if !matches!(instance.driver, provider::ProviderDriver::ClaudeCli) {
+        return None;
+    }
+    Some(AnyModel::ClaudeCliPiggyback(ClaudeCliPiggybackModel::new(
+        binary.to_string(),
+        model_name,
+        instance.home_path.clone(),
+        instance.env.clone(),
+        dir,
+    )))
+}
+
+pub(crate) fn rebuild_grok_cli_model(
+    dir: &Path,
+    sel: &ModelSel,
+    model_name: String,
+) -> Option<AnyModel> {
+    let endpoint = sel.endpoint.as_ref()?;
+    let binary = grok_cli::binary_from_endpoint(&endpoint.base_url)?;
+    let cfg = provider::load_config(dir);
+    let instance = cfg.instance(&endpoint.instance_id)?;
+    if !matches!(instance.driver, provider::ProviderDriver::GrokCli) {
+        return None;
+    }
+    Some(AnyModel::GrokCliPiggyback(GrokCliPiggybackModel::new(
+        binary.to_string(),
+        model_name,
+        instance.home_path.clone(),
+        instance.env.clone(),
+        dir,
+    )))
+}
+
 pub(crate) fn rebuild_codex_model(
     dir: &Path,
     sel: &ModelSel,
@@ -255,14 +401,16 @@ pub(crate) fn resolve_role(
     caps: &aden::AdenCaps,
     role: &str,
 ) -> Option<provider::ModelSelection> {
-    if !caps.available {
-        return None;
-    }
     let cfg = provider::load_config(dir);
-    cfg.route(role).or_else(|| cfg.route("active")).or_else(|| {
+    if let Some(sel) = cfg.route(role).or_else(|| cfg.route("active")) {
+        return Some(sel);
+    }
+    if caps.available {
         aden::config_get(dir, &format!("route.{role}"))
             .and_then(|value| provider::split_selection(&value))
-    })
+    } else {
+        None
+    }
 }
 
 /// Read the task env (`COXN_TASK_NAME` + `COXN_TASK_SEEDS` + `COXN_TASK_BUDGET`).
@@ -303,3 +451,44 @@ Edits are gated by aden against the task scope and reverted if they escape, so \
 keep changes minimal and in scope. To search or understand code, use the aden \
 tools: aden_grep, aden_locate, aden_asm, aden_understand, aden_ask.\n\n\
 === task scope context ===\n\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn resolve_role_reads_config_routes_without_aden() {
+        let dir = std::env::temp_dir().join(format!("coxn-route-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".aden")).unwrap();
+        fs::write(
+            dir.join(".aden/config.toml"),
+            r#"
+[provider.local]
+driver = "openai_compat"
+base_url = "http://localhost:11434/v1"
+enabled = true
+
+[route]
+active = "local:model-a"
+scout = "local:model-b"
+synth = "local:model-c"
+"#,
+        )
+        .unwrap();
+        let caps = aden::AdenCaps {
+            available: false,
+            model_base_url: None,
+            model_name: None,
+        };
+        let scout = resolve_role(&dir, &caps, "scout").expect("scout route");
+        assert_eq!(scout.instance_id, "local");
+        assert_eq!(scout.model, "model-b");
+        let synth = resolve_role(&dir, &caps, "synth").expect("synth route");
+        assert_eq!(synth.model, "model-c");
+        let unknown = resolve_role(&dir, &caps, "missing");
+        assert_eq!(unknown.as_ref().map(|s| s.model.as_str()), Some("model-a"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

@@ -25,7 +25,7 @@ pub struct AuthReport {
 pub fn report(dir: &Path, args: &[String]) -> AuthReport {
     match args.first().map(String::as_str) {
         Some("status") | None => status(dir),
-        Some("setup") => setup(dir, args.get(1).map(String::as_str)),
+        Some("setup") | Some("list") => setup(dir, args.get(1).map(String::as_str)),
         Some("login") => {
             let Some(id) = args.get(1) else {
                 return AuthReport {
@@ -47,7 +47,7 @@ pub fn report(dir: &Path, args: &[String]) -> AuthReport {
         Some(other) => AuthReport {
             code: 2,
             output: format!(
-                "coxn auth: unknown subcommand {other}\nusage: coxn auth status | setup [preset] | login <id> | set-key <id>\n"
+                "coxn auth: unknown subcommand {other}\nusage: coxn auth status | list | setup [preset] | login <id> | set-key <id>\n"
             ),
         },
     }
@@ -55,8 +55,9 @@ pub fn report(dir: &Path, args: &[String]) -> AuthReport {
 
 fn setup(dir: &Path, preset_id: Option<&str>) -> AuthReport {
     let Some(id) = preset_id else {
-        let mut out =
-            String::from("provider presets (coxn auth setup <id> or /auth setup <id>):\n\n");
+        let mut out = String::from(
+            "provider presets (coxn auth list | coxn auth setup <id> or /auth list | /auth setup <id>):\n\n",
+        );
         for p in provider::presets() {
             let key = if p.needs_key {
                 format!("needs {}", provider::secret_env_name(p.instance_id))
@@ -65,7 +66,7 @@ fn setup(dir: &Path, preset_id: Option<&str>) -> AuthReport {
             };
             out.push_str(&format!("  {:<18} {} — {key}\n", p.id, p.label));
         }
-        out.push_str("\nexample: coxn auth setup openrouter-claude\n");
+        out.push_str("\nexample: coxn auth list\nexample: coxn auth setup openrouter-claude\n");
         return AuthReport {
             code: 0,
             output: out,
@@ -166,12 +167,38 @@ fn status(dir: &Path) -> AuthReport {
             }
             ProviderDriver::ClaudeCli => {
                 let bin = instance.binary.as_deref().unwrap_or("claude");
-                if binary_responds(bin) {
-                    output.push_str(&format!("✓ {}: {bin} installed\n", instance.id));
-                } else {
+                let home = instance.home_path.as_deref();
+                if !binary_responds(bin) {
                     blocking = true;
                     output.push_str(&format!(
                         "✗ {}: {bin} not installed or not runnable\n",
+                        instance.id
+                    ));
+                } else if crate::claude_cli::probe_logged_in(bin, home, &instance.env) {
+                    output.push_str(&format!("✓ {}: {bin} authenticated\n", instance.id));
+                } else {
+                    blocking = true;
+                    output.push_str(&format!(
+                        "✗ {}: {bin} installed but not logged in (`{bin} login`)\n",
+                        instance.id
+                    ));
+                }
+            }
+            ProviderDriver::GrokCli => {
+                let bin = instance.binary.as_deref().unwrap_or("grok");
+                let home = instance.home_path.as_deref();
+                if !binary_responds(bin) {
+                    blocking = true;
+                    output.push_str(&format!(
+                        "✗ {}: {bin} not installed or not runnable\n",
+                        instance.id
+                    ));
+                } else if crate::grok_cli::probe_logged_in(bin, home, &instance.env) {
+                    output.push_str(&format!("✓ {}: {bin} authenticated\n", instance.id));
+                } else {
+                    blocking = true;
+                    output.push_str(&format!(
+                        "✗ {}: {bin} installed but not logged in (`{bin} login`)\n",
                         instance.id
                     ));
                 }
@@ -213,6 +240,10 @@ fn login(dir: &Path, id: &str) -> AuthReport {
             let bin = instance.binary.as_deref().unwrap_or("claude");
             format!("run native login:\n  {bin} login")
         }
+        ProviderDriver::GrokCli => {
+            let bin = instance.binary.as_deref().unwrap_or("grok");
+            format!("run native login:\n  {bin} login")
+        }
         ProviderDriver::Stub => format!("{} is offline stub; no auth needed", instance.id),
         ProviderDriver::Ollama => format!(
             "{} is native Ollama: local and keyless (no login needed)",
@@ -237,49 +268,15 @@ fn set_key(id: &str) -> AuthReport {
             output: format!("failed to read key from stdin: {e}\n"),
         };
     }
-    let key = key.trim();
-    if key.is_empty() {
-        return AuthReport {
+    match provider::write_secret(id, &key) {
+        Ok(path) => AuthReport {
+            code: 0,
+            output: format!("wrote {path}\n"),
+        },
+        Err(e) => AuthReport {
             code: 1,
-            output: "empty key refused\n".to_string(),
-        };
-    }
-    let Some(path) = provider::secret_file_path(id) else {
-        return AuthReport {
-            code: 1,
-            output: "HOME is not set; cannot choose secret path\n".to_string(),
-        };
-    };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return AuthReport {
-            code: 1,
-            output: format!("failed to create {}: {e}\n", parent.display()),
-        };
-    }
-    if let Some(parent) = path.parent() {
-        set_dir_permissions(parent);
-    }
-    let temp_path = path.with_extension(format!("key.{}.tmp", std::process::id()));
-    if let Err(e) = std::fs::write(&temp_path, format!("{key}\n")) {
-        return AuthReport {
-            code: 1,
-            output: format!("failed to write {}: {e}\n", temp_path.display()),
-        };
-    }
-    set_secret_permissions(&temp_path);
-    if let Err(e) = std::fs::rename(&temp_path, &path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return AuthReport {
-            code: 1,
-            output: format!("failed to persist {}: {e}\n", path.display()),
-        };
-    }
-    set_secret_permissions(&path);
-    AuthReport {
-        code: 0,
-        output: format!("wrote {}\n", path.display()),
+            output: format!("{e}\n"),
+        },
     }
 }
 
@@ -308,20 +305,16 @@ fn binary_responds(bin: &str) -> bool {
     }
 }
 
-#[cfg(unix)]
-fn set_secret_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_list_alias_matches_setup_listing() {
+        let dir = Path::new(".");
+        let list = report(dir, &["list".to_string()]);
+        let setup = report(dir, &["setup".to_string()]);
+        assert_eq!(list.code, 0);
+        assert_eq!(list.output, setup.output);
+    }
 }
-
-#[cfg(not(unix))]
-fn set_secret_permissions(_path: &Path) {}
-
-#[cfg(unix)]
-fn set_dir_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-}
-
-#[cfg(not(unix))]
-fn set_dir_permissions(_path: &Path) {}

@@ -357,7 +357,7 @@ impl Model for OllamaModel {
     async fn stream(
         &self,
         request: ModelRequest,
-        on_delta: &mut dyn FnMut(&str) -> bool,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<ModelResponse, ModelError> {
         let url = self.url();
         let body = to_wire(&self.model, &request, true);
@@ -377,24 +377,46 @@ impl Model for OllamaModel {
         // Ollama streams NDJSON: one JSON object per line, terminated by a
         // `{"done":true,...}` line.
         let mut state = StreamState::default();
-        let reader = std::io::BufReader::new(response.body_mut().as_reader());
-        for line in reader.lines() {
-            let line = line
-                .map_err(|e| ModelError::Backend(format!("reading ollama stream failed: {e}")))?;
-            if line.trim().is_empty() {
-                continue;
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+            scope.spawn(move || {
+                let reader = std::io::BufReader::new(response.body_mut().as_reader());
+                for line in reader.lines() {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            loop {
+                let line = {
+                    let mut idle_cb = || io.on_idle();
+                    let mut idle_opt = Some(&mut idle_cb as &mut dyn FnMut() -> bool);
+                    match crate::stream_idle::recv_line_with_idle(&rx, &mut idle_opt) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(e) => {
+                            return Err(ModelError::Backend(format!(
+                                "reading ollama stream failed: {e}"
+                            )));
+                        }
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(chunk) = serde_json::from_str::<ChatChunk>(&line) else {
+                    continue;
+                };
+                let is_done = chunk.done.unwrap_or(false);
+                if !state.apply(chunk, &mut |d| io.on_delta(d)) {
+                    break;
+                }
+                if is_done {
+                    break;
+                }
             }
-            let Ok(chunk) = serde_json::from_str::<ChatChunk>(&line) else {
-                continue;
-            };
-            let is_done = chunk.done.unwrap_or(false);
-            if !state.apply(chunk, on_delta) {
-                break;
-            }
-            if is_done {
-                break;
-            }
-        }
+            Ok(())
+        })?;
         let response = state.finish();
         if response.message.content.is_empty() && response.tool_calls.is_empty() {
             return Err(ModelError::Backend(

@@ -103,11 +103,40 @@ pub fn run(dir: &Path) -> i32 {
                 }
                 provider::ProviderDriver::ClaudeCli => {
                     let bin = instance.binary.as_deref().unwrap_or("claude");
-                    if codex_probe::binary_installed(bin) {
-                        println!("○ {}: {bin} installed (auth probe deferred)", instance.id);
-                    } else {
+                    let home = instance.home_path.as_deref();
+                    if !crate::cli_ndjson::binary_installed(bin) {
                         blocking = true;
                         println!("✗ {}: {bin} not installed or not runnable", instance.id);
+                    } else if crate::claude_cli::probe_logged_in(bin, home, &instance.env) {
+                        println!(
+                            "✓ {}: {bin} authenticated (claude CLI piggyback — text-only turns)",
+                            instance.id
+                        );
+                    } else {
+                        blocking = true;
+                        println!(
+                            "✗ {}: {bin} installed but not logged in (`{bin} login`)",
+                            instance.id
+                        );
+                    }
+                }
+                provider::ProviderDriver::GrokCli => {
+                    let bin = instance.binary.as_deref().unwrap_or("grok");
+                    let home = instance.home_path.as_deref();
+                    if !crate::cli_ndjson::binary_installed(bin) {
+                        blocking = true;
+                        println!("✗ {}: {bin} not installed or not runnable", instance.id);
+                    } else if crate::grok_cli::probe_logged_in(bin, home, &instance.env) {
+                        println!(
+                            "✓ {}: {bin} authenticated (grok CLI piggyback — text-only turns)",
+                            instance.id
+                        );
+                    } else {
+                        blocking = true;
+                        println!(
+                            "✗ {}: {bin} installed but not logged in (`{bin} login`)",
+                            instance.id
+                        );
                     }
                 }
                 provider::ProviderDriver::Unknown(driver) => {

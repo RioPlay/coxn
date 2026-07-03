@@ -1090,6 +1090,46 @@ mod tests {
     }
 
     #[test]
+    fn execute_partition_resolves_distinct_role_routes_without_aden() {
+        let dir = std::env::temp_dir().join(format!("coxn-exec-role-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".aden")).unwrap();
+        std::fs::write(
+            dir.join(".aden/config.toml"),
+            r#"
+[provider.scout]
+driver = "stub"
+enabled = true
+
+[provider.synth]
+driver = "stub"
+enabled = true
+
+[route]
+scout = "scout:scout-model"
+synth = "synth:synth-model"
+active = "scout:scout-model"
+"#,
+        )
+        .unwrap();
+        let caps = aden::AdenCaps {
+            available: false,
+            model_base_url: None,
+            model_name: None,
+        };
+        let cfg = provider::load_config(&dir);
+        let scout = resolve_role(&dir, &caps, "scout").expect("scout route");
+        let synth = resolve_role(&dir, &caps, "synth").expect("synth route");
+        assert_eq!(scout.instance_id, "scout");
+        assert_eq!(scout.model, "scout-model");
+        assert_eq!(synth.instance_id, "synth");
+        assert_eq!(synth.model, "synth-model");
+        assert!(resolve_instance_from_config(&cfg, scout, "route").is_some());
+        assert!(resolve_instance_from_config(&cfg, synth, "route").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn mandates_disjoint_detects_overlap() {
         let dir = std::env::temp_dir();
         // Two manifests with disjoint files => disjoint.

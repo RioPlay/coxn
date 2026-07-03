@@ -29,7 +29,7 @@ pub(crate) enum Command {
     Undo,
     /// `/export` writes the transcript to a markdown file.
     Export,
-    /// `/auth status|setup [preset]|login <id>|set-key <id>` — provider auth helpers.
+    /// `/auth status|list|setup [preset]|login <id>|set-key <id>` — provider auth helpers.
     Auth(Vec<String>),
     /// `/execute` runs the aden task partition sequentially (BatchIo).
     Execute {

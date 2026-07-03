@@ -12,11 +12,15 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 
 use crate::app::{
-    AGENT_PREAMBLE_ADEN, AGENT_PREAMBLE_BASE, ModelSel, openai_model, rebuild_codex_model,
-    resolve_instance_from_config, resolve_role, task_config,
+    AGENT_PREAMBLE_ADEN, AGENT_PREAMBLE_BASE, ModelSel, openai_model, rebuild_claude_cli_model,
+    rebuild_codex_model, rebuild_grok_cli_model, resolve_instance_from_config, resolve_role,
+    task_config,
 };
-use crate::codex_model::{self, CODEX_ENDPOINT_SCHEME};
+
+use crate::claude_cli;
+use crate::codex_model;
 use crate::commands::{Command, complete_input, parse_command};
+use crate::grok_cli;
 use crate::layout;
 use crate::model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
 use crate::mouse::{MouseEffect, frame_layout, handle_mouse, osc52_copy};
@@ -36,8 +40,189 @@ use crate::{
 
 const TICK: Duration = Duration::from_millis(100);
 
-/// Non-blocking Ctrl-C / quit check while a long local operation runs.
-fn poll_user_cancel() -> bool {
+/// Result of draining the event queue while a long operation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputDrainResult {
+    /// No input edits were applied.
+    None,
+    /// The input buffer or scroll position changed.
+    Edited,
+    /// The user pressed Ctrl-C to cancel the background operation.
+    Cancel,
+}
+
+/// Drain pending keyboard/paste events into the input buffer while inference,
+/// streaming, or `/execute` runs. Does not submit messages or open modals.
+fn drain_input_edits(tui: &Tui, view: &mut View) -> InputDrainResult {
+    if view.modal.is_some() || view.menu.is_some() || view.show_help {
+        return InputDrainResult::None;
+    }
+    let mut result = InputDrainResult::None;
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        let Ok(ev) = event::read() else {
+            break;
+        };
+        match ev {
+            Event::Paste(s) => {
+                view.input_push_str(&s);
+                result = InputDrainResult::Edited;
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if matches!(map_input_key(key), Some(Action::Quit)) {
+                    return InputDrainResult::Cancel;
+                }
+                let newline_enter = matches!(key.code, KeyCode::Enter)
+                    && (key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::SHIFT));
+                let vim_outcome = if newline_enter || !vim::enabled() {
+                    Outcome::Pass
+                } else {
+                    view.vim.handle(&mut view.input, &mut view.cursor, key)
+                };
+                if vim_outcome == Outcome::Consumed {
+                    result = InputDrainResult::Edited;
+                    continue;
+                }
+                if let Outcome::Scroll(dir) = vim_outcome {
+                    let (w, h) = pane_dims(tui, view);
+                    match dir {
+                        Scroll::LineUp => view.scroll_primary_up(1, view.max_scroll(w, h)),
+                        Scroll::LineDown => view.scroll_primary_down(1),
+                        Scroll::HalfPageUp => view.scroll_primary_up(h / 2, view.max_scroll(w, h)),
+                        Scroll::HalfPageDown => view.scroll_primary_down(h / 2),
+                        Scroll::Top => {
+                            view.scroll_primary_up(view.max_scroll(w, h), view.max_scroll(w, h));
+                        }
+                        Scroll::Bottom => view.scroll_primary_down(view.max_scroll(w, h)),
+                    }
+                    result = InputDrainResult::Edited;
+                    continue;
+                }
+                if let Outcome::ScrollN(dir, n) = vim_outcome {
+                    let (w, h) = pane_dims(tui, view);
+                    for _ in 0..n {
+                        match dir {
+                            Scroll::LineUp => view.scroll_primary_up(1, view.max_scroll(w, h)),
+                            Scroll::LineDown => view.scroll_primary_down(1),
+                            Scroll::HalfPageUp => {
+                                view.scroll_primary_up(h / 2, view.max_scroll(w, h))
+                            }
+                            Scroll::HalfPageDown => view.scroll_primary_down(h / 2),
+                            Scroll::Top => {
+                                view.scroll_primary_up(
+                                    view.max_scroll(w, h),
+                                    view.max_scroll(w, h),
+                                );
+                            }
+                            Scroll::Bottom => view.scroll_primary_down(view.max_scroll(w, h)),
+                        }
+                    }
+                    result = InputDrainResult::Edited;
+                    continue;
+                }
+                if view.search_editing() || view.search.is_some() {
+                    continue;
+                }
+                if vim_outcome == Outcome::Submit {
+                    continue;
+                }
+                let action = map_insert_key(view, key);
+                match action {
+                    Some(Action::Quit) => return InputDrainResult::Cancel,
+                    Some(Action::Submit) | Some(Action::Complete) => {}
+                    Some(Action::Append(c)) => {
+                        view.input_push(c);
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::Newline) => {
+                        view.input_push('\n');
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::Backspace) => {
+                        view.input_backspace();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::CursorLeft) => {
+                        view.cursor_left();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::CursorRight) => {
+                        if view.cursor == view.input.len() {
+                            if let Some(sugg) = &view.suggestion {
+                                view.input.push_str(sugg);
+                                view.cursor_end();
+                                result = InputDrainResult::Edited;
+                                continue;
+                            }
+                        }
+                        view.cursor_right();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::CursorHome) => {
+                        view.cursor_home();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::CursorEnd) => {
+                        view.cursor_end();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::WordDelete) => {
+                        view.word_delete();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::KillToEnd) => {
+                        view.kill_to_end();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::KillToStart) => {
+                        view.kill_to_start();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::Yank) => {
+                        view.yank();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::HistoryPrev) => {
+                        view.history_prev();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::HistoryNext) => {
+                        view.history_next();
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::ScrollUp) => {
+                        let (w, h) = pane_dims(tui, view);
+                        view.scroll_primary_up(SCROLL_STEP, view.max_scroll(w, h));
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::ScrollDown) => {
+                        view.scroll_primary_down(SCROLL_STEP);
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::PageUp) => {
+                        let (w, h) = pane_dims(tui, view);
+                        view.scroll_primary_up(h, view.max_scroll(w, h));
+                        result = InputDrainResult::Edited;
+                    }
+                    Some(Action::PageDown) => {
+                        let (_, h) = pane_dims(tui, view);
+                        view.scroll_primary_down(h);
+                        result = InputDrainResult::Edited;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if result == InputDrainResult::Edited {
+        view.refresh_suggestion();
+    }
+    result
+}
+
+/// Ctrl-C / quit only — used where `tui`/`view` are already borrowed elsewhere.
+fn poll_user_quit_only() -> bool {
     if let Ok(true) = event::poll(Duration::ZERO)
         && let Ok(Event::Key(key)) = event::read()
         && key.kind == KeyEventKind::Press
@@ -45,6 +230,17 @@ fn poll_user_cancel() -> bool {
         return matches!(map_input_key(key), Some(Action::Quit));
     }
     false
+}
+
+fn apply_input_drain(tui: &mut Tui, view: &mut View) -> bool {
+    match drain_input_edits(tui, view) {
+        InputDrainResult::Cancel => false,
+        InputDrainResult::Edited => {
+            let _ = tui.draw(view);
+            true
+        }
+        InputDrainResult::None => true,
+    }
 }
 
 /// Lines the transcript scrolls per Up/Down (a wheel notch in most terminals).
@@ -214,7 +410,7 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
     view.set_status(boot_status(&sel.label(), &task.status, caps.available));
     let scope_cache = ScopeCaches::default();
     view.set_chrome(chrome_state(
-        &sel.label(),
+        &sel,
         &scope_cache.chrome_label(&task.status),
         None,
         caps.available,
@@ -235,7 +431,8 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
         append_sys_note(
             &mut view,
             "\n\nsys: ⚠ offline — no model reachable yet\n\
-             sys: fix: /auth setup · start Ollama/LM Studio · set COXN_MODEL_BASE_URL\n\
+             sys: fix: Ctrl-Space → setup grok-cli / ollama-native / openrouter-claude\n\
+             sys: or /auth setup · start Ollama/LM Studio · set COXN_MODEL_BASE_URL\n\
              sys: [r] retry  [q] quit  (slash commands still work)",
         );
         view.set_status("OFFLINE STUB  |  /auth setup  /model  [r] retry  [q] quit".to_string());
@@ -353,19 +550,15 @@ impl ScopeCaches {
 
 /// Chrome bar fields for TUI 3.0 (parallel to [`status_line`]).
 fn chrome_state(
-    model_label: &str,
+    sel: &ModelSel,
     scope: &str,
     usage: Option<Usage>,
     aden_active: bool,
     trust: &Trust,
     task_gated: bool,
 ) -> ChromeState {
-    let model = match usage {
-        Some(u) if u.prompt_tokens > 0 => format!("{model_label} {}", ctx_meter(u.prompt_tokens)),
-        _ => model_label.to_string(),
-    };
     ChromeState {
-        model,
+        model: crate::discover::model_display_label(sel, usage),
         task: scope.to_string(),
         trust: trust.ladder_tag(task_gated).to_string(),
         aden_active,
@@ -474,11 +667,19 @@ fn resolve_model(dir: &Path, caps: &aden::AdenCaps) -> (AnyModel, ModelSel) {
             .unwrap_or_else(|| "local".to_string());
         return openai_model("config".to_string(), base_url, model, env_key(), "config");
     }
-    // 4. Local auto-detection.
+    // 4. Logged-in CLIs on PATH (grok → claude → codex).
+    if let Some(resolved) = crate::discover::detect_cli(dir) {
+        return resolved;
+    }
+    // 5. Native Ollama when the daemon is up (streaming + tools).
+    if let Some(resolved) = crate::discover::detect_ollama_native() {
+        return resolved;
+    }
+    // 6. LM Studio / Ollama OpenAI-compat HTTP auto-detect.
     if let Some((base_url, model)) = openai::detect() {
         return openai_model("local".to_string(), base_url, model, None, "auto");
     }
-    // 5. Offline stub.
+    // 7. Offline stub.
     (
         AnyModel::Stub(StubModel),
         ModelSel {
@@ -495,10 +696,7 @@ fn model_listing(dir: &Path, sel: &ModelSel) -> String {
     let Some(e) = &sel.endpoint else {
         return format!("model: {}", sel.label());
     };
-    if e.base_url.starts_with(CODEX_ENDPOINT_SCHEME) {
-        let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) else {
-            return format!("model: {}", sel.label());
-        };
+    if let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) {
         let cfg = provider::load_config(dir);
         let instance = cfg.instance(&e.instance_id);
         let codex_home = instance.and_then(|i| i.shadow_home.as_deref().or(i.home_path.as_deref()));
@@ -511,6 +709,48 @@ fn model_listing(dir: &Path, sel: &ModelSel) -> String {
                     out.push_str(&format!("  {mark} {:>2}. {m}\n", i + 1));
                 }
                 out.push_str("(* = active; codex CLI piggyback — text-only turns)");
+                out
+            }
+            _ => format!(
+                "model: {}  (could not list models from {binary})",
+                sel.label()
+            ),
+        };
+    }
+    if let Some(binary) = claude_cli::binary_from_endpoint(&e.base_url) {
+        let cfg = provider::load_config(dir);
+        let instance = cfg.instance(&e.instance_id);
+        let home = instance.and_then(|i| i.home_path.as_deref());
+        let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
+        return match claude_cli::list_models(binary, home, env) {
+            Some(models) if !models.is_empty() => {
+                let mut out = format!("models on {binary} (/model <name|#> to switch):\n");
+                for (i, m) in models.iter().enumerate() {
+                    let mark = if *m == sel.name { '*' } else { ' ' };
+                    out.push_str(&format!("  {mark} {:>2}. {m}\n", i + 1));
+                }
+                out.push_str("(* = active; claude CLI piggyback — text-only turns)");
+                out
+            }
+            _ => format!(
+                "model: {}  (could not list models from {binary})",
+                sel.label()
+            ),
+        };
+    }
+    if let Some(binary) = grok_cli::binary_from_endpoint(&e.base_url) {
+        let cfg = provider::load_config(dir);
+        let instance = cfg.instance(&e.instance_id);
+        let home = instance.and_then(|i| i.home_path.as_deref());
+        let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
+        return match grok_cli::list_models(binary, home, env) {
+            Some(models) if !models.is_empty() => {
+                let mut out = format!("models on {binary} (/model <name|#> to switch):\n");
+                for (i, m) in models.iter().enumerate() {
+                    let mark = if *m == sel.name { '*' } else { ' ' };
+                    out.push_str(&format!("  {mark} {:>2}. {m}\n", i + 1));
+                }
+                out.push_str("(* = active; grok CLI piggyback — text-only turns)");
                 out
             }
             _ => format!(
@@ -565,11 +805,8 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
     let Some(e) = &sel.endpoint else {
         return "no provider to switch on (offline stub)".to_string();
     };
-    if e.base_url.starts_with(CODEX_ENDPOINT_SCHEME) {
+    if let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) {
         let cfg = provider::load_config(dir);
-        let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) else {
-            return "invalid codex endpoint".to_string();
-        };
         let instance = cfg.instance(&e.instance_id);
         let codex_home = instance.and_then(|i| i.shadow_home.as_deref().or(i.home_path.as_deref()));
         let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
@@ -583,6 +820,46 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
         };
         let Some(model) = rebuild_codex_model(dir, sel, chosen.clone()) else {
             return "failed to rebuild codex model".to_string();
+        };
+        pump.set_model(model);
+        sel.name = chosen;
+        return format!("switched to {}", sel.label());
+    }
+    if let Some(binary) = claude_cli::binary_from_endpoint(&e.base_url) {
+        let cfg = provider::load_config(dir);
+        let instance = cfg.instance(&e.instance_id);
+        let home = instance.and_then(|i| i.home_path.as_deref());
+        let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
+        let listed = claude_cli::list_models(binary, home, env).unwrap_or_default();
+        let chosen = match target.parse::<usize>() {
+            Ok(n) => match listed.get(n.wrapping_sub(1)) {
+                Some(m) => m.clone(),
+                None => return format!("no model #{n} (there are {})", listed.len()),
+            },
+            Err(_) => target.to_string(),
+        };
+        let Some(model) = rebuild_claude_cli_model(dir, sel, chosen.clone()) else {
+            return "failed to rebuild claude CLI model".to_string();
+        };
+        pump.set_model(model);
+        sel.name = chosen;
+        return format!("switched to {}", sel.label());
+    }
+    if let Some(binary) = grok_cli::binary_from_endpoint(&e.base_url) {
+        let cfg = provider::load_config(dir);
+        let instance = cfg.instance(&e.instance_id);
+        let home = instance.and_then(|i| i.home_path.as_deref());
+        let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
+        let listed = grok_cli::list_models(binary, home, env).unwrap_or_default();
+        let chosen = match target.parse::<usize>() {
+            Ok(n) => match listed.get(n.wrapping_sub(1)) {
+                Some(m) => m.clone(),
+                None => return format!("no model #{n} (there are {})", listed.len()),
+            },
+            Err(_) => target.to_string(),
+        };
+        let Some(model) = rebuild_grok_cli_model(dir, sel, chosen.clone()) else {
+            return "failed to rebuild grok CLI model".to_string();
         };
         pump.set_model(model);
         sel.name = chosen;
@@ -608,20 +885,28 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
 /// active one starred). `None` for the offline stub or an unreachable endpoint.
 fn model_menu(dir: &Path, sel: &ModelSel) -> Option<Menu> {
     let e = sel.endpoint.as_ref()?;
-    let models = if e.base_url.starts_with(CODEX_ENDPOINT_SCHEME) {
-        let binary = codex_model::codex_binary_from_endpoint(&e.base_url)?;
-        let cfg = provider::load_config(dir);
-        let instance = cfg.instance(&e.instance_id);
+    let cfg = provider::load_config(dir);
+    let instance = cfg.instance(&e.instance_id);
+    let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
+    let models = if let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) {
         let codex_home = instance.and_then(|i| i.shadow_home.as_deref().or(i.home_path.as_deref()));
-        let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
         codex_model::list_models(binary, codex_home, env)?
+    } else if let Some(binary) = claude_cli::binary_from_endpoint(&e.base_url) {
+        let home = instance.and_then(|i| i.home_path.as_deref());
+        claude_cli::list_models(binary, home, env)?
+    } else if let Some(binary) = grok_cli::binary_from_endpoint(&e.base_url) {
+        let home = instance.and_then(|i| i.home_path.as_deref());
+        grok_cli::list_models(binary, home, env)?
     } else {
         openai::list_models(&e.base_url, e.key.as_deref())?
     };
     if models.is_empty() {
         return None;
     }
-    let loaded = if e.base_url.starts_with(CODEX_ENDPOINT_SCHEME) {
+    let loaded = if codex_model::codex_binary_from_endpoint(&e.base_url).is_some()
+        || claude_cli::binary_from_endpoint(&e.base_url).is_some()
+        || grok_cli::binary_from_endpoint(&e.base_url).is_some()
+    {
         Vec::new()
     } else {
         openai::loaded_models(&e.base_url, e.key.as_deref()).unwrap_or_default()
@@ -689,6 +974,15 @@ fn session_menu() -> Option<Menu> {
 /// Fuzzy unified palette (M4): slash verbs, models, sessions, recent commands.
 fn palette_menu(dir: &Path, sel: &ModelSel, history: &[String]) -> Menu {
     let mut catalog: Vec<MenuItem> = Vec::new();
+
+    for preset in ["grok-cli", "ollama-native", "openrouter-claude"] {
+        if let Some(p) = provider::preset_by_id(preset) {
+            catalog.push(MenuItem {
+                label: format!("setup  {preset} — {}", p.label),
+                value: format!("auth:setup:{preset}"),
+            });
+        }
+    }
 
     for cmd in crate::commands::COMMANDS {
         catalog.push(MenuItem {
@@ -794,6 +1088,14 @@ fn commands_menu() -> Option<Menu> {
     items.push(MenuItem {
         label: "/help - this help".to_string(),
         value: "/help ".to_string(),
+    });
+    items.push(MenuItem {
+        label: "/auth setup - provider wizard".to_string(),
+        value: "/auth setup ".to_string(),
+    });
+    items.push(MenuItem {
+        label: "/auth status - check providers".to_string(),
+        value: "/auth status".to_string(),
     });
     items.push(MenuItem {
         label: "/model - list/switch models".to_string(),
@@ -1289,7 +1591,7 @@ async fn run_bang_shell_streaming(
         }
         view.snap_to_bottom();
         let _ = tui.draw(view);
-        if poll_user_cancel() {
+        if !apply_input_drain(tui, view) {
             cancelled = true;
             return false;
         }
@@ -1398,12 +1700,14 @@ fn retry_wait(tui: &mut Tui, view: &mut View, attempt: u32, secs: u64) -> io::Re
         tui.draw(view)?;
         let until = std::time::Instant::now() + Duration::from_secs(1);
         while std::time::Instant::now() < until {
-            if event::poll(Duration::from_millis(100))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && matches!(map_input_key(key), Some(Action::Quit))
-            {
-                return Ok(true);
+            if event::poll(Duration::from_millis(100))? {
+                match drain_input_edits(tui, view) {
+                    InputDrainResult::Cancel => return Ok(true),
+                    InputDrainResult::Edited => {
+                        let _ = tui.draw(view);
+                    }
+                    InputDrainResult::None => {}
+                }
             }
         }
     }
@@ -1545,34 +1849,42 @@ impl DriveIo<'_> {
 }
 
 impl TurnIo for DriveIo<'_> {
+    fn stream_cancelled(&self) -> bool {
+        self.cancelled || self.cancel_turn
+    }
+
+    fn on_idle(&mut self) -> bool {
+        match drain_input_edits(self.tui, self.view) {
+            InputDrainResult::Cancel => {
+                self.cancelled = true;
+                false
+            }
+            InputDrainResult::Edited => {
+                let _ = self.tui.draw(self.view);
+                true
+            }
+            InputDrainResult::None => true,
+        }
+    }
+
     fn on_delta(&mut self, delta: &str) -> bool {
-        self.buf.push_str(delta);
-        self.repaint();
-        // Non-blocking cancel check: Ctrl-C aborts the turn.
-        if let Ok(true) = event::poll(Duration::ZERO)
-            && let Ok(Event::Key(key)) = event::read()
-            && key.kind == KeyEventKind::Press
-            && matches!(map_input_key(key), Some(Action::Quit))
-        {
+        if !self.on_idle() {
             self.cancelled = true;
             return false;
         }
+        self.buf.push_str(delta);
+        self.repaint();
         true
     }
 
     fn on_run_output(&mut self, line: &str) -> bool {
-        self.run_buf.push_str(line);
-        self.run_buf.push('\n');
-        self.repaint();
-        // Non-blocking cancel check: Ctrl-C kills the child.
-        if let Ok(true) = event::poll(Duration::ZERO)
-            && let Ok(Event::Key(key)) = event::read()
-            && key.kind == KeyEventKind::Press
-            && matches!(map_input_key(key), Some(Action::Quit))
-        {
+        if !self.on_idle() {
             self.cancelled = true;
             return false;
         }
+        self.run_buf.push_str(line);
+        self.run_buf.push('\n');
+        self.repaint();
         true
     }
 
@@ -1879,6 +2191,22 @@ fn dispatch_menu_pick(
                         scope_cache,
                     ));
                 }
+            } else if let Some(preset) = value.strip_prefix("auth:setup:") {
+                let body = match provider::apply_preset(dir, preset) {
+                    Ok(msg) => {
+                        let mut out = msg;
+                        let caps = aden::probe(dir);
+                        if let Some(note) =
+                            hot_reload_model(dir, &caps, pump, sel, view, task, trust, scope_cache)
+                        {
+                            out.push_str(&format!("\n{note}\n"));
+                            append_sys_note(view, &format!("\nsys: {note}"));
+                        }
+                        out
+                    }
+                    Err(e) => format!("{e}\n"),
+                };
+                show_slash_output(view, "/auth setup", body, pump.messages());
             } else if let Some(text) = value.strip_prefix("input:") {
                 view.input = text.to_string();
                 view.cursor_end();
@@ -1892,6 +2220,48 @@ fn dispatch_menu_pick(
             view.refresh_suggestion();
         }
     }
+}
+
+/// Re-resolve the model after `/auth setup` or `/auth set-key` without restarting.
+#[allow(clippy::too_many_arguments)]
+fn hot_reload_model(
+    dir: &Path,
+    caps: &aden::AdenCaps,
+    pump: &mut Pump<AnyModel>,
+    sel: &mut ModelSel,
+    view: &mut View,
+    task: &str,
+    trust: &Trust,
+    scope_cache: &mut ScopeCaches,
+) -> Option<String> {
+    let (model, new_sel) = resolve_model(dir, caps);
+    new_sel.endpoint.as_ref()?;
+    let was_offline = sel.is_offline_stub();
+    pump.set_model(model);
+    *sel = new_sel;
+    let task_gated = !task.is_empty() && task.contains("gated");
+    view.set_status(status_line(
+        dir,
+        &sel.label(),
+        task,
+        pump.last_usage(),
+        view.aden_active,
+        trust,
+        scope_cache,
+    ));
+    view.set_chrome(chrome_state(
+        sel,
+        &scope_cache.chrome_label(task),
+        pump.last_usage(),
+        view.aden_active,
+        trust,
+        task_gated,
+    ));
+    Some(if was_offline {
+        format!("model online: {}", sel.label())
+    } else {
+        format!("model refreshed: {}", sel.label())
+    })
 }
 
 /// The event loop: draw, read a key, route it by mode (modal vs input), and run
@@ -1925,7 +2295,7 @@ async fn drive(
         // Keep the aden badge on the status line in sync with caps each frame.
         view.aden_active = caps.available;
         view.set_chrome(chrome_state(
-            &sel.label(),
+            sel,
             &scope_cache.chrome_label(task),
             pump.last_usage(),
             caps.available,
@@ -2048,7 +2418,11 @@ async fn drive(
             // Either the modal/menu paths above already ate the key, or we are
             // in normal Insert/Normal input composition: paste is always an
             // input edit, never a confirm/select gesture.
-            if view.modal.is_none() && view.menu.is_none() {
+            if view.modal.is_some() && view.modal_kind == ModalKind::SecretInput {
+                for c in s.chars() {
+                    view.modal_input_push(c);
+                }
+            } else if view.modal.is_none() && view.menu.is_none() {
                 view.input_push_str(&s);
             }
             continue;
@@ -2141,6 +2515,43 @@ async fn drive(
         // A modal grabs input until answered.
         if view.modal.is_some() {
             match view.modal_kind {
+                ModalKind::SecretInput => match (key.code, key.modifiers) {
+                    (KeyCode::Enter, _) => {
+                        if let Some(id) = view.modal_secret_id.clone() {
+                            let key_text = std::mem::take(&mut view.modal_input);
+                            view.modal_cursor = 0;
+                            view.dismiss();
+                            let body = match provider::write_secret(&id, &key_text) {
+                                Ok(path) => {
+                                    let mut out = format!("wrote {path}\n");
+                                    let caps = aden::probe(dir);
+                                    if let Some(note) = hot_reload_model(
+                                        dir,
+                                        &caps,
+                                        pump,
+                                        sel,
+                                        view,
+                                        task,
+                                        &trust,
+                                        &mut scope_cache,
+                                    ) {
+                                        out.push_str(&format!("{note}\n"));
+                                        append_sys_note(view, &format!("\nsys: {note}"));
+                                    }
+                                    out
+                                }
+                                Err(e) => format!("{e}\n"),
+                            };
+                            show_slash_output(view, "/auth set-key", body, pump.messages());
+                        }
+                    }
+                    (KeyCode::Esc, _) => view.dismiss(),
+                    (KeyCode::Backspace, _) => view.modal_input_backspace(),
+                    (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                        view.modal_input_push(c);
+                    }
+                    _ => {}
+                },
                 ModalKind::Gate => match map_modal_key(key) {
                     Some(Action::Confirm) | Some(Action::Cancel) => view.dismiss(),
                     Some(Action::ModalExpand) if view.modal_diff.is_some() => {
@@ -2909,7 +3320,7 @@ async fn drive(
                             {
                                 resolve_role(dir, caps, role).map(|s| format!("{}/{}", s.instance_id, s.model)).ok_or_else(|| {
                                     format!(
-                                        "no model mapped for role '@{role}'; set route.{role} via aden config"
+                                        "no model mapped for role '@{role}'; set route.{role} in .aden/config.toml"
                                     )
                                 })
                             } else {
@@ -3105,18 +3516,41 @@ async fn drive(
                             pump.messages(),
                         ),
                         Command::Auth(args) => {
-                            let body = if args.first().is_some_and(|arg| arg == "set-key") {
-                                "run key storage from your shell: coxn auth set-key <id> < key.txt\n"
-                                    .to_string()
+                            if args.first().is_some_and(|arg| arg == "set-key")
+                                && let Some(id) = args.get(1)
+                                && args.len() == 2
+                            {
+                                view.open_secret_modal(
+                                    id.clone(),
+                                    format!(
+                                        "Paste API key for {id} (stored in ~/.config/coxn/secrets/)"
+                                    ),
+                                );
                             } else {
                                 let result = auth::report(dir, &args);
                                 let mut out = result.output;
                                 if result.code != 0 {
                                     out.push_str(&format!("status: auth exited {}\n", result.code));
                                 }
-                                out
-                            };
-                            show_slash_output(view, "/auth", body, pump.messages());
+                                if args.first().is_some_and(|a| a == "setup")
+                                    && args.len() >= 2
+                                    && result.code == 0
+                                    && let Some(note) = hot_reload_model(
+                                        dir,
+                                        caps,
+                                        pump,
+                                        sel,
+                                        view,
+                                        task,
+                                        &trust,
+                                        &mut scope_cache,
+                                    )
+                                {
+                                    out.push_str(&format!("\n{note}\n"));
+                                    append_sys_note(view, &format!("\nsys: {note}"));
+                                }
+                                show_slash_output(view, "/auth", out, pump.messages());
+                            }
                         }
                         Command::Execute { resume } => {
                             let preview = execute_preview_text(dir, caps, resume);
@@ -3153,7 +3587,7 @@ async fn drive(
                                     view.snap_to_bottom();
                                     let _ = tui.draw(view);
                                 };
-                                let mut poll_cancel = || poll_user_cancel();
+                                let mut poll_cancel = || poll_user_quit_only();
                                 let report = execute::execute_partition(
                                     dir,
                                     caps,

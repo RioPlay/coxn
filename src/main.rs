@@ -7,14 +7,18 @@ mod aden;
 mod agents;
 mod app;
 mod auth;
+mod claude_cli;
+mod cli_ndjson;
 mod codex_app_server;
 mod codex_model;
 mod codex_probe;
 mod commands;
+mod discover;
 mod doctor;
 mod drive;
 mod execute;
 mod gate;
+mod grok_cli;
 mod layout;
 mod model;
 mod mouse;
@@ -25,6 +29,7 @@ mod pump;
 mod run_ledger;
 mod sandbox;
 mod session;
+mod stream_idle;
 mod tools;
 mod trust;
 mod tui;
@@ -44,7 +49,8 @@ USAGE:
     coxn                 Interactive TUI (default)
     coxn doctor          Health check (model, sandbox, aden, task)
     coxn auth status     Check configured provider auth
-    coxn auth setup      List provider presets; setup <id> writes config
+    coxn auth list       List provider presets
+    coxn auth setup <id> Write config for a preset
     coxn --version       Print version
     coxn --help          This help
 

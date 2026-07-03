@@ -171,13 +171,13 @@ Spec: `docs/provider-auth-plan.adoc` (delegation plan; T3 Code patterns).
 * [x] N3 `coxn auth status|login|set-key` + doctor per-instance rows
 * [x] N4 `/model`, `/execute`, status line wired to instances
 * [x] N5 Docs + example config (OpenRouter preset, INSTALL)
-* [x] N6 (optional) CLI piggyback backend — Codex `app-server` text turns (`AnyModel::CodexPiggyback`); Claude deferred (N11/A10)
+* [x] N6 (optional) CLI piggyback backend — Codex / Claude / Grok `*-cli` text turns (`CodexPiggyback`, `ClaudeCliPiggyback`, `GrokCliPiggyback`)
 * [x] N7 (parallel) `main.rs` → `app.rs` extract (Phase K — done; drive loop in `drive.rs`)
 * [x] N8 T3-derived hardening: provider slug/env validation, unknown-driver unavailable state, atomic secrets
 * [x] N9 Codex app-server auth probe (`initialize` + `account/read`)
 * [x] N10 Provider environment presets (`coxn auth setup`, `/auth setup <id>`) for Ollama/LM Studio/OpenAI/OpenRouter
-* [ ] N10b CLI backend design (piggyback — see N6/N11)
-* [x] N11 CLI-backed provider MVP — Codex first via `CodexPiggybackModel` (text-only; coxn tools stay on pump side)
+* [x] N10b CLI backend design (piggyback — shared `cli_ndjson` + `stream_idle`; grok/claude NDJSON parsers)
+* [x] N11 CLI-backed provider MVP — Codex + Claude + Grok via piggyback models (text-only; coxn tools stay on pump side)
 
 == Phase T (TUI frictionless): daily-driver chrome -- DONE
 
