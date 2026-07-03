@@ -1676,7 +1676,7 @@ pub(crate) fn mode_tip_text(mode: Mode) -> &'static str {
         return "Enter send. Ctrl-Space palette. @ files. ? help. Ctrl-F search.";
     }
     match mode {
-        Mode::Insert => "type. Enter send. Alt-Enter newline.",
+        Mode::Insert => "type. Enter send. Alt-Enter newline. Up recalls history when empty.",
         Mode::Normal => "h/j/k/l. / search. gr grep. g? help.",
         Mode::Visual => "v motion. d/y operate.",
         Mode::Command => ":view :grep :doctor :impact.",
@@ -2414,9 +2414,9 @@ pub enum Action {
     ToggleReasoning,
 }
 
-/// Map a key event while typing. Up/Down scroll the transcript (so a mouse
-/// wheel, which many terminals translate to arrow keys in the alt screen,
-/// scrolls the chat); input history is on Ctrl-P / Ctrl-N. Pure and testable.
+/// Map a key event while typing (base table). Up/Down scroll the transcript;
+/// [`map_insert_key`] upgrades empty-input Up/Down to history recall.
+/// Ctrl-P / Ctrl-N also browse history. Pure and testable.
 pub fn map_input_key(key: KeyEvent) -> Option<Action> {
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Quit),
@@ -2457,6 +2457,30 @@ pub fn map_input_key(key: KeyEvent) -> Option<Action> {
         (KeyCode::PageDown, _) => Some(Action::PageDown),
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => Some(Action::Append(c)),
         _ => None,
+    }
+}
+
+/// Insert-mode key map with shell-style history recall: when the input is empty,
+/// Up/Down browse submitted lines; otherwise arrows scroll the transcript (so a
+/// mouse wheel mapped to arrow keys still scrolls chat while typing).
+pub fn map_insert_key(view: &View, key: KeyEvent) -> Option<Action> {
+    let action = map_input_key(key)?;
+    match action {
+        Action::ScrollUp => {
+            if view.hist_pos.is_some() || (view.input.is_empty() && !view.history.is_empty()) {
+                Some(Action::HistoryPrev)
+            } else {
+                Some(Action::ScrollUp)
+            }
+        }
+        Action::ScrollDown => {
+            if view.hist_pos.is_some() {
+                Some(Action::HistoryNext)
+            } else {
+                Some(Action::ScrollDown)
+            }
+        }
+        other => Some(other),
     }
 }
 
@@ -3055,13 +3079,48 @@ mod tests {
         assert_eq!(map_input_key(home), Some(Action::CursorHome));
         assert_eq!(map_input_key(end), Some(Action::CursorEnd));
         assert_eq!(map_input_key(ctrl_w), Some(Action::WordDelete));
-        // Arrows scroll the transcript (so a wheel scrolls chat); history is Ctrl-P/N.
+        // Base table: arrows scroll; Ctrl-P/N history.
         assert_eq!(map_input_key(up), Some(Action::ScrollUp));
         assert_eq!(map_input_key(down), Some(Action::ScrollDown));
         assert_eq!(map_input_key(pgup), Some(Action::PageUp));
         assert_eq!(map_input_key(pgdn), Some(Action::PageDown));
         assert_eq!(map_input_key(ctrl_p), Some(Action::HistoryPrev));
         assert_eq!(map_input_key(ctrl_n), Some(Action::HistoryNext));
+    }
+
+    #[test]
+    fn insert_key_up_recalls_history_when_input_empty() {
+        let mut v = View::new();
+        v.push_history("prior prompt".to_string());
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            map_insert_key(&v, up),
+            Some(Action::HistoryPrev),
+            "empty input + history → recall"
+        );
+        v.input = "typing".to_string();
+        assert_eq!(
+            map_insert_key(&v, up),
+            Some(Action::ScrollUp),
+            "non-empty input → scroll chat"
+        );
+    }
+
+    #[test]
+    fn insert_key_down_browses_history_while_navigating() {
+        let mut v = View::new();
+        v.push_history("a".to_string());
+        v.push_history("b".to_string());
+        v.history_prev();
+        assert!(v.hist_pos.is_some());
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(map_insert_key(&v, down), Some(Action::HistoryNext));
+        let empty = View::new();
+        assert_eq!(
+            map_insert_key(&empty, down),
+            Some(Action::ScrollDown),
+            "not browsing history → scroll"
+        );
     }
 
     #[test]

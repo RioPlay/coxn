@@ -22,6 +22,20 @@ Run after each meaningful diff batch, before continuing feature work.
 - [ ] Chat-first copy matches bindings (`?`, `mode: CHAT`, `!cmd`)
 - [ ] Help overlay and README agree on risk disclosure
 - [ ] Live progress does not destroy transcript
+- [ ] Empty input: Up recalls prior prompt; Down returns through history (typing scrolls chat)
+- [ ] Shell ergonomics spot-check: history, submit, scroll — no surprise rebinding
+
+## Telemetry / cross-repo cosmetics
+
+- [ ] User-facing estimates tagged `[est.]` (not presented as measured)
+- [ ] `savings.json` ledger math validated in tests (`baseline - returned`)
+- [ ] aden read tools that coxn uses all record to the savings ledger (grep/understand/locate/asm/ask)
+- [ ] Refresh cadence documented: cosmetic probes only after turns/slash, never per redraw frame
+
+## TUI hot path (perf)
+
+- [ ] No blocking subprocess / `Command::output` in `drive()` loop body (grep `drive.rs` loop)
+- [ ] 60s idle dogfood: zero `aden` spawns while TUI sits at prompt
 
 ## TUI 3.0 (`COXN_TUI3=1`)
 

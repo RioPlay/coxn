@@ -25,7 +25,7 @@ use crate::tools::{build_registry, register_aden_tools};
 use crate::trust::Trust;
 use crate::tui::{
     Action, Menu, MenuItem, MenuKind, ModalKind, ToolApprovalChoice, Tui, View, map_input_key,
-    map_modal_key, map_tool_approval_key, menu_max_rows,
+    map_insert_key, map_modal_key, map_tool_approval_key, menu_max_rows,
 };
 use crate::ui::ChromeState;
 use crate::vim::{Outcome, Scroll};
@@ -2676,7 +2676,7 @@ async fn drive(
         let action = if vim_outcome == Outcome::Submit {
             Some(Action::Submit)
         } else {
-            map_input_key(key)
+            map_insert_key(view, key)
         };
 
         if !vim::enabled() {

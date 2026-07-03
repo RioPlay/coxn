@@ -278,9 +278,9 @@ key). Press `?` with an empty input to open the help overlay; `g?` also works.
 | Ctrl-F / Ctrl-Shift-F | Transcript search (when vim off) |
 | Tab | Command palette / completion |
 | @ | Attach project file (fuzzy picker) |
-| Up/Down | Scroll chat; also navigate pickers |
+| Up/Down | Empty input: recall prior prompts; while typing: scroll chat; in pickers: move selection |
 | PgUp/PgDn | Scroll a page |
-| Ctrl-N | Input history forward (Ctrl-P opens palette) |
+| Ctrl-N | History forward while browsing (`Ctrl-P` opens palette) |
 | Ctrl-W | Delete word |
 | Ctrl-K / Ctrl-U | Cut to end / cut to start |
 | Ctrl-Y | Yank (paste) |
