@@ -81,18 +81,19 @@ fn refresh_discovery(
 /// The startup greeting, shown until the first turn and after `/clear`. A single
 /// `sys:` line so it renders in the transcript's own voice -- no ASCII art.
 fn welcome(aden_active: bool) -> String {
-    let vim = if vim::enabled() {
-        "COXN_VIM=1: Esc→Normal, / search"
-    } else {
-        "chat-first: Enter send, Ctrl-F search, Ctrl-Space palette"
-    };
+    let mut lines = vec!["sys: coxn — gated coding harness".to_string()];
     if aden_active {
-        format!(
-            "sys: coxn ready. ADEN cockpit. Ctrl-Space/Ctrl-P palette. @ files. g? help. {vim}."
-        )
-    } else {
-        format!("sys: coxn ready. Type to chat, /commands, @files, g? help. {vim}.")
+        lines.push("sys: aden on PATH — scope gate + graph tools available".to_string());
     }
+    if vim::enabled() {
+        lines.push("sys: vim modes on (COXN_VIM=1) — Esc Normal, / search, g? help".to_string());
+    } else {
+        lines.push("sys: chat-first — type a task, Enter to send, g? for keys".to_string());
+        lines.push(
+            "sys: Ctrl-Space palette · @ attach files · !run shell · /help commands".to_string(),
+        );
+    }
+    lines.join("\n")
 }
 
 /// Format the conversation into the output pane text. An assistant turn that
@@ -198,11 +199,14 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
             .push_str("\nsys: WARNING — COXN_AUTO_APPROVE=1 bypasses the human approval gate\n");
     }
     // Offline stub: block chat until a model is reachable (not a silent echo toy).
+    if !vim::enabled() {
+        view.show_mode_tip();
+    }
     if sel.is_offline_stub() {
         view.output.push_str(
-            "\n\n⚠ OFFLINE STUB — no model reachable. This is not a coding agent yet.\n\
-             fix: start Ollama/LM Studio, set COXN_MODEL_BASE_URL, or use /auth setup\n\
-             try: /auth setup, /auth status, /model, [r] retry, [q] quit",
+            "\n\nsys: ⚠ offline — no model reachable yet\n\
+             sys: fix: /auth setup · start Ollama/LM Studio · set COXN_MODEL_BASE_URL\n\
+             sys: [r] retry  [q] quit  (slash commands still work)",
         );
         view.set_status("OFFLINE STUB  |  /auth setup  /model  [r] retry  [q] quit".to_string());
     }
@@ -1069,9 +1073,45 @@ fn copy_transcript(view: &View) -> String {
         let _ = std::fs::create_dir_all(parent);
     }
     match std::fs::write(&path, &view.output) {
-        Ok(()) => format!("transcript copied to {}", path.display()),
+        Ok(()) => {
+            let clip = if std::env::var("COXN_CLIPBOARD")
+                .ok()
+                .is_some_and(|v| matches!(v.as_str(), "1" | "on" | "true" | "yes"))
+            {
+                " (drag-select in transcript copies via OSC52)"
+            } else {
+                " (set COXN_CLIPBOARD=on for OSC52 copy on selection)"
+            };
+            format!("transcript copied to {}{clip}", path.display())
+        }
         Err(e) => format!("copy failed: {e}"),
     }
+}
+
+/// Run a `!command` line locally (sandboxed) and format output for the transcript.
+fn run_bang_shell(dir: &Path, bwrap: bool, command: &str) -> String {
+    let outcome = sandbox::run(dir, command, false, bwrap);
+    let mut out = format!("you: !{command}\n");
+    if outcome.timed_out {
+        out.push_str("err: timed out\n");
+    } else if let Some(code) = outcome.exit_code {
+        if code == 0 {
+            out.push_str("ok: exit 0\n");
+        } else {
+            out.push_str(&format!("err: exit {code}\n"));
+        }
+    }
+    if bwrap {
+        out.push_str("cmd: sandboxed\n");
+    } else {
+        out.push_str("cmd: NO SANDBOX\n");
+    }
+    if outcome.output.is_empty() {
+        out.push_str("(no output)");
+    } else {
+        out.push_str(&outcome.output);
+    }
+    out
 }
 
 /// An ex-style command (`:cmd`) parsed from the vim command line.
@@ -1815,6 +1855,19 @@ async fn drive(
             if handled_offline_key {
                 continue;
             }
+        }
+
+        // Chat-first: `?` with empty input opens help (vim uses `g?` in Normal).
+        if !vim::enabled()
+            && view.modal.is_none()
+            && view.menu.is_none()
+            && view.input.is_empty()
+            && key.code == KeyCode::Char('?')
+            && key.modifiers.is_empty()
+        {
+            view.toggle_help();
+            view.show_mode_tip();
+            continue;
         }
 
         // Help overlay: Esc, q, or ? are the close keys and are consumed.
@@ -2604,11 +2657,23 @@ async fn drive(
                 }
                 // Snap the output pane to the bottom on every submit.
                 view.snap_to_bottom();
+                // `!cmd` runs locally (sandboxed) without a model turn.
+                if let Some(cmd) = text.trim().strip_prefix('!').map(str::trim)
+                    && !cmd.is_empty()
+                {
+                    view.output.push('\n');
+                    view.output.push_str(&run_bang_shell(dir, bwrap, cmd));
+                    view.snap_to_bottom();
+                    continue;
+                }
                 // A leading slash is a local command, not a model turn.
                 if text.trim_start().starts_with('/') {
                     match parse_command(text.trim()) {
                         Command::Quit => return Ok(()),
-                        Command::Help => view.toggle_help(),
+                        Command::Help => {
+                            view.toggle_help();
+                            view.show_mode_tip();
+                        }
                         Command::Model(None) => {
                             // Re-discover first: a backend started after boot is
                             // selectable now, no reboot.

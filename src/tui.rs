@@ -1191,6 +1191,19 @@ fn styled_output_with_search(
                 ]);
             }
 
+            // Tool-call cards (TUI 2.0): collapsed `▸ tool path` lines under coxn turns.
+            if raw.starts_with("▸ ") {
+                let body = if live { SHIMMER } else { MAUVE };
+                let body_style = highlight.unwrap_or(Style::default().fg(body));
+                return Line::from(vec![
+                    Span::styled("▹ ", Style::default().fg(ACCENT)),
+                    Span::styled(
+                        raw.strip_prefix("▸ ").unwrap_or(raw).to_string(),
+                        body_style,
+                    ),
+                ]);
+            }
+
             if let Some(prefix) = ROLE_PREFIXES.iter().find(|&&p| raw.starts_with(p)) {
                 owner_body = role_body_color(prefix);
                 let after = &raw[prefix.len()..];
@@ -1481,13 +1494,32 @@ fn build_input_prompt_text(view: &View) -> Text<'static> {
 /// Render one frame: a ruled output pane, a hairline separator, a one-row status
 /// line, and a one-row input prompt, with the confirm modal or picker overlaid
 /// when active. Pure in `view`; testable with `TestBackend`.
-/// One-line mode cheat-sheet copy (M6).
+/// One-line mode cheat-sheet copy (M6). Chat-first when vim is off.
 pub(crate) fn mode_tip_text(mode: Mode) -> &'static str {
+    if !crate::vim::enabled() {
+        return "Enter send. Ctrl-Space palette. @ files. Ctrl-F search. g? help.";
+    }
     match mode {
         Mode::Insert => "type. Enter send. Alt-Enter newline.",
         Mode::Normal => "h/j/k/l. / search. gr grep. g? help.",
         Mode::Visual => "v motion. d/y operate.",
         Mode::Command => ":view :grep :doctor :impact.",
+    }
+}
+
+/// Status-line mode label: CHAT when vim is off, else the vim mode tag.
+pub(crate) fn mode_status_label(mode: Mode) -> String {
+    if crate::vim::enabled() {
+        format!("mode: {} ", mode.tag())
+    } else {
+        "mode: CHAT ".to_string()
+    }
+}
+
+fn modal_title(view: &View) -> &'static str {
+    match view.modal_kind {
+        ModalKind::Gate => " gate ",
+        ModalKind::ToolApproval => " approve ",
     }
 }
 
@@ -1594,11 +1626,11 @@ pub fn render(frame: &mut Frame, view: &View) {
     // Non-Insert modes render in ACCENT (an actionable state the user entered
     // intentionally); Insert renders in DIM so it recedes in steady-state typing.
     {
-        let tag = format!("mode: {} ", view.vim.mode.tag());
-        let color = if view.vim.mode == Mode::Insert {
-            DIM
-        } else {
+        let tag = mode_status_label(view.vim.mode);
+        let color = if crate::vim::enabled() && view.vim.mode != Mode::Insert {
             ACCENT
+        } else {
+            DIM
         };
         status_spans.push(Span::styled(tag, Style::default().fg(color)));
     }
@@ -1803,7 +1835,7 @@ pub fn render(frame: &mut Frame, view: &View) {
             .border_style(Style::default().fg(ACCENT))
             .padding(Padding::horizontal(1))
             .title(Line::from(Span::styled(
-                " confirm ",
+                modal_title(view),
                 Style::default().fg(DIM),
             )));
 
@@ -1961,6 +1993,7 @@ pub fn render(frame: &mut Frame, view: &View) {
             ("Ctrl-Space / Ctrl-P / Tab", Some("palette / commands")),
             ("Ctrl-F / Ctrl-Shift-F", Some("transcript search (vim off)")),
             ("@", Some("attach project file (fuzzy picker)")),
+            ("!cmd", Some("run shell locally (sandboxed), no model turn")),
             ("g? or /help", Some("this help (vim modes need COXN_VIM=1)")),
             ("mouse wheel", Some("scrolls transcript")),
             ("", None),
@@ -3280,6 +3313,7 @@ mod tests {
         // The mode tag must appear in the status line regardless of mode.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        unsafe { std::env::set_var("COXN_VIM", "1") };
         let mut view = View::new();
         view.set_status("my-model");
         // Default is Insert.
@@ -3289,6 +3323,7 @@ mod tests {
             .expect("draw succeeds");
         let text = buffer_text(&terminal);
         assert!(text.contains("INSERT"), "INSERT tag must appear: {text:?}");
+        unsafe { std::env::remove_var("COXN_VIM") };
     }
 
     #[test]
@@ -3310,11 +3345,28 @@ mod tests {
     }
 
     #[test]
+    fn chat_first_mode_label_when_vim_off() {
+        unsafe { std::env::remove_var("COXN_VIM") };
+        assert_eq!(mode_status_label(Mode::Insert), "mode: CHAT ");
+        assert!(mode_tip_text(Mode::Normal).contains("Ctrl-Space"));
+    }
+
+    #[test]
+    fn tool_card_lines_get_accent_gutter() {
+        let text = styled_output_with_search("coxn:\n▸ edit src/foo.rs", false, None);
+        let line = &text.lines[1];
+        assert_eq!(line.spans[0].content, "▹ ");
+        assert!(line.spans[1].content.contains("edit src/foo.rs"));
+    }
+
+    #[test]
     fn m6_mode_tip_text_per_mode() {
+        unsafe { std::env::set_var("COXN_VIM", "1") };
         assert!(mode_tip_text(Mode::Insert).contains("Enter send"));
         assert!(mode_tip_text(Mode::Normal).contains("g? help"));
         assert!(mode_tip_text(Mode::Visual).contains("d/y"));
         assert!(mode_tip_text(Mode::Command).contains(":doctor"));
+        unsafe { std::env::remove_var("COXN_VIM") };
     }
 
     #[test]

@@ -256,9 +256,15 @@ coxn once -p "prompt"    headless turn (COXN_AUTO_APPROVE=1)
 Use `@path/to/file` in messages to inject file contents (up to 3 files), or type `@`
 to open a fuzzy file picker.
 
+Prefix a line with `!` to run a shell command locally (sandboxed) without a model
+turn — output appears in the transcript as `you: !cmd`.
+
 `/model` and `/session` open an arrow-navigable picker (Up/Down, Enter, Esc).
 
 Keys (default chat-first; set `COXN_VIM=1` for full vim modes):
+
+The status line shows `mode: CHAT` and a one-line tip on boot (dismiss with any
+key). Press `?` with an empty input to open the help overlay; `g?` also works.
 
 | Key | Action |
 |---|---|
@@ -276,7 +282,7 @@ Keys (default chat-first; set `COXN_VIM=1` for full vim modes):
 | Ctrl-K / Ctrl-U | Cut to end / cut to start |
 | Ctrl-Y | Yank (paste) |
 | Left/Right Home/End | Move cursor |
-| g? | Help overlay |
+| ? / g? | Help overlay (chat-first: `?` when input is empty) |
 | o/s/d/x | Tool approval modal (once / session / decline / cancel) |
 | y/n | Gate-block proceed / cancel |
 | Ctrl-L/A/I/V/G | ADEN ops on word at cursor (Insert mode) |

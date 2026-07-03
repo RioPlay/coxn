@@ -257,7 +257,7 @@ async fn execute_partition_sequential(
             && prior.status == "success"
         {
             report.push_str(&format!(
-                "  [{}/{}] {} ({}) — skipped complete\n",
+                "  ✓ [{}/{}] {} ({}) — skipped (complete)\n",
                 i + 1,
                 ordered.len(),
                 scope.id,
@@ -312,6 +312,13 @@ async fn execute_partition_sequential(
             .ok()
             .flatten()
             .unwrap_or(budget);
+        report.push_str(&format!(
+            "  ⟳ [{}/{}] {} ({}) — running…\n",
+            i + 1,
+            ordered.len(),
+            scope.id,
+            scope.role
+        ));
         let mut context = AGENT_PREAMBLE_BASE.to_string();
         context.push_str(AGENT_PREAMBLE_ADEN);
         context.push_str(&format!(
@@ -359,7 +366,7 @@ async fn execute_partition_sequential(
                     })
                     .unwrap_or_else(|| format!(", budget {scope_budget}"));
                 report.push_str(&format!(
-                    "  [{}/{}] {} ({}, {}, {}{}) — done\n",
+                    "  ✓ [{}/{}] {} ({}, {}, {}{}) — done\n",
                     i + 1,
                     ordered.len(),
                     scope.id,
@@ -381,7 +388,13 @@ async fn execute_partition_sequential(
                 );
             }
             Err(e) => {
-                report.push_str(&format!("  [{}] {} — error: {e}\n", scope.id, scope.role));
+                report.push_str(&format!(
+                    "  ✗ [{}/{}] {} ({}) — error: {e}\n",
+                    i + 1,
+                    ordered.len(),
+                    scope.id,
+                    scope.role
+                ));
                 run_status = "error";
                 ledger.append(
                     "scope_finished",
@@ -760,7 +773,7 @@ async fn execute_partition_parallel(
                 run_status = "error";
                 reported += 1;
                 report.push_str(&format!(
-                    "  [{reported}/{total}] {} ({}) — blocked by an unmet dependency\n",
+                    "  ✗ [{reported}/{total}] {} ({}) — blocked by an unmet dependency\n",
                     ordered[i].id, ordered[i].role
                 ));
             }
@@ -847,7 +860,7 @@ async fn execute_partition_parallel(
                     })
                     .unwrap_or_else(|| format!(", budget {}", outcome.budget));
                 report.push_str(&format!(
-                    "  [{reported}/{total}] {} ({}, {}, {}){} — done\n",
+                    "  ✓ [{reported}/{total}] {} ({}, {}, {}){} — done\n",
                     scope.id, scope.role, outcome.policy_label, outcome.label, usage
                 ));
                 upstream.push_str(&format!("\n--- {} ---\n{}\n", scope.id, outcome.result));
@@ -865,7 +878,7 @@ async fn execute_partition_parallel(
                 run_status = "error";
                 failed_ids.insert(scope.id.clone());
                 report.push_str(&format!(
-                    "  [{reported}/{total}] {id} ({role}) - {err}\n",
+                    "  ✗ [{reported}/{total}] {id} ({role}) — error: {err}\n",
                     id = scope.id,
                     role = scope.role,
                     err = outcome.error
