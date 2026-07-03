@@ -167,26 +167,40 @@ impl TurnIo for LedgerBatchIo<'_> {
 
 /// Optional sink for live `/execute` progress (full report snapshot per update).
 pub(crate) struct ExecuteProgress<'a> {
-    callback: Option<&'a mut dyn FnMut(&str)>,
+    on_update: Option<&'a mut dyn FnMut(&str)>,
+    should_cancel: Option<&'a mut dyn FnMut() -> bool>,
 }
 
 impl<'a> ExecuteProgress<'a> {
-    pub(crate) fn new(callback: &'a mut dyn FnMut(&str)) -> Self {
+    pub(crate) fn new(
+        on_update: &'a mut dyn FnMut(&str),
+        should_cancel: Option<&'a mut dyn FnMut() -> bool>,
+    ) -> Self {
         Self {
-            callback: Some(callback),
+            on_update: Some(on_update),
+            should_cancel,
         }
     }
 
     fn emit(&mut self, report: &str) {
-        if let Some(cb) = &mut self.callback {
+        if let Some(cb) = &mut self.on_update {
             cb(report);
         }
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.should_cancel.as_mut().is_some_and(|f| f())
     }
 }
 
 fn append_report(report: &mut String, progress: &mut ExecuteProgress<'_>, chunk: &str) {
     report.push_str(chunk);
     progress.emit(report);
+}
+
+fn abort_report(report: &mut String, progress: &mut ExecuteProgress<'_>, msg: &str) -> String {
+    append_report(report, progress, &format!("\n✗ {msg}\n"));
+    std::mem::take(report)
 }
 
 /// Run the aden task partition. With `COXN_EXECUTE_JOBS > 1` (and a fresh,
@@ -280,6 +294,11 @@ async fn execute_partition_sequential(
     progress.emit(&report);
     let mut run_status = "success";
     for (i, scope) in ordered.iter().enumerate() {
+        if progress.cancelled() {
+            append_report(&mut report, &mut progress, "\n  ✗ — cancelled (Ctrl-C)\n");
+            run_status = "cancelled";
+            break;
+        }
         if let Some(prior) = prior_statuses.get(&scope.id)
             && prior.status == "success"
         {
@@ -303,7 +322,13 @@ async fn execute_partition_sequential(
         let (model, sub_sel) = match resolve_role(dir, caps, &scope.role) {
             Some(selection) => match resolve_instance_from_config(&cfg, selection, "route") {
                 Some(resolved) => resolved,
-                None => return format!("provider unavailable for role '{}'", scope.role),
+                None => {
+                    return abort_report(
+                        &mut report,
+                        &mut progress,
+                        &format!("provider unavailable for role '{}'", scope.role),
+                    );
+                }
             },
             None => match &sel.endpoint {
                 Some(e) => openai_model(
@@ -313,7 +338,9 @@ async fn execute_partition_sequential(
                     e.key.clone(),
                     e.source.clone(),
                 ),
-                None => return "no provider for sub-agent".to_string(),
+                None => {
+                    return abort_report(&mut report, &mut progress, "no provider for sub-agent");
+                }
             },
         };
         let policy = ToolPolicy::for_role(&scope.role);
@@ -803,6 +830,11 @@ async fn execute_partition_parallel(
 
     let mut pending: Vec<usize> = (0..ordered.len()).collect();
     while !pending.is_empty() {
+        if progress.cancelled() {
+            append_report(&mut report, &mut progress, "\n  ✗ — cancelled (Ctrl-C)\n");
+            run_status = "cancelled";
+            break;
+        }
         // Ready: deps all complete and this scope never tried-and-failed.
         let ready: Vec<usize> = pending
             .iter()
@@ -999,10 +1031,23 @@ mod tests {
     }
 
     #[test]
+    fn execute_progress_cancel_callback() {
+        let mut snapshots = Vec::new();
+        let mut capture = |r: &str| snapshots.push(r.to_string());
+        let mut cancel = || true;
+        let mut progress = ExecuteProgress::new(&mut capture, Some(&mut cancel));
+        let mut report = "start\n".to_string();
+        progress.emit(&report);
+        assert!(progress.cancelled());
+        append_report(&mut report, &mut progress, "  ✗ — cancelled\n");
+        assert!(snapshots[1].contains("cancelled"));
+    }
+
+    #[test]
     fn append_report_emits_on_every_append() {
         let mut snapshots = Vec::new();
         let mut capture = |r: &str| snapshots.push(r.to_string());
-        let mut progress = ExecuteProgress::new(&mut capture);
+        let mut progress = ExecuteProgress::new(&mut capture, None);
         let mut report = "executing partition 't' (2 scopes)…\n".to_string();
         progress.emit(&report);
         append_report(&mut report, &mut progress, "  ⟳ [1/2] scout — running…\n");

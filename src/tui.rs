@@ -1497,7 +1497,7 @@ fn build_input_prompt_text(view: &View) -> Text<'static> {
 /// One-line mode cheat-sheet copy (M6). Chat-first when vim is off.
 pub(crate) fn mode_tip_text(mode: Mode) -> &'static str {
     if !crate::vim::enabled() {
-        return "Enter send. Ctrl-Space palette. @ files. Ctrl-F search. g? help.";
+        return "Enter send. Ctrl-Space palette. @ files. ? help. Ctrl-F search.";
     }
     match mode {
         Mode::Insert => "type. Enter send. Alt-Enter newline.",
@@ -1993,8 +1993,14 @@ pub fn render(frame: &mut Frame, view: &View) {
             ("Ctrl-Space / Ctrl-P / Tab", Some("palette / commands")),
             ("Ctrl-F / Ctrl-Shift-F", Some("transcript search (vim off)")),
             ("@", Some("attach project file (fuzzy picker)")),
-            ("!cmd", Some("run shell locally (sandboxed), no model turn")),
-            ("? / g? / /help", Some("help overlay (? when input empty in chat mode)")),
+            (
+                "!cmd",
+                Some("run shell locally — y/n gate, sandboxed when bwrap present"),
+            ),
+            (
+                "? / g? / /help",
+                Some("help overlay (? when input empty in chat mode)"),
+            ),
             ("mouse wheel", Some("scrolls transcript")),
             ("", None),
             ("PICKER (open menu)", None),
@@ -2328,6 +2334,21 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate process-global `COXN_VIM`.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_coxn_vim(enabled: bool, f: impl FnOnce()) {
+        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        if enabled {
+            unsafe { std::env::set_var("COXN_VIM", "1") };
+        } else {
+            unsafe { std::env::remove_var("COXN_VIM") };
+        }
+        f();
+        unsafe { std::env::remove_var("COXN_VIM") };
+    }
 
     // -- wrapped_line_count tests -----------------------------------------
 
@@ -3313,17 +3334,16 @@ mod tests {
         // The mode tag must appear in the status line regardless of mode.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        unsafe { std::env::set_var("COXN_VIM", "1") };
-        let mut view = View::new();
-        view.set_status("my-model");
-        // Default is Insert.
-        let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("test backend");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("draw succeeds");
-        let text = buffer_text(&terminal);
-        assert!(text.contains("INSERT"), "INSERT tag must appear: {text:?}");
-        unsafe { std::env::remove_var("COXN_VIM") };
+        with_coxn_vim(true, || {
+            let mut view = View::new();
+            view.set_status("my-model");
+            let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("test backend");
+            terminal
+                .draw(|frame| render(frame, &view))
+                .expect("draw succeeds");
+            let text = buffer_text(&terminal);
+            assert!(text.contains("INSERT"), "INSERT tag must appear: {text:?}");
+        });
     }
 
     #[test]
@@ -3346,9 +3366,10 @@ mod tests {
 
     #[test]
     fn chat_first_mode_label_when_vim_off() {
-        unsafe { std::env::remove_var("COXN_VIM") };
-        assert_eq!(mode_status_label(Mode::Insert), "mode: CHAT ");
-        assert!(mode_tip_text(Mode::Normal).contains("Ctrl-Space"));
+        with_coxn_vim(false, || {
+            assert_eq!(mode_status_label(Mode::Insert), "mode: CHAT ");
+            assert!(mode_tip_text(Mode::Normal).contains("? help"));
+        });
     }
 
     #[test]
@@ -3361,12 +3382,12 @@ mod tests {
 
     #[test]
     fn m6_mode_tip_text_per_mode() {
-        unsafe { std::env::set_var("COXN_VIM", "1") };
-        assert!(mode_tip_text(Mode::Insert).contains("Enter send"));
-        assert!(mode_tip_text(Mode::Normal).contains("g? help"));
-        assert!(mode_tip_text(Mode::Visual).contains("d/y"));
-        assert!(mode_tip_text(Mode::Command).contains(":doctor"));
-        unsafe { std::env::remove_var("COXN_VIM") };
+        with_coxn_vim(true, || {
+            assert!(mode_tip_text(Mode::Insert).contains("Enter send"));
+            assert!(mode_tip_text(Mode::Normal).contains("g? help"));
+            assert!(mode_tip_text(Mode::Visual).contains("d/y"));
+            assert!(mode_tip_text(Mode::Command).contains(":doctor"));
+        });
     }
 
     #[test]

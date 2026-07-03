@@ -32,7 +32,7 @@ pre-apply diff; vim modes opt-in; discovery via palette and `@` files.
 | Ctrl-F / Ctrl-Shift-F | Transcript search (vim off) |
 | @ | Attach project file |
 | ? / g? | Help overlay (? when input empty) |
-| !cmd | Run shell locally (sandboxed), no model turn |
+| !cmd | Run shell locally — y/n gate, streaming, Ctrl-C cancel |
 | o/s/d/x | Tool approval (modal) |
 | y/n | Gate block proceed/cancel |
 

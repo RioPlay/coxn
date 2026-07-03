@@ -240,7 +240,7 @@ status line is honest about which mode is active.
 /copy            save transcript to ~/.local/share/coxn/last-transcript.txt
 /auth status     check configured provider auth
 /auth login <id> print native login or key setup command
-/execute         run aden task partition (live ✓/⟳/✗ progress in transcript)
+/execute         run aden task partition (live progress; transcript preserved)
 ```
 
 CLI:
@@ -256,8 +256,10 @@ coxn once -p "prompt"    headless turn (COXN_AUTO_APPROVE=1)
 Use `@path/to/file` in messages to inject file contents (up to 3 files), or type `@`
 to open a fuzzy file picker.
 
-Prefix a line with `!` to run a shell command locally (sandboxed) without a model
-turn — output appears in the transcript as `you: !cmd`.
+Prefix a line with `!` to run a shell command locally without a model turn. Coxn
+shows a **y/n confirm** first (human gate, same keys as scope blocks). When `bwrap`
+is on PATH the command runs sandboxed; otherwise you see a NO SANDBOX warning.
+Output streams to the transcript; Ctrl-C cancels mid-run.
 
 `/model` and `/session` open an arrow-navigable picker (Up/Down, Enter, Esc).
 

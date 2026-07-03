@@ -35,6 +35,17 @@ use crate::{
 
 const TICK: Duration = Duration::from_millis(100);
 
+/// Non-blocking Ctrl-C / quit check while a long local operation runs.
+fn poll_user_cancel() -> bool {
+    if let Ok(true) = event::poll(Duration::ZERO)
+        && let Ok(Event::Key(key)) = event::read()
+        && key.kind == KeyEventKind::Press
+    {
+        return matches!(map_input_key(key), Some(Action::Quit));
+    }
+    false
+}
+
 /// Lines the transcript scrolls per Up/Down (a wheel notch in most terminals).
 const SCROLL_STEP: u16 = 3;
 
@@ -90,7 +101,7 @@ fn welcome(aden_active: bool) -> String {
     } else {
         lines.push("sys: chat-first — type a task, Enter to send, g? for keys".to_string());
         lines.push(
-            "sys: Ctrl-Space palette · @ attach files · !run shell · /help commands".to_string(),
+            "sys: Ctrl-Space palette · @ attach files · !cmd shell (y/n gate) · /help".to_string(),
         );
     }
     lines.join("\n")
@@ -1088,30 +1099,56 @@ fn copy_transcript(view: &View) -> String {
     }
 }
 
-/// Run a `!command` line locally (sandboxed) and format output for the transcript.
-fn run_bang_shell(dir: &Path, bwrap: bool, command: &str) -> String {
-    let outcome = sandbox::run(dir, command, false, bwrap);
-    let mut out = format!("you: !{command}\n");
-    if outcome.timed_out {
-        out.push_str("err: timed out\n");
+/// Append exit / cancel footer after a streaming `!command` run.
+fn append_bang_footer(view: &mut View, outcome: &sandbox::RunOutcome, cancelled: bool) {
+    if cancelled {
+        view.output.push_str("err: cancelled\n");
+    } else if outcome.timed_out {
+        view.output.push_str("err: timed out\n");
     } else if let Some(code) = outcome.exit_code {
         if code == 0 {
-            out.push_str("ok: exit 0\n");
+            view.output.push_str("ok: exit 0\n");
         } else {
-            out.push_str(&format!("err: exit {code}\n"));
+            view.output.push_str(&format!("err: exit {code}\n"));
         }
     }
+}
+
+/// Run `!command` with streaming output and Ctrl-C cancel (after y/n confirm).
+async fn run_bang_shell_streaming(
+    dir: &Path,
+    bwrap: bool,
+    command: &str,
+    view: &mut View,
+    tui: &mut Tui,
+) {
+    view.output.push('\n');
+    view.output.push_str(&format!("you: !{command}\n"));
     if bwrap {
-        out.push_str("cmd: sandboxed\n");
+        view.output.push_str("cmd: sandboxed\n");
     } else {
-        out.push_str("cmd: NO SANDBOX\n");
+        view.output.push_str("cmd: NO SANDBOX\n");
     }
-    if outcome.output.is_empty() {
-        out.push_str("(no output)");
-    } else {
-        out.push_str(&outcome.output);
-    }
-    out
+    view.snap_to_bottom();
+    let _ = tui.draw(view);
+
+    let mut cancelled = false;
+    let outcome = sandbox::run_streaming(dir, command, false, bwrap, &mut |line| {
+        view.output.push_str(line);
+        view.output.push('\n');
+        view.snap_to_bottom();
+        let _ = tui.draw(view);
+        if poll_user_cancel() {
+            cancelled = true;
+            return false;
+        }
+        true
+    })
+    .await;
+
+    append_bang_footer(view, &outcome, cancelled);
+    view.snap_to_bottom();
+    let _ = tui.draw(view);
 }
 
 /// An ex-style command (`:cmd`) parsed from the vim command line.
@@ -2657,13 +2694,23 @@ async fn drive(
                 }
                 // Snap the output pane to the bottom on every submit.
                 view.snap_to_bottom();
-                // `!cmd` runs locally (sandboxed) without a model turn.
+                // `!cmd` runs locally after y/n confirm (no model turn).
                 if let Some(cmd) = text.trim().strip_prefix('!').map(str::trim)
                     && !cmd.is_empty()
                 {
-                    view.output.push('\n');
-                    view.output.push_str(&run_bang_shell(dir, bwrap, cmd));
-                    view.snap_to_bottom();
+                    let isolation = if bwrap {
+                        "Isolation: bwrap sandbox (project root, no network)"
+                    } else {
+                        "WARNING: NO SANDBOX — host shell with cleared env"
+                    };
+                    view.confirm(format!(
+                        "Run shell locally (human gate, not model)?\n!{cmd}\n{isolation}"
+                    ));
+                    if !confirm_gate_blocking(tui, view) {
+                        continue;
+                    }
+                    view.push_history(text.clone());
+                    run_bang_shell_streaming(dir, bwrap, cmd, view, tui).await;
                     continue;
                 }
                 // A leading slash is a local command, not a model turn.
@@ -2870,13 +2917,20 @@ async fn drive(
                                     "executing partition…".to_string()
                                 });
                                 let _ = tui.draw(view);
-                                let format_execute_report =
-                                    |report: &str| format!("sys: /execute\n{report}");
+                                let prior_output = view.output.clone();
+                                let format_execute_report = |report: &str| {
+                                    if prior_output.is_empty() {
+                                        format!("sys: /execute\n{report}")
+                                    } else {
+                                        format!("{prior_output}\n\nsys: /execute\n{report}")
+                                    }
+                                };
                                 let mut on_execute_progress = |report: &str| {
                                     view.output = format_execute_report(report);
                                     view.snap_to_bottom();
                                     let _ = tui.draw(view);
                                 };
+                                let mut poll_cancel = || poll_user_cancel();
                                 view.output = format_execute_report(
                                     &execute::execute_partition(
                                         dir,
@@ -2884,7 +2938,10 @@ async fn drive(
                                         sel,
                                         bwrap,
                                         resume,
-                                        execute::ExecuteProgress::new(&mut on_execute_progress),
+                                        execute::ExecuteProgress::new(
+                                            &mut on_execute_progress,
+                                            Some(&mut poll_cancel),
+                                        ),
                                     )
                                     .await,
                                 );
