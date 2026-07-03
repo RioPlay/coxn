@@ -5,10 +5,12 @@
 use std::io::{self, Write};
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 
+use crate::layout;
 use crate::tui::{
-    Action, Menu, MenuKind, PANE_GUTTER, View, centered_rect, menu_max_rows, wrapped_line_count,
+    Action, Menu, MenuKind, PANE_GUTTER, View, centered_rect, menu_max_rows, modal_hint_plain,
+    wrapped_line_count,
 };
 
 /// Result of routing a mouse event through the view.
@@ -48,19 +50,9 @@ pub struct ModalHit {
     pub hint_row: u16,
 }
 
-const MAX_INPUT_ROWS: u16 = 8;
-
 /// Split the frame the same way `render` does.
 pub fn frame_layout(frame: Rect, view: &View) -> FrameLayout {
-    let input_rows = (view.input_line_count() as u16).clamp(1, MAX_INPUT_ROWS);
-    let areas = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(input_rows),
-    ])
-    .split(frame);
-
+    let areas = layout::frame_areas(frame, view);
     FrameLayout {
         pane: areas[0],
         input: areas[3],
@@ -103,11 +95,7 @@ fn menu_hit(frame: Rect, menu: &Menu) -> MenuHit {
 
 fn modal_hit(frame: Rect, view: &View) -> Option<ModalHit> {
     let prompt = view.modal.as_ref()?;
-    let hint = if view.modal_diff.is_some() {
-        "[y] proceed   [n] block   [e] expand   [c] collapse"
-    } else {
-        "[y] proceed   [n] block"
-    };
+    let hint = modal_hint_plain(view);
     const DIFF_PREVIEW_ROWS: usize = 12;
     let diff_len = view
         .modal_diff

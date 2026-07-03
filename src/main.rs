@@ -15,6 +15,7 @@ mod doctor;
 mod drive;
 mod execute;
 mod gate;
+mod layout;
 mod model;
 mod mouse;
 mod ollama;
@@ -53,6 +54,7 @@ ENVIRONMENT:
     COXN_KEY_<INSTANCE>  API key for a named provider instance
     COXN_BARE=1          Empty system prompt (zero-default-context purists)
     COXN_AUTO_APPROVE=1  Required for `coxn once` (auto-approves tool calls)
+    COXN_VIM=1           Opt into vim-style Normal/Visual/Command modes (default: insert-only)
     COXN_TASK_NAME       Task scope (aden blast-radius gate)
     COXN_TASK_SEEDS      Comma-separated seed symbols
     COXN_ADEN_BIN        Path to aden binary

@@ -16,6 +16,14 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Whether vim-style modal editing is enabled (`COXN_VIM=1`). Default off for
+/// chat-first insert-only UX; set the env var to opt into Normal/Visual/Command.
+pub fn enabled() -> bool {
+    std::env::var("COXN_VIM")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+}
+
 /// The editing mode. `Insert` is the default so unmodified typing just works.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {

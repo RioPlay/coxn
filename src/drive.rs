@@ -17,13 +17,15 @@ use crate::app::{
 };
 use crate::codex_model::{self, CODEX_ENDPOINT_SCHEME};
 use crate::commands::{Command, complete_input, parse_command};
+use crate::layout;
 use crate::model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
 use crate::mouse::{MouseEffect, frame_layout, handle_mouse, osc52_copy};
 use crate::pump::{Approval, BatchIo, Pump, TurnIo};
 use crate::tools::{build_registry, register_aden_tools};
 use crate::trust::Trust;
 use crate::tui::{
-    Action, Menu, MenuItem, MenuKind, Tui, View, map_input_key, map_modal_key, menu_max_rows,
+    Action, Menu, MenuItem, MenuKind, ModalKind, ToolApprovalChoice, Tui, View, map_input_key,
+    map_modal_key, map_tool_approval_key, menu_max_rows,
 };
 use crate::vim::{Outcome, Scroll};
 use crate::{
@@ -1011,9 +1013,9 @@ fn retry_wait(tui: &mut Tui, view: &mut View, attempt: u32, secs: u64) -> io::Re
 /// The output pane's (width, height), for wrapping and PageUp/PageDown scroll
 /// amounts. Height excludes the separator, status, and input rows. Falls back to
 /// (80, 1) if the terminal size cannot be determined.
-fn pane_dims(tui: &Tui) -> (u16, u16) {
+fn pane_dims(tui: &Tui, view: &View) -> (u16, u16) {
     tui.size()
-        .map(|s| (s.width.max(1), s.height.saturating_sub(3).max(1)))
+        .map(|s| layout::pane_dims((s.width, s.height), view))
         .unwrap_or((80, 1))
 }
 
@@ -1063,6 +1065,7 @@ fn command_key(call: &ToolCall) -> Option<String> {
 /// Ctrl-C cancel check between fragments) and prompt for approval before a
 /// mutating tool runs. Owns the terminal borrows so the pump needs one handle.
 struct DriveIo<'a> {
+    dir: &'a Path,
     tui: &'a mut Tui,
     view: &'a mut View,
     prior: &'a str,
@@ -1142,38 +1145,52 @@ impl TurnIo for DriveIo<'_> {
         }
         let summary = approval_summary(call, self.bwrap);
         let session_label = if command_key(call).is_some() {
-            "[s]ession (this exact command)".to_string()
+            "session = this exact command".to_string()
         } else {
-            format!("[s]ession (all {} calls)", call.name)
+            format!("session = all {} calls", call.name)
         };
+        let diff = tools::approval_preview_diff(self.dir, call, self.bwrap).unwrap_or_default();
+        self.view
+            .confirm_tool_approval(format!("Approve {summary}?\n({session_label})"), diff);
         loop {
-            self.view.set_status(format!(
-                "approve {summary}?  [o]nce  {session_label}  [d]ecline  [x] cancel turn",
-            ));
             let _ = self.tui.draw(self.view);
             if event::poll(TICK).unwrap_or(false)
                 && let Ok(Event::Key(key)) = event::read()
                 && key.kind == KeyEventKind::Press
             {
-                // Ctrl-C cancels the turn here too, not just x/Esc.
                 if matches!(map_input_key(key), Some(Action::Quit)) {
+                    self.view.dismiss();
                     self.cancel_turn = true;
                     return Approval::CancelTurn;
                 }
-                match key.code {
-                    KeyCode::Char('o' | 'O') => return Approval::Allow,
-                    KeyCode::Char('s' | 'S') => {
+                match map_tool_approval_key(key) {
+                    Some(ToolApprovalChoice::Once) => {
+                        self.view.dismiss();
+                        return Approval::Allow;
+                    }
+                    Some(ToolApprovalChoice::Session) => {
                         if let Some(cmd) = command_key(call) {
                             self.approved_commands.insert(cmd);
                         } else {
                             self.approvals.insert(call.name.clone());
                         }
+                        self.view.dismiss();
                         return Approval::Allow;
                     }
-                    KeyCode::Char('d' | 'D') => return Approval::Decline,
-                    KeyCode::Char('x' | 'X') | KeyCode::Esc => {
+                    Some(ToolApprovalChoice::Decline) => {
+                        self.view.dismiss();
+                        return Approval::Decline;
+                    }
+                    Some(ToolApprovalChoice::CancelTurn) => {
+                        self.view.dismiss();
                         self.cancel_turn = true;
                         return Approval::CancelTurn;
+                    }
+                    Some(ToolApprovalChoice::Expand) if self.view.modal_diff.is_some() => {
+                        self.view.modal_diff_expanded = true;
+                    }
+                    Some(ToolApprovalChoice::Collapse) if self.view.modal_diff.is_some() => {
+                        self.view.modal_diff_expanded = false;
                     }
                     _ => {}
                 }
@@ -1456,7 +1473,7 @@ async fn drive(
         // Keep the picker viewport pinned to the selection even on a resize
         // (handlers also re-pin on each key; this covers the no-key frame).
         if view.menu.is_some() {
-            let (_, term_h) = pane_dims(tui);
+            let (_, term_h) = pane_dims(tui, view);
             let count = view.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
             view.menu_refit(menu_max_rows(term_h, count));
         }
@@ -1472,7 +1489,7 @@ async fn drive(
         // drag-select + OSC52 copy (gated on COXN_CLIPBOARD).
         if let Event::Mouse(me) = ev {
             if !view.show_help {
-                let (w, h) = pane_dims(tui);
+                let (w, h) = pane_dims(tui, view);
                 let max_scroll = view.max_scroll(w, h);
                 let frame = tui
                     .size()
@@ -1602,10 +1619,10 @@ async fn drive(
             }
         }
 
-        // M4: fuzzy palette — Ctrl-Space in any mode except the approval modal.
+        // M4: fuzzy palette — Ctrl-Space or Ctrl-P in any mode except modals.
         if view.modal.is_none()
-            && key.code == KeyCode::Char(' ')
             && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('p'))
         {
             if view
                 .menu
@@ -1619,26 +1636,37 @@ async fn drive(
 
         // A modal grabs input until answered.
         if view.modal.is_some() {
-            match map_modal_key(key) {
-                // Answers + dismiss:
-                Some(Action::Confirm) | Some(Action::Cancel) => view.dismiss(),
-                // Diff body expand/collapse (M3); only meaningful when a diff
-                // is attached; no-op otherwise. Toggle stays on the fence so
-                // repeated presses toggle, idiomatic with e/c keys.
-                Some(Action::ModalExpand) if view.modal_diff.is_some() => {
-                    view.modal_diff_expanded = true;
-                }
-                Some(Action::ModalCollapse) if view.modal_diff.is_some() => {
-                    view.modal_diff_expanded = false;
-                }
-                _ => {}
+            match view.modal_kind {
+                ModalKind::Gate => match map_modal_key(key) {
+                    Some(Action::Confirm) | Some(Action::Cancel) => view.dismiss(),
+                    Some(Action::ModalExpand) if view.modal_diff.is_some() => {
+                        view.modal_diff_expanded = true;
+                    }
+                    Some(Action::ModalCollapse) if view.modal_diff.is_some() => {
+                        view.modal_diff_expanded = false;
+                    }
+                    _ => {}
+                },
+                ModalKind::ToolApproval => match map_tool_approval_key(key) {
+                    Some(ToolApprovalChoice::Once)
+                    | Some(ToolApprovalChoice::Session)
+                    | Some(ToolApprovalChoice::Decline)
+                    | Some(ToolApprovalChoice::CancelTurn) => view.dismiss(),
+                    Some(ToolApprovalChoice::Expand) if view.modal_diff.is_some() => {
+                        view.modal_diff_expanded = true;
+                    }
+                    Some(ToolApprovalChoice::Collapse) if view.modal_diff.is_some() => {
+                        view.modal_diff_expanded = false;
+                    }
+                    _ => {}
+                },
             }
             continue;
         }
 
         // A picker grabs input until selected or cancelled.
         if view.menu.is_some() {
-            let (_, term_h) = pane_dims(tui);
+            let (_, term_h) = pane_dims(tui, view);
             let count = view.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
             let rows = menu_max_rows(term_h, count);
             let palette = view
@@ -1704,7 +1732,7 @@ async fn drive(
         // bindings and plain typing are completely unaffected. Only Esc
         // (mode change), Normal-mode motions/operators, and scroll bindings
         // are ever consumed before the map_input_key path sees them.
-        let vim_outcome = if newline_enter {
+        let vim_outcome = if newline_enter || !vim::enabled() {
             Outcome::Pass
         } else {
             view.vim.handle(&mut view.input, &mut view.cursor, key)
@@ -1713,7 +1741,7 @@ async fn drive(
         // Resolve a vim-level Scroll before potentially falling through to the
         // map_input_key path so the arms below stay symmetric.
         if let Outcome::Scroll(dir) = vim_outcome {
-            let (w, h) = pane_dims(tui);
+            let (w, h) = pane_dims(tui, view);
             match dir {
                 // j/k are single-line motions; only PageUp/Down use SCROLL_STEP.
                 Scroll::LineUp => view.scroll_up(1, view.max_scroll(w, h)),
@@ -1728,7 +1756,7 @@ async fn drive(
         // A counted scroll (e.g. `3j`): the host applies the step `n` times so
         // `3j` scrolls exactly 3 lines (not 3 * SCROLL_STEP).
         if let Outcome::ScrollN(dir, n) = vim_outcome {
-            let (w, h) = pane_dims(tui);
+            let (w, h) = pane_dims(tui, view);
             for _ in 0..n {
                 match dir {
                     Scroll::LineUp => view.scroll_up(1, view.max_scroll(w, h)),
@@ -2225,16 +2253,16 @@ async fn drive(
             Some(Action::HistoryPrev) => view.history_prev(),
             Some(Action::HistoryNext) => view.history_next(),
             Some(Action::ScrollUp) => {
-                let (w, h) = pane_dims(tui);
+                let (w, h) = pane_dims(tui, view);
                 view.scroll_up(SCROLL_STEP, view.max_scroll(w, h));
             }
             Some(Action::ScrollDown) => view.scroll_down(SCROLL_STEP),
             Some(Action::PageUp) => {
-                let (w, h) = pane_dims(tui);
+                let (w, h) = pane_dims(tui, view);
                 view.scroll_up(h, view.max_scroll(w, h));
             }
             Some(Action::PageDown) => {
-                let (_, h) = pane_dims(tui);
+                let (_, h) = pane_dims(tui, view);
                 view.scroll_down(h);
             }
             // ADEN actions via Ctrl shortcuts (available in Insert mode too).
@@ -2578,6 +2606,7 @@ async fn drive(
                 let mut cancelled;
                 loop {
                     let mut io = DriveIo {
+                        dir,
                         tui,
                         view,
                         prior: &prior,

@@ -162,6 +162,27 @@ impl Menu {
     }
 }
 
+/// Which confirmation modal is active. Gates use y/n; tool approval uses o/s/d/x.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModalKind {
+    /// Gate-block proceed/block (y/n).
+    #[default]
+    Gate,
+    /// Per-tool approval before apply (o/s/d/x).
+    ToolApproval,
+}
+
+/// User choice while a tool-approval modal is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolApprovalChoice {
+    Once,
+    Session,
+    Decline,
+    CancelTurn,
+    Expand,
+    Collapse,
+}
+
 /// The view state coxn renders: the streaming output buffer and the status
 /// line. Pure data; [`render`] is a function of it.
 #[derive(Debug, Default)]
@@ -178,6 +199,8 @@ pub struct View {
     /// and the modal key mapping applies. The pump sets this (e.g. on a blocked
     /// gate) and clears it once the user answers.
     pub modal: Option<String>,
+    /// Which key mapping applies while `modal` is set.
+    pub modal_kind: ModalKind,
     /// A diff body shown inside the modal, alongside `modal`. Painted line-by-
     /// line through [`paint_diff_line`] (green `+`, red `-`, cyan `@@`,
     /// context unstyled). Used by the gate-block confirmation (M3) so the
@@ -321,9 +344,10 @@ impl View {
         self.status = status.into();
     }
 
-    /// Raise a confirmation modal with `prompt`. Block on the user's answer
+    /// Raise a gate confirmation modal with `prompt`. Block on the user's answer
     /// (proceed / block) is the pump's job; this only sets the view state.
     pub fn confirm(&mut self, prompt: impl Into<String>) {
+        self.modal_kind = ModalKind::Gate;
         self.modal = Some(prompt.into());
     }
 
@@ -332,6 +356,18 @@ impl View {
     /// gate-block confirmation so the user sees the rejected diff before
     /// answering. Empty `diff` degrades to plain confirm-render.
     pub fn confirm_with_diff(&mut self, prompt: impl Into<String>, diff: impl Into<String>) {
+        self.set_modal_diff(diff);
+        self.confirm(prompt);
+    }
+
+    /// Raise a tool-approval modal with optional diff preview before apply.
+    pub fn confirm_tool_approval(&mut self, prompt: impl Into<String>, diff: impl Into<String>) {
+        self.modal_kind = ModalKind::ToolApproval;
+        self.set_modal_diff(diff);
+        self.modal = Some(prompt.into());
+    }
+
+    fn set_modal_diff(&mut self, diff: impl Into<String>) {
         let diff_text = diff.into();
         if diff_text.is_empty() {
             self.modal_diff = None;
@@ -340,12 +376,12 @@ impl View {
             self.modal_diff = Some(diff_text);
             self.modal_diff_expanded = false;
         }
-        self.confirm(prompt);
     }
 
     /// Dismiss the modal and any diff body alongside it.
     pub fn dismiss(&mut self) {
         self.modal = None;
+        self.modal_kind = ModalKind::Gate;
         self.modal_diff = None;
         self.modal_diff_expanded = false;
     }
@@ -1176,6 +1212,47 @@ fn styled_output_with_search(
     Text::from(lines)
 }
 
+pub(crate) fn modal_hint_plain(view: &View) -> &'static str {
+    match view.modal_kind {
+        ModalKind::Gate if view.modal_diff.is_some() => {
+            "[y] proceed   [n] block   [e] expand   [c] collapse"
+        }
+        ModalKind::Gate => "[y] proceed   [n] block",
+        ModalKind::ToolApproval if view.modal_diff.is_some() => {
+            "[o] once   [s] session   [d] decline   [x] cancel   [e] expand   [c] collapse"
+        }
+        ModalKind::ToolApproval => "[o] once   [s] session   [d] decline   [x] cancel",
+    }
+}
+
+fn modal_hint_spans(view: &View) -> Vec<Span<'static>> {
+    let accent = Style::default().fg(ACCENT);
+    let dim = Style::default().fg(DIM);
+    let mut spans = Vec::new();
+    let push_key = |spans: &mut Vec<Span<'static>>, key: &str, label: &str| {
+        spans.push(Span::styled(format!("[{key}]"), accent));
+        spans.push(Span::styled(label.to_string(), dim));
+    };
+    match view.modal_kind {
+        ModalKind::Gate => {
+            push_key(&mut spans, "y", " proceed   ");
+            push_key(&mut spans, "n", " block");
+        }
+        ModalKind::ToolApproval => {
+            push_key(&mut spans, "o", " once   ");
+            push_key(&mut spans, "s", " session   ");
+            push_key(&mut spans, "d", " decline   ");
+            push_key(&mut spans, "x", " cancel");
+        }
+    }
+    if view.modal_diff.is_some() {
+        spans.push(Span::styled("   ", dim));
+        push_key(&mut spans, "e", " expand   ");
+        push_key(&mut spans, "c", " collapse");
+    }
+    spans
+}
+
 // -- Diff hunk painting (M3) ----------------------------------------------
 
 /// Style a single unified-diff line. Returns a styled span over the same
@@ -1412,10 +1489,7 @@ pub fn render(frame: &mut Frame, view: &View) {
     // Input box rows grow with `\n` (M1 multi-line). Computed before the
     // layout split so the input slot is `Length(input_rows)` not `Length(1)`,
     // capped at MAX_INPUT_ROWS so a runaway paste cannot eat the pane.
-    /// Visible row cap for the input box before growth stops (past this the
-    /// box scrolls via `Paragraph`, never eating the transcript).
-    const MAX_INPUT_ROWS: u16 = 8;
-    let input_rows = (view.input_line_count() as u16).clamp(1, MAX_INPUT_ROWS);
+    let input_rows = (view.input_line_count() as u16).clamp(1, crate::layout::MAX_INPUT_ROWS);
 
     let areas = Layout::vertical([
         Constraint::Min(1),
@@ -1676,11 +1750,7 @@ pub fn render(frame: &mut Frame, view: &View) {
         // longer changes (a `write_file` over a big file) start collapsed.
         const DIFF_PREVIEW_ROWS: usize = 12;
 
-        let hint = if view.modal_diff.is_some() {
-            "[y] proceed   [n] block   [e] expand   [c] collapse"
-        } else {
-            "[y] proceed   [n] block"
-        };
+        let hint = modal_hint_plain(view);
 
         // Build the diff body lines if any, painting each line via
         // [`paint_diff_line`]. Long hunks collapse past DIFF_PREVIEW_ROWS.
@@ -1741,20 +1811,7 @@ pub fn render(frame: &mut Frame, view: &View) {
             body_lines.extend(diff_lines);
         }
         body_lines.push(Line::from(""));
-        let mut hint_spans = vec![
-            Span::styled("[y]", Style::default().fg(ACCENT)),
-            Span::styled(" proceed   ", Style::default().fg(DIM)),
-            Span::styled("[n]", Style::default().fg(ACCENT)),
-            Span::styled(" block", Style::default().fg(DIM)),
-        ];
-        if view.modal_diff.is_some() {
-            hint_spans.push(Span::styled("   ", Style::default().fg(DIM)));
-            hint_spans.push(Span::styled("[e]", Style::default().fg(ACCENT)));
-            hint_spans.push(Span::styled(" expand   ", Style::default().fg(DIM)));
-            hint_spans.push(Span::styled("[c]", Style::default().fg(ACCENT)));
-            hint_spans.push(Span::styled(" collapse", Style::default().fg(DIM)));
-        }
-        body_lines.push(Line::from(hint_spans));
+        body_lines.push(Line::from(modal_hint_spans(view)));
         let body = Text::from(body_lines.clone());
         let body_height = body_lines.len() as u16;
         let _ = body_height; // see immediately below for area sizing.
@@ -2142,6 +2199,19 @@ pub fn map_modal_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::Cancel),
         KeyCode::Char('e') | KeyCode::Char('E') => Some(Action::ModalExpand),
         KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::ModalCollapse),
+        _ => None,
+    }
+}
+
+/// Map a key event while a tool-approval modal is up.
+pub fn map_tool_approval_key(key: KeyEvent) -> Option<ToolApprovalChoice> {
+    match key.code {
+        KeyCode::Char('o' | 'O') => Some(ToolApprovalChoice::Once),
+        KeyCode::Char('s' | 'S') => Some(ToolApprovalChoice::Session),
+        KeyCode::Char('d' | 'D') => Some(ToolApprovalChoice::Decline),
+        KeyCode::Char('x' | 'X') | KeyCode::Esc => Some(ToolApprovalChoice::CancelTurn),
+        KeyCode::Char('e' | 'E') => Some(ToolApprovalChoice::Expand),
+        KeyCode::Char('c' | 'C') => Some(ToolApprovalChoice::Collapse),
         _ => None,
     }
 }
@@ -2789,6 +2859,38 @@ mod tests {
         assert!(text.contains("0s"), "activity indicator elapsed: {text:?}");
         // "Ctrl-C cancel" hint must also appear.
         assert!(text.contains("Ctrl-C"), "cancel hint: {text:?}");
+    }
+
+    #[test]
+    fn tool_approval_modal_renders_osdx_hints() {
+        let mut view = View::new();
+        view.confirm_tool_approval("Approve edit src/foo.rs?", "@@\n-old\n+new\n");
+        assert_eq!(view.modal_kind, ModalKind::ToolApproval);
+        let mut terminal = Terminal::new(TestBackend::new(70, 14)).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("draw succeeds");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("[o]"), "once hint: {text:?}");
+        assert!(text.contains("[s]"), "session hint: {text:?}");
+        assert!(text.contains("[d]"), "decline hint: {text:?}");
+        assert!(text.contains("[x]"), "cancel hint: {text:?}");
+        assert!(!text.contains("[y] proceed"), "gate hint absent: {text:?}");
+    }
+
+    #[test]
+    fn tool_approval_keys_map_to_choices() {
+        let o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+        let s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        let d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(map_tool_approval_key(o), Some(ToolApprovalChoice::Once));
+        assert_eq!(map_tool_approval_key(s), Some(ToolApprovalChoice::Session));
+        assert_eq!(map_tool_approval_key(d), Some(ToolApprovalChoice::Decline));
+        assert_eq!(
+            map_tool_approval_key(x),
+            Some(ToolApprovalChoice::CancelTurn)
+        );
     }
 
     #[test]

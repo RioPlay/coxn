@@ -13,6 +13,132 @@ use std::path::{Path, PathBuf};
 
 use crate::model::{ToolCall, ToolDef};
 
+/// Preview text for the tool-approval modal: a unified diff for file tools, or a
+/// short summary for `run_command`. Returns `None` when arguments are malformed.
+pub fn approval_preview_diff(dir: &Path, call: &ToolCall, bwrap: bool) -> Option<String> {
+    match call.name.as_str() {
+        "edit" => preview_edit_diff(dir, &call.arguments),
+        "write_file" => preview_write_diff(dir, &call.arguments),
+        "run_command" => Some(preview_run_command(&call.arguments, bwrap)),
+        _ => None,
+    }
+}
+
+fn preview_edit_diff(dir: &Path, arguments: &str) -> Option<String> {
+    let path = arg(arguments, "path");
+    let old = arg(arguments, "old_string");
+    let new = arg(arguments, "new_string");
+    if path.is_empty() || old.is_empty() {
+        return None;
+    }
+    let full = project_path(dir, &path).ok()?;
+    let text = std::fs::read_to_string(&full).ok()?;
+    if text.matches(&old).count() != 1 {
+        return None;
+    }
+    let pos = text.find(&old)?;
+    let before = &text[..pos];
+    let after = &text[pos + old.len()..];
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    for line in context_lines(before, 3) {
+        out.push_str(&format!(" {line}\n"));
+    }
+    for line in old.lines() {
+        out.push_str(&format!("-{line}\n"));
+    }
+    for line in new.lines() {
+        out.push_str(&format!("+{line}\n"));
+    }
+    for line in context_lines(after, 3) {
+        out.push_str(&format!(" {line}\n"));
+    }
+    Some(out)
+}
+
+fn preview_write_diff(dir: &Path, arguments: &str) -> Option<String> {
+    let path = arg(arguments, "path");
+    let content = arg(arguments, "content");
+    if path.is_empty() {
+        return None;
+    }
+    let full = project_path(dir, &path).ok()?;
+    let old = std::fs::read_to_string(&full).unwrap_or_default();
+    Some(unified_line_diff(&path, &old, &content))
+}
+
+fn preview_run_command(arguments: &str, bwrap: bool) -> String {
+    let command = arg(arguments, "command");
+    let network = arg_bool(arguments, "network");
+    let box_tag = if bwrap { "sandbox" } else { "NO SANDBOX" };
+    let net_tag = if network {
+        "network: on"
+    } else {
+        "network: off"
+    };
+    format!("$ {command}\n[{box_tag}, {net_tag}]")
+}
+
+fn context_lines(text: &str, max: usize) -> Vec<&str> {
+    text.lines()
+        .rev()
+        .take(max)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn unified_line_diff(path: &str, old: &str, new: &str) -> String {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    let ops = line_diff_ops(&old_lines, &new_lines);
+    for op in ops {
+        match op {
+            DiffOp::Ctx(line) => out.push_str(&format!(" {line}\n")),
+            DiffOp::Del(line) => out.push_str(&format!("-{line}\n")),
+            DiffOp::Add(line) => out.push_str(&format!("+{line}\n")),
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffOp<'a> {
+    Ctx(&'a str),
+    Del(&'a str),
+    Add(&'a str),
+}
+
+/// Greedy line diff for approval previews (not a full Myers implementation).
+fn line_diff_ops<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<DiffOp<'a>> {
+    let mut out = Vec::new();
+    let mut oi = 0usize;
+    let mut ni = 0usize;
+    while oi < old.len() || ni < new.len() {
+        if oi < old.len() && ni < new.len() && old[oi] == new[ni] {
+            out.push(DiffOp::Ctx(old[oi]));
+            oi += 1;
+            ni += 1;
+            continue;
+        }
+        let old_del = oi < old.len();
+        let new_add = ni < new.len();
+        let next_match_old =
+            old_del && new_add && new[ni..].iter().position(|line| *line == old[oi]).is_some();
+        let next_match_new =
+            new_add && old_del && old[oi..].iter().position(|line| *line == new[ni]).is_some();
+        if new_add && (!old_del || next_match_old && !next_match_new) {
+            out.push(DiffOp::Add(new[ni]));
+            ni += 1;
+        } else if old_del {
+            out.push(DiffOp::Del(old[oi]));
+            oi += 1;
+        }
+    }
+    out
+}
+
 /// Read a string argument from a tool-call payload. If `arguments` is a JSON
 /// object (what a function-calling provider sends), return its `key` field;
 /// otherwise treat the whole trimmed string as the value (bare-string args from
@@ -1174,6 +1300,31 @@ mod tests {
         assert!(write.run(bad_write).unwrap_err().contains("relative"));
         assert!(!std::path::Path::new("/tmp/coxn-escape-probe").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn approval_preview_diff_shows_edit_hunk() {
+        let dir = temp_dir("preview-edit");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+        let call = call(
+            "edit",
+            r#"{"path":"a.txt","old_string":"beta","new_string":"BETA"}"#,
+        );
+        let diff = approval_preview_diff(&dir, &call, true).expect("diff");
+        assert!(diff.contains("-beta"), "{diff}");
+        assert!(diff.contains("+BETA"), "{diff}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn approval_preview_diff_summarizes_run_command() {
+        let call = call("run_command", r#"{"command":"cargo test","network":true}"#);
+        let preview =
+            approval_preview_diff(std::env::temp_dir().as_path(), &call, false).expect("preview");
+        assert!(preview.contains("cargo test"), "{preview}");
+        assert!(preview.contains("NO SANDBOX"), "{preview}");
+        assert!(preview.contains("network: on"), "{preview}");
     }
 
     #[test]
