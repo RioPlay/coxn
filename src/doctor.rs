@@ -7,6 +7,7 @@ use crate::codex_probe;
 use crate::openai;
 use crate::provider;
 use crate::sandbox;
+use crate::trust;
 
 /// Run all checks, print a human-readable report to stdout, return exit code
 /// (0 = ready to code, 1 = blocking issue, 2 = warnings only).
@@ -115,6 +116,12 @@ pub fn run(dir: &Path) -> i32 {
                 }
             }
         }
+    }
+
+    if trust::auto_approve_enabled() {
+        warnings = true;
+        println!("⚠ auto-approve: COXN_AUTO_APPROVE=1 — human gate disabled");
+        println!("  note: intended for `coxn once` headless runs only");
     }
 
     // --- Sandbox ---

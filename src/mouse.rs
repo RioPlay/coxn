@@ -9,8 +9,8 @@ use ratatui::layout::Rect;
 
 use crate::layout;
 use crate::tui::{
-    Action, Menu, MenuKind, PANE_GUTTER, View, centered_rect, menu_max_rows, modal_hint_plain,
-    wrapped_line_count,
+    Action, Menu, MenuKind, ModalKind, PANE_GUTTER, ToolApprovalChoice, View, centered_rect,
+    menu_max_rows, modal_hint_plain, wrapped_line_count,
 };
 
 /// Result of routing a mouse event through the view.
@@ -22,6 +22,7 @@ pub enum MouseEffect {
     SetCursor(usize),
     MenuRow(usize),
     Modal(Action),
+    ToolApproval(ToolApprovalChoice),
     /// Selection finalized; caller should emit OSC52 after the next frame flush.
     CopySelection(String),
 }
@@ -69,7 +70,7 @@ fn menu_hit(frame: Rect, menu: &Menu) -> MenuHit {
     };
     let count = menu.items.len();
     let rows = menu_max_rows(frame.height, count);
-    let filter_row = menu.kind == MenuKind::Palette;
+    let filter_row = matches!(menu.kind, MenuKind::Palette | MenuKind::AtFiles);
     let filter_w = if filter_row {
         format!("filter: {}", menu.filter).chars().count()
     } else {
@@ -147,16 +148,33 @@ fn menu_row_at(hit: &MenuHit, menu: &Menu, col: u16, row: u16) -> Option<usize> 
     menu.items.get(idx).map(|_| idx)
 }
 
-fn modal_action_at(hit: &ModalHit, col: u16, row: u16) -> Option<Action> {
+fn modal_action_at(hit: &ModalHit, view: &View, col: u16, row: u16) -> Option<MouseEffect> {
     if row != hit.hint_row || !in_rect(hit.area, col, row) {
         return None;
     }
     let rel = col.saturating_sub(hit.area.x + 1);
-    let mid = hit.area.width.saturating_sub(2) / 2;
-    if rel < mid {
-        Some(Action::Confirm)
-    } else {
-        Some(Action::Cancel)
+    let inner = hit.area.width.saturating_sub(2).max(1);
+    match view.modal_kind {
+        ModalKind::Gate => {
+            if rel < inner / 2 {
+                Some(MouseEffect::Modal(Action::Confirm))
+            } else {
+                Some(MouseEffect::Modal(Action::Cancel))
+            }
+        }
+        ModalKind::ToolApproval => {
+            let q = inner / 4;
+            let choice = if rel < q {
+                ToolApprovalChoice::Once
+            } else if rel < q * 2 {
+                ToolApprovalChoice::Session
+            } else if rel < q * 3 {
+                ToolApprovalChoice::Decline
+            } else {
+                ToolApprovalChoice::CancelTurn
+            };
+            Some(MouseEffect::ToolApproval(choice))
+        }
     }
 }
 
@@ -249,10 +267,10 @@ pub fn handle_mouse(
     let col = me.column;
     let row = me.row;
 
-    if let Some(hit) = layout.modal {
-        if let Some(action) = modal_action_at(&hit, col, row) {
-            return MouseEffect::Modal(action);
-        }
+    if let Some(hit) = layout.modal
+        && let Some(effect) = modal_action_at(&hit, view, col, row)
+    {
+        return effect;
     }
 
     if let (Some(hit), Some(menu)) = (layout.menu, view.menu.as_ref()) {
@@ -396,12 +414,12 @@ mod tests {
         let frame = Rect::new(0, 0, 80, 24);
         let hit = modal_hit(frame, &view).unwrap();
         assert_eq!(
-            modal_action_at(&hit, hit.area.x + 2, hit.hint_row),
-            Some(Action::Confirm)
+            modal_action_at(&hit, &view, hit.area.x + 2, hit.hint_row),
+            Some(MouseEffect::Modal(Action::Confirm))
         );
         assert_eq!(
-            modal_action_at(&hit, hit.area.x + hit.area.width - 2, hit.hint_row),
-            Some(Action::Cancel)
+            modal_action_at(&hit, &view, hit.area.x + hit.area.width - 2, hit.hint_row),
+            Some(MouseEffect::Modal(Action::Cancel))
         );
     }
 

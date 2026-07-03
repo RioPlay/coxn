@@ -5,7 +5,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0.0] - 2026-07-02
+
 ### Added
+
+- **TUI 2.0 trust UX**: mutating tools open an approval modal with pre-apply diff
+  preview (`edit`/`write_file`) or command summary (`run_command`). Keys
+  `o/s/d/x` (+ `e/c` expand/collapse). Gate blocks keep `y/n`.
+- **`src/layout.rs`**: shared frame math; scroll/hit-test respect multiline input height.
+- **Chat-first defaults**: `COXN_VIM=1` opts into vim modes; `Ctrl+P` palette alias;
+  `Ctrl-F` / `Ctrl-Shift-F` transcript search when vim is off; `@` fuzzy file picker.
+- **Trust ladder** status chips; `COXN_AUTO_APPROVE` warnings in doctor and boot banner.
+- **`/undo`** (git checkout last accepted edit), **`/export`** (markdown transcript).
+- **`/execute` confirm card** with partition preview before run/resume.
+- **Tool cards** in transcript (`▸ tool path`).
+- **`docs/tui-2.0-plan.adoc`**, **`scripts/pty-smoke.sh`**.
+
+### Changed
+
+- README and help overlay bindings synced to current TUI (no stale Tab/`?`/`/` refs).
+
+### Added (from 0.3.3 backlog)
 
 - **Codex CLI piggyback backend** (`AnyModel::CodexPiggyback`): text-only turns
   through `codex app-server` (`thread/start` + `turn/start`); `coxn auth setup codex`

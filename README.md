@@ -131,11 +131,14 @@ mapping. Tab-completion and arrow-navigation are available in the picker.
 
 ## Tools and the safety model
 
-Every tool call requires explicit approval before it runs:
+Every mutating tool call opens an **approval modal with a diff preview** before it runs:
 
 ```
-approve edit src/lib.rs?  [o]nce  [s]ession (all edit calls)  [d]ecline  [x] cancel turn
+Approve edit src/lib.rs?
+[o] once  [s] session  [d] decline  [x] cancel
 ```
+
+File edits show a unified diff; `run_command` shows the command and sandbox labels.
 
 For `run_command`, session-approval is scoped to the **exact command string**, not
 the tool name, so re-approving a different command is always required.
@@ -212,6 +215,8 @@ status line is honest about which mode is active.
 | `COXN_TASK_SEEDS` | Comma-separated seed symbols for the scope |
 | `COXN_TASK_BUDGET` | Token budget for scope context (default 8192) |
 | `COXN_RUN_TIMEOUT_SECS` | Wall-clock timeout for run_command (default 300) |
+| `COXN_VIM` | Set to `1` for vim-style Normal/Visual/Command modes (default: chat-first insert-only) |
+| `COXN_CLIPBOARD` | Set to `on` or `1` for OSC52 transcript copy on selection |
 
 ## Slash commands and keys
 
@@ -230,6 +235,8 @@ status line is honest about which mode is active.
 /quit            leave coxn
 /scope           show active task scope (COXN_TASK_*)
 /trust           toggle read_file session-auto approval
+/undo            revert last accepted file edit via git checkout
+/export          save transcript to ~/.local/share/coxn/exports/
 /copy            save transcript to ~/.local/share/coxn/last-transcript.txt
 /auth status     check configured provider auth
 /auth login <id> print native login or key setup command
@@ -246,32 +253,35 @@ coxn auth set-key <id>   write ~/.config/coxn/secrets/<id>.key from stdin
 coxn once -p "prompt"    headless turn (COXN_AUTO_APPROVE=1)
 ```
 
-Use `@path/to/file` in messages to inject file contents (up to 3 files).
-```
+Use `@path/to/file` in messages to inject file contents (up to 3 files), or type `@`
+to open a fuzzy file picker.
 
 `/model` and `/session` open an arrow-navigable picker (Up/Down, Enter, Esc).
 
-Keys:
+Keys (default chat-first; set `COXN_VIM=1` for full vim modes):
 
 | Key | Action |
 |---|---|
 | Enter | Send message |
+| Alt-Enter / Shift-Enter | Newline in input |
 | Ctrl-C | Cancel a turn / quit when idle |
-| Tab | Complete a command or `/resume` slug |
+| Ctrl-Space / Ctrl-P | Fuzzy command palette |
+| Ctrl-F / Ctrl-Shift-F | Transcript search (when vim off) |
+| Tab | Command palette / completion |
+| @ | Attach project file (fuzzy picker) |
 | Up/Down | Scroll chat; also navigate pickers |
 | PgUp/PgDn | Scroll a page |
-| Ctrl-P / Ctrl-N | Input history |
+| Ctrl-N | Input history forward (Ctrl-P opens palette) |
 | Ctrl-W | Delete word |
 | Ctrl-K / Ctrl-U | Cut to end / cut to start |
 | Ctrl-Y | Yank (paste) |
 | Left/Right Home/End | Move cursor |
-| K / gd | (Normal) aden understand symbol at cursor |
-| ga | (Normal) aden asm context for symbol at cursor |
-| gi | (Normal) aden impact for symbol at cursor |
-| gv | (Normal) launch aden view for symbol at cursor |
-| / | (Normal) aden grep on symbol at cursor |
+| g? | Help overlay |
+| o/s/d/x | Tool approval modal (once / session / decline / cancel) |
+| y/n | Gate-block proceed / cancel |
+| Ctrl-L/A/I/V/G | ADEN ops on word at cursor (Insert mode) |
 
-: ex commands in Normal/Command mode include `:view`, `:gm`/`:viz` (mermaid), `:doctor`, `:impact`, `:understand`, `:grep`, `:ask`.
+With `COXN_VIM=1`: Esc → Normal, `/` transcript search, `gr` aden grep, `K`/`gd` understand, `:view` / `:doctor` ex commands.
 
 ## Model routing by role
 

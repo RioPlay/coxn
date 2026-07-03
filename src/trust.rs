@@ -1,5 +1,12 @@
 //! Per-tool approval trust tiers. Permission presets, not inference.
 
+/// True when `COXN_AUTO_APPROVE` bypasses the human approval gate (`coxn once`).
+pub fn auto_approve_enabled() -> bool {
+    std::env::var("COXN_AUTO_APPROVE")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+}
+
 /// How a tool class is approved by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustLevel {
@@ -24,11 +31,17 @@ impl Default for Trust {
 }
 
 impl Trust {
-    /// Short status fragment for the status line.
-    pub fn status_tag(&self) -> &'static str {
+    /// Trust ladder chip: supervised human gate, optional scope gate, read tier.
+    pub fn ladder_tag(&self, task_gated: bool) -> &'static str {
+        if auto_approve_enabled() {
+            return "trust: AUTO-APPROVE";
+        }
+        if task_gated {
+            return "trust: supervised+scope";
+        }
         match self.read {
-            TrustLevel::Session => "trust: read-auto",
-            TrustLevel::Prompt => "trust: read-gated",
+            TrustLevel::Session => "trust: supervised",
+            TrustLevel::Prompt => "trust: supervised",
         }
     }
 
@@ -53,5 +66,23 @@ impl Trust {
             TrustLevel::Session => "session-auto",
             TrustLevel::Prompt => "prompt",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ladder_shows_auto_approve_when_env_set() {
+        // SAFETY: single-threaded test; cleared on drop.
+        unsafe { std::env::set_var("COXN_AUTO_APPROVE", "1") };
+        assert_eq!(Trust::default().ladder_tag(false), "trust: AUTO-APPROVE");
+        unsafe { std::env::remove_var("COXN_AUTO_APPROVE") };
+    }
+
+    #[test]
+    fn ladder_shows_scope_when_task_gated() {
+        assert_eq!(Trust::default().ladder_tag(true), "trust: supervised+scope");
     }
 }

@@ -25,6 +25,10 @@ pub(crate) enum Command {
     Trust,
     /// `/copy` writes the transcript to disk.
     Copy,
+    /// `/undo` reverts the last accepted file edit via git.
+    Undo,
+    /// `/export` writes the transcript to a markdown file.
+    Export,
     /// `/auth status|setup [preset]|login <id>|set-key <id>` — provider auth helpers.
     Auth(Vec<String>),
     /// `/execute` runs the aden task partition sequentially (BatchIo).
@@ -56,6 +60,8 @@ pub(crate) fn parse_command(input: &str) -> Command {
         "scope" => Command::Scope,
         "trust" => Command::Trust,
         "copy" => Command::Copy,
+        "undo" => Command::Undo,
+        "export" => Command::Export,
         "auth" => Command::Auth(args),
         "execute" | "run-agents" => Command::Execute {
             resume: args.iter().any(|a| a == "--resume"),
@@ -68,7 +74,7 @@ pub(crate) fn parse_command(input: &str) -> Command {
 /// Slash command verbs, for Tab completion and the fuzzy palette (M4).
 pub(crate) const COMMANDS: &[&str] = &[
     "help", "model", "auth", "think", "tools", "agents", "execute", "scope", "trust", "copy",
-    "session", "resume", "runs", "edit", "clear", "quit",
+    "undo", "export", "session", "resume", "runs", "edit", "clear", "quit",
 ];
 
 /// The longest common prefix of `items` (empty if they share none).

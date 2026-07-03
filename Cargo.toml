@@ -1,6 +1,6 @@
 [package]
 name = "coxn"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Lean gated terminal harness for coding LLMs with optional aden blast-radius scope."

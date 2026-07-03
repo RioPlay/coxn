@@ -143,6 +143,11 @@ fn line_diff_ops<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<DiffOp<'a>> {
 /// object (what a function-calling provider sends), return its `key` field;
 /// otherwise treat the whole trimmed string as the value (bare-string args from
 /// the stub or tests). This lets one tool serve both call styles.
+/// Read a string argument for UI previews (same rules as [`arg`]).
+pub fn arg_preview(arguments: &str, key: &str) -> String {
+    arg(arguments, key)
+}
+
 fn arg(arguments: &str, key: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(arguments) {
         // A JSON object: return the named field, or empty if absent.
@@ -601,6 +606,37 @@ pub(crate) fn confine_path(dir: &Path, path: &str) -> Result<PathBuf, String> {
 
 const GREP_MAX_LINES: usize = 80;
 const GLOB_MAX_MATCHES: usize = 200;
+const PICKER_MAX_FILES: usize = 400;
+
+/// Repo-relative file paths for the `@` attachment picker (fuzzy-filtered by caller).
+pub fn project_file_picker(dir: &Path) -> Vec<String> {
+    let mut matches = Vec::new();
+    let _ = picker_walk(dir, dir, &mut matches);
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+fn picker_walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
+    if out.len() >= PICKER_MAX_FILES {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" || name == "target" || name == "node_modules" || name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            picker_walk(root, &path, out)?;
+        } else if let Ok(rel) = rel_path(root, &path) {
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
 
 /// Ripgrep (or grep) search confined to the project root. Fallback when aden is
 /// absent; commodity shell-out, not context assembly.

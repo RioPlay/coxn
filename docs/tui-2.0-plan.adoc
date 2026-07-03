@@ -1,0 +1,37 @@
+= coxn TUI 2.0 — chat-first chrome
+:status: shipped (Epics 1–3 core, 4–5 partial)
+:date: 2026-07-02
+:parent: docs/tui-frictionless-plan.adoc
+
+North star: **chat-first, diff-centric, gate-honest** — unified approval with
+pre-apply diff; vim modes opt-in; discovery via palette and `@` files.
+
+== Shipped
+
+* Epic 1: tool approval modal with diff preview; gate vs tool key maps; mouse zones
+* Epic 2: `src/layout.rs` shared frame math; `pane_dims` respects multiline input
+* Epic 3: `COXN_VIM=1` opt-in; `Ctrl+P` palette; `Ctrl-F` search when vim off;
+  `@` fuzzy file picker; tool cards in transcript; README/help binding sync
+* Epic 1B: trust ladder status chips; `COXN_AUTO_APPROVE` warnings in doctor/boot
+* Epic 4 (partial): `/undo` (git checkout last edit); `/export` markdown
+* Epic 5 (partial): `/execute` confirm card with partition preview
+
+== Remaining (non-blocking)
+
+* Epic 3: `!` shell prefix in composer; reasoning block toggle
+* Epic 4: richer `/copy` + session card polish
+* Epic 5: live partition progress lanes in transcript
+* Epic 6: `drive/` module split; full PTY approval-key smoke in CI
+
+== Key bindings (default chat-first)
+
+| Key | Action |
+| Enter | Send message |
+| Ctrl-Space / Ctrl-P | Fuzzy palette |
+| Ctrl-F / Ctrl-Shift-F | Transcript search (vim off) |
+| @ | Attach project file |
+| g? | Help overlay |
+| o/s/d/x | Tool approval (modal) |
+| y/n | Gate block proceed/cancel |
+
+Set `COXN_VIM=1` for Normal/Visual/Command modes and vim-style `/` search.

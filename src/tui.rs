@@ -58,6 +58,8 @@ pub enum MenuKind {
     Commands,
     /// Fuzzy unified palette (M4): slash verbs, models, sessions, recent input.
     Palette,
+    /// `@` file attachment picker (fuzzy project paths).
+    AtFiles,
 }
 
 /// One selectable row: the `value` acted on, and the `label` shown.
@@ -123,12 +125,16 @@ impl Menu {
     /// Recompute [`Menu::items`] from [`Menu::catalog`] + [`Menu::filter`].
     /// Pins [`Menu::selected`] to the top match (index 0).
     pub fn apply_palette_filter(&mut self) {
-        if self.kind != MenuKind::Palette {
+        if !matches!(self.kind, MenuKind::Palette | MenuKind::AtFiles) {
             return;
         }
         let q = self.filter.trim();
         if q.is_empty() {
-            self.items = self.catalog.clone();
+            self.items = if self.kind == MenuKind::AtFiles {
+                self.catalog.iter().take(80).cloned().collect()
+            } else {
+                self.catalog.clone()
+            };
         } else {
             let mut ranked: Vec<(u32, usize)> = self
                 .catalog
@@ -676,7 +682,7 @@ impl View {
     /// should fall back to [`map_menu_key`]).
     pub fn map_palette_key(&mut self, key: KeyEvent) -> Option<Action> {
         let menu = self.menu.as_mut()?;
-        if menu.kind != MenuKind::Palette {
+        if !matches!(menu.kind, MenuKind::Palette | MenuKind::AtFiles) {
             return None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1836,7 +1842,7 @@ pub fn render(frame: &mut Frame, view: &View) {
         // selected row carries a › marker and bold primary text. Overflow
         // above/below is signalled by ▴/▾ in the title so the user knows there
         // is more to scroll to.
-        let hint = if menu.kind == MenuKind::Palette {
+        let hint = if matches!(menu.kind, MenuKind::Palette | MenuKind::AtFiles) {
             "type to filter  j/k  Enter  Esc"
         } else {
             "j/k ↑↓  G/gg  PgUp/Dn  Enter  Esc"
@@ -1845,7 +1851,7 @@ pub fn render(frame: &mut Frame, view: &View) {
         let rows = menu_max_rows(frame.area().height, count);
         let start = menu.scroll.min(count);
         let end = (start + rows).min(count);
-        let filter_line = if menu.kind == MenuKind::Palette {
+        let filter_line = if matches!(menu.kind, MenuKind::Palette | MenuKind::AtFiles) {
             format!("filter: {}", menu.filter)
         } else {
             String::new()
@@ -1862,7 +1868,7 @@ pub fn render(frame: &mut Frame, view: &View) {
             .max()
             .unwrap_or(0) as u16;
         let mut lines: Vec<Line<'static>> = Vec::new();
-        if menu.kind == MenuKind::Palette {
+        if matches!(menu.kind, MenuKind::Palette | MenuKind::AtFiles) {
             lines.push(Line::from(vec![
                 Span::styled("filter: ", Style::default().fg(DIM)),
                 Span::styled(menu.filter.clone(), Style::default().fg(ACCENT)),
@@ -1934,10 +1940,10 @@ pub fn render(frame: &mut Frame, view: &View) {
             // COCKPIT - ADEN graph harness for high velocity coding
             ("COCKPIT (ADEN graph)", None),
             (
-                "Ctrl-Space",
+                "Ctrl-Space / Ctrl-P",
                 Some("fuzzy palette: commands, models, sessions"),
             ),
-            ("Tab", Some("ADEN symbols+actions palette")),
+            ("Tab", Some("slash commands + ADEN shortcuts")),
             (
                 "ADEN items",
                 Some("direct: understand/view/impact + comms/doctor/audit"),
@@ -1952,8 +1958,10 @@ pub fn render(frame: &mut Frame, view: &View) {
                 "Ctrl+L on a word",
                 Some("pulls ADEN context (also Ctrl+A/I/V/G)"),
             ),
-            ("Ctrl-Space / Tab", Some("command palette / suggestions")),
-            ("? or /help", Some("this help")),
+            ("Ctrl-Space / Ctrl-P / Tab", Some("palette / commands")),
+            ("Ctrl-F / Ctrl-Shift-F", Some("transcript search (vim off)")),
+            ("@", Some("attach project file (fuzzy picker)")),
+            ("g? or /help", Some("this help (vim modes need COXN_VIM=1)")),
             ("mouse wheel", Some("scrolls transcript")),
             ("", None),
             ("PICKER (open menu)", None),
@@ -1992,8 +2000,11 @@ pub fn render(frame: &mut Frame, view: &View) {
             // Section: commands
             ("COMMANDS", None),
             (":q", Some("quit")),
-            (":help  ?", Some("this overlay")),
-            ("Ctrl-Space", Some("fuzzy palette; Tab for ADEN symbols")),
+            (":help  g?", Some("this overlay")),
+            (
+                "Ctrl-Space / Ctrl-P",
+                Some("fuzzy palette; Tab for commands"),
+            ),
             (":model", Some("switch model")),
             (":tools", Some("list active tools")),
             (":clear", Some("new conversation")),
@@ -2146,6 +2157,8 @@ pub enum Action {
     AdenView,
     /// ADEN grep on word at cursor (Ctrl-G).
     AdenGrep,
+    /// Open transcript search forward (`Ctrl-F` when vim is off).
+    SearchForward,
 }
 
 /// Map a key event while typing. Up/Down scroll the transcript (so a mouse
@@ -2180,6 +2193,7 @@ pub fn map_input_key(key: KeyEvent) -> Option<Action> {
         (KeyCode::Char('i'), KeyModifiers::CONTROL) => Some(Action::AdenImpact),
         (KeyCode::Char('v'), KeyModifiers::CONTROL) => Some(Action::AdenView),
         (KeyCode::Char('g'), KeyModifiers::CONTROL) => Some(Action::AdenGrep),
+        (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(Action::SearchForward),
         (KeyCode::Up, _) => Some(Action::ScrollUp),
         (KeyCode::Down, _) => Some(Action::ScrollDown),
         (KeyCode::PageUp, _) => Some(Action::PageUp),
@@ -3319,7 +3333,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut view = View::new();
         view.set_status(
-            "model: gpt-4  |  scope: task 'foo'  |  ctx: ~1.2k ctx  |  trust: read-auto",
+            "model: gpt-4  |  scope: task 'foo'  |  ctx: ~1.2k ctx  |  trust: supervised+scope",
         );
         let mut terminal = Terminal::new(TestBackend::new(100, 6)).expect("test backend");
         terminal

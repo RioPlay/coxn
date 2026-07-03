@@ -81,11 +81,17 @@ fn refresh_discovery(
 /// The startup greeting, shown until the first turn and after `/clear`. A single
 /// `sys:` line so it renders in the transcript's own voice -- no ASCII art.
 fn welcome(aden_active: bool) -> String {
-    if aden_active {
-        "sys: coxn ready. ADEN cockpit: graph-powered terminal. Tab for palette (symbols+actions). Ctrl+L on words for context. ? for help.".to_string()
+    let vim = if vim::enabled() {
+        "COXN_VIM=1: Esc→Normal, / search"
     } else {
-        "sys: coxn ready. Simple chat with LLM + tools. Type to talk, / for commands, ? for help."
-            .to_string()
+        "chat-first: Enter send, Ctrl-F search, Ctrl-Space palette"
+    };
+    if aden_active {
+        format!(
+            "sys: coxn ready. ADEN cockpit. Ctrl-Space/Ctrl-P palette. @ files. g? help. {vim}."
+        )
+    } else {
+        format!("sys: coxn ready. Type to chat, /commands, @files, g? help. {vim}.")
     }
 }
 
@@ -113,13 +119,13 @@ fn transcript(messages: &[Message]) -> String {
                 let calls = m
                     .tool_calls
                     .iter()
-                    .map(|c| format!("{}({})", c.name, c.arguments))
+                    .map(tool_call_card)
                     .collect::<Vec<_>>()
-                    .join(", ");
+                    .join("\n");
                 if m.content.is_empty() {
-                    format!("coxn: → {calls}")
+                    format!("coxn:\n{calls}")
                 } else {
-                    format!("coxn: {}  → {calls}", m.content)
+                    format!("coxn: {}\n{calls}", m.content)
                 }
             }
         })
@@ -187,6 +193,10 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
     // slowest aden spawn and is purely cosmetic, so defer it to the first
     // post-turn refresh and let the user reach the prompt sooner.
     view.set_status(boot_status(&sel.label(), &task.status, caps.available));
+    if trust::auto_approve_enabled() {
+        view.output
+            .push_str("\nsys: WARNING — COXN_AUTO_APPROVE=1 bypasses the human approval gate\n");
+    }
     // Offline stub: block chat until a model is reachable (not a silent echo toy).
     if sel.is_offline_stub() {
         view.output.push_str(
@@ -261,7 +271,8 @@ fn status_line(
         Some(u) if u.prompt_tokens > 0 => format!("{base}  |  ctx: {}", ctx_meter(u.prompt_tokens)),
         _ => base,
     };
-    format!("{line}  |  {}", trust.status_tag())
+    let task_gated = !task.is_empty() && task.contains("gated");
+    format!("{line}  |  {}", trust.ladder_tag(task_gated))
 }
 
 /// Format a context-size meter: the prompt tokens sent on the last turn, so the
@@ -682,7 +693,7 @@ fn commands_menu() -> Option<Menu> {
         value: "".to_string(),
     });
     items.push(MenuItem {
-        label: "TIP: Tab for command palette, mouse wheel to scroll".to_string(),
+        label: "TIP: Ctrl-Space palette, @ files, mouse wheel scroll".to_string(),
         value: "".to_string(),
     });
 
@@ -880,6 +891,164 @@ fn expand_at_paths(dir: &Path, input: &str) -> String {
         out.push(word.to_string());
     }
     out.join(" ")
+}
+
+/// One-line collapsed tool card for the transcript.
+fn tool_call_card(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "read_file" | "edit" | "write_file" => {
+            let path = tools::arg_preview(&call.arguments, "path");
+            format!("▸ {} {}", call.name, path)
+        }
+        "run_command" => {
+            let cmd = tools::arg_preview(&call.arguments, "command");
+            let preview: String = cmd.chars().take(60).collect();
+            let ell = if cmd.chars().count() > 60 { "…" } else { "" };
+            format!("▸ run_command $ {preview}{ell}")
+        }
+        _ => {
+            let preview: String = call.arguments.chars().take(40).collect();
+            format!("▸ {} {preview}", call.name)
+        }
+    }
+}
+
+fn at_files_menu(dir: &Path) -> Option<Menu> {
+    let catalog: Vec<MenuItem> = tools::project_file_picker(dir)
+        .into_iter()
+        .map(|p| MenuItem {
+            label: p.clone(),
+            value: format!("@{p}"),
+        })
+        .collect();
+    if catalog.is_empty() {
+        return None;
+    }
+    let mut menu = Menu {
+        kind: MenuKind::AtFiles,
+        title: "@ attach file — type to filter".to_string(),
+        items: catalog.clone(),
+        catalog,
+        selected: 0,
+        scroll: 0,
+        count: None,
+        pending_g: false,
+        filter: String::new(),
+    };
+    menu.apply_palette_filter();
+    Some(menu)
+}
+
+fn insert_at_path(input: &str, cursor: usize, token: &str) -> (String, usize) {
+    let cursor = cursor.min(input.len());
+    let before = &input[..cursor];
+    let after = &input[cursor..];
+    if let Some(at) = before.rfind('@') {
+        let prefix = &input[..at];
+        let new = format!("{prefix}{token}{after}");
+        let new_cursor = (prefix.len() + token.len()).min(new.len());
+        (new, new_cursor)
+    } else {
+        let new = format!("{before}{token}{after}");
+        let new_cursor = (before.len() + token.len()).min(new.len());
+        (new, new_cursor)
+    }
+}
+
+/// Block until the user answers a gate confirm modal (`y`/`n`).
+fn confirm_gate_blocking(tui: &mut Tui, view: &mut View) -> bool {
+    loop {
+        let _ = tui.draw(view);
+        if !event::poll(TICK).unwrap_or(false) {
+            continue;
+        }
+        let Ok(ev) = event::read() else {
+            continue;
+        };
+        if let Event::Key(key) = ev
+            && key.kind == KeyEventKind::Press
+        {
+            if matches!(map_input_key(key), Some(Action::Quit)) {
+                view.dismiss();
+                return false;
+            }
+            match map_modal_key(key) {
+                Some(Action::Confirm) => {
+                    view.dismiss();
+                    return true;
+                }
+                Some(Action::Cancel) => {
+                    view.dismiss();
+                    return false;
+                }
+                Some(Action::ModalExpand) if view.modal_diff.is_some() => {
+                    view.modal_diff_expanded = true;
+                }
+                Some(Action::ModalCollapse) if view.modal_diff.is_some() => {
+                    view.modal_diff_expanded = false;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn execute_preview_text(dir: &Path, caps: &aden::AdenCaps, resume: bool) -> String {
+    let listing = agents_listing(dir, caps);
+    if resume {
+        if let Some(slug) =
+            run_ledger::latest_for_task(&std::env::var("COXN_TASK_NAME").unwrap_or_default())
+        {
+            let statuses = run_ledger::scope_statuses(&slug);
+            let mut lines = vec![format!("resume run: {slug}")];
+            for (scope, st) in statuses {
+                lines.push(format!("  {scope}: {} {}", st.status, st.result));
+            }
+            return lines.join("\n");
+        }
+        return "resume: no prior run found for this task\n\n".to_string() + &listing;
+    }
+    listing
+}
+
+fn undo_last_edit(dir: &Path, pump: &Pump<AnyModel>) -> String {
+    let Some(path) = pump.last_edited() else {
+        return "nothing to undo — no accepted file edit this session".to_string();
+    };
+    let rel = path
+        .strip_prefix(dir)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string());
+    let out = std::process::Command::new("git")
+        .args(["-C", &dir.display().to_string(), "checkout", "--", &rel])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => format!("reverted {rel} via git checkout"),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            format!("undo failed for {rel}: {err}")
+        }
+        Err(e) => format!("undo failed: {e}"),
+    }
+}
+
+fn export_transcript(pump: &Pump<AnyModel>) -> String {
+    let text = transcript(pump.messages());
+    let base = doctor::session_dir();
+    let dir = base.parent().unwrap_or(&base).join("exports");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return "export failed: cannot create exports directory".to_string();
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("coxn-{stamp}.md"));
+    let body = format!("# coxn transcript\n\n{text}\n");
+    match std::fs::write(&path, body) {
+        Ok(()) => format!("exported to {}", path.display()),
+        Err(e) => format!("export failed: {e}"),
+    }
 }
 
 fn scope_listing() -> String {
@@ -1086,6 +1255,46 @@ struct DriveIo<'a> {
 }
 
 impl DriveIo<'_> {
+    fn apply_tool_approval(
+        &mut self,
+        choice: ToolApprovalChoice,
+        call: &ToolCall,
+    ) -> Option<Approval> {
+        match choice {
+            ToolApprovalChoice::Once => {
+                self.view.dismiss();
+                Some(Approval::Allow)
+            }
+            ToolApprovalChoice::Session => {
+                if let Some(cmd) = command_key(call) {
+                    self.approved_commands.insert(cmd);
+                } else {
+                    self.approvals.insert(call.name.clone());
+                }
+                self.view.dismiss();
+                Some(Approval::Allow)
+            }
+            ToolApprovalChoice::Decline => {
+                self.view.dismiss();
+                Some(Approval::Decline)
+            }
+            ToolApprovalChoice::CancelTurn => {
+                self.view.dismiss();
+                self.cancel_turn = true;
+                Some(Approval::CancelTurn)
+            }
+            ToolApprovalChoice::Expand if self.view.modal_diff.is_some() => {
+                self.view.modal_diff_expanded = true;
+                None
+            }
+            ToolApprovalChoice::Collapse if self.view.modal_diff.is_some() => {
+                self.view.modal_diff_expanded = false;
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Repaint the output pane with the current assistant text and any live
     /// run_command output appended below it.
     fn repaint(&mut self) {
@@ -1154,46 +1363,38 @@ impl TurnIo for DriveIo<'_> {
             .confirm_tool_approval(format!("Approve {summary}?\n({session_label})"), diff);
         loop {
             let _ = self.tui.draw(self.view);
-            if event::poll(TICK).unwrap_or(false)
-                && let Ok(Event::Key(key)) = event::read()
-                && key.kind == KeyEventKind::Press
-            {
-                if matches!(map_input_key(key), Some(Action::Quit)) {
-                    self.view.dismiss();
-                    self.cancel_turn = true;
-                    return Approval::CancelTurn;
-                }
-                match map_tool_approval_key(key) {
-                    Some(ToolApprovalChoice::Once) => {
-                        self.view.dismiss();
-                        return Approval::Allow;
-                    }
-                    Some(ToolApprovalChoice::Session) => {
-                        if let Some(cmd) = command_key(call) {
-                            self.approved_commands.insert(cmd);
-                        } else {
-                            self.approvals.insert(call.name.clone());
-                        }
-                        self.view.dismiss();
-                        return Approval::Allow;
-                    }
-                    Some(ToolApprovalChoice::Decline) => {
-                        self.view.dismiss();
-                        return Approval::Decline;
-                    }
-                    Some(ToolApprovalChoice::CancelTurn) => {
+            if !event::poll(TICK).unwrap_or(false) {
+                continue;
+            }
+            let Ok(ev) = event::read() else {
+                continue;
+            };
+            match ev {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if matches!(map_input_key(key), Some(Action::Quit)) {
                         self.view.dismiss();
                         self.cancel_turn = true;
                         return Approval::CancelTurn;
                     }
-                    Some(ToolApprovalChoice::Expand) if self.view.modal_diff.is_some() => {
-                        self.view.modal_diff_expanded = true;
+                    if let Some(choice) = map_tool_approval_key(key)
+                        && let Some(decision) = self.apply_tool_approval(choice, call)
+                    {
+                        return decision;
                     }
-                    Some(ToolApprovalChoice::Collapse) if self.view.modal_diff.is_some() => {
-                        self.view.modal_diff_expanded = false;
-                    }
-                    _ => {}
                 }
+                Event::Mouse(me) => {
+                    if let Some(size) = self.tui.size() {
+                        let frame = Rect::new(0, 0, size.width, size.height);
+                        let layout = frame_layout(frame, self.view);
+                        if let MouseEffect::ToolApproval(choice) =
+                            handle_mouse(self.view, &layout, me, 0)
+                            && let Some(decision) = self.apply_tool_approval(choice, call)
+                        {
+                            return decision;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1431,6 +1632,12 @@ fn dispatch_menu_pick(
                 view.refresh_suggestion();
             }
         }
+        MenuKind::AtFiles => {
+            let (input, cursor) = insert_at_path(&view.input, view.cursor, &value);
+            view.input = input;
+            view.cursor = cursor;
+            view.refresh_suggestion();
+        }
     }
 }
 
@@ -1536,6 +1743,15 @@ async fn drive(
                             view.modal_diff_expanded = false;
                         }
                         _ => {}
+                    },
+                    MouseEffect::ToolApproval(choice) => match choice {
+                        ToolApprovalChoice::Expand if view.modal_diff.is_some() => {
+                            view.modal_diff_expanded = true;
+                        }
+                        ToolApprovalChoice::Collapse if view.modal_diff.is_some() => {
+                            view.modal_diff_expanded = false;
+                        }
+                        _ => view.dismiss(),
                     },
                     MouseEffect::CopySelection(text) => copy_text = Some(text),
                     MouseEffect::None => {}
@@ -1669,11 +1885,11 @@ async fn drive(
             let (_, term_h) = pane_dims(tui, view);
             let count = view.menu.as_ref().map(|m| m.items.len()).unwrap_or(0);
             let rows = menu_max_rows(term_h, count);
-            let palette = view
+            let fuzzy = view
                 .menu
                 .as_ref()
-                .is_some_and(|m| m.kind == MenuKind::Palette);
-            let action = if palette {
+                .is_some_and(|m| matches!(m.kind, MenuKind::Palette | MenuKind::AtFiles));
+            let action = if fuzzy {
                 view.map_palette_key(key)
             } else {
                 view.map_menu_key(key)
@@ -1708,7 +1924,7 @@ async fn drive(
                         );
                     }
                 }
-                None if palette => {
+                None if fuzzy => {
                     // Filter edit consumed the key; redraw.
                 }
                 _ => {}
@@ -2209,6 +2425,20 @@ async fn drive(
             map_input_key(key)
         };
 
+        if !vim::enabled() {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('f')
+                && key.modifiers.contains(KeyModifiers::SHIFT)
+            {
+                view.search_open(true);
+                continue;
+            }
+            if matches!(action, Some(Action::SearchForward)) {
+                view.search_open(false);
+                continue;
+            }
+        }
+
         match action {
             Some(Action::Quit) => return Ok(()),
             Some(Action::Complete) => {
@@ -2229,7 +2459,14 @@ async fn drive(
                     }
                 }
             }
-            Some(Action::Append(c)) => view.input_push(c),
+            Some(Action::Append(c)) => {
+                view.input_push(c);
+                if c == '@'
+                    && let Some(menu) = at_files_menu(dir)
+                {
+                    view.open_menu(menu);
+                }
+            }
             Some(Action::Newline) => view.input_push('\n'),
             Some(Action::Backspace) => view.input_backspace(),
             Some(Action::CursorLeft) => view.cursor_left(),
@@ -2535,6 +2772,8 @@ async fn drive(
                             ));
                         }
                         Command::Copy => view.output = copy_transcript(view),
+                        Command::Undo => view.output = undo_last_edit(dir, pump),
+                        Command::Export => view.output = export_transcript(pump),
                         Command::Auth(args) => {
                             if args.first().is_some_and(|arg| arg == "set-key") {
                                 view.output =
@@ -2552,14 +2791,25 @@ async fn drive(
                             }
                         }
                         Command::Execute { resume } => {
-                            view.set_status(if resume {
-                                "resuming partition…".to_string()
+                            let preview = execute_preview_text(dir, caps, resume);
+                            let prompt = if resume {
+                                "Resume partition?"
                             } else {
-                                "executing partition…".to_string()
-                            });
-                            let _ = tui.draw(view);
-                            view.output =
-                                execute::execute_partition(dir, caps, sel, bwrap, resume).await;
+                                "Start partition?"
+                            };
+                            view.confirm_with_diff(prompt, preview);
+                            if confirm_gate_blocking(tui, view) {
+                                view.set_status(if resume {
+                                    "resuming partition…".to_string()
+                                } else {
+                                    "executing partition…".to_string()
+                                });
+                                let _ = tui.draw(view);
+                                view.output =
+                                    execute::execute_partition(dir, caps, sel, bwrap, resume).await;
+                            } else {
+                                view.output = "partition cancelled".to_string();
+                            }
                             view.set_status(status_line(
                                 dir,
                                 &sel.label(),
@@ -2758,7 +3008,7 @@ mod tests {
         ];
         assert_eq!(
             transcript(&messages),
-            "you: go\n\ncoxn: → aden_asm({})\n\ntool: result"
+            "you: go\n\ncoxn:\n▸ aden_asm {}\n\ntool: result"
         );
     }
 
