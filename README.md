@@ -216,7 +216,7 @@ status line is honest about which mode is active.
 | `COXN_TASK_BUDGET` | Token budget for scope context (default 8192) |
 | `COXN_RUN_TIMEOUT_SECS` | Wall-clock timeout for run_command (default 300) |
 | `COXN_VIM` | Set to `1` for vim-style Normal/Visual/Command modes (default: chat-first insert-only) |
-| `COXN_TUI3` | Set to `1` for structured shell: chrome bar, conversation cards, activity drawer |
+| `COXN_TUI3` | Set to `1` for structured shell: chrome, conversation cards, activity drawer; `Ctrl-T` collapse tools, `Ctrl-Shift-R` toggle reasoning |
 | `COXN_CLIPBOARD` | Set to `on` or `1` for OSC52 transcript copy on selection |
 
 ## Slash commands and keys

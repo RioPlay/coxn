@@ -992,6 +992,46 @@ impl View {
     /// Snap the output pane back to the bottom (called on submit / new turn).
     pub fn snap_to_bottom(&mut self) {
         self.scroll_offset = 0;
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.conv_scroll_offset = 0;
+            ui3.activity_scroll_offset = 0;
+        }
+    }
+
+    /// Primary pane text: conversation cards (ui3) or legacy output.
+    pub fn primary_text(&self) -> String {
+        if let Some(ui3) = &self.ui3 {
+            ui3.conversation_text()
+        } else {
+            self.output.clone()
+        }
+    }
+
+    /// Exportable transcript for `/copy` and file write.
+    pub fn export_text(&self) -> String {
+        if let Some(ui3) = &self.ui3 {
+            ui3.export_text()
+        } else {
+            self.output.clone()
+        }
+    }
+
+    pub fn toggle_tools_collapsed(&mut self) -> bool {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.tools_collapsed = !ui3.tools_collapsed;
+            ui3.tools_collapsed
+        } else {
+            false
+        }
+    }
+
+    pub fn toggle_reasoning_hidden(&mut self) -> bool {
+        if let Some(ui3) = &mut self.ui3 {
+            ui3.reasoning_hidden = !ui3.reasoning_hidden;
+            ui3.reasoning_hidden
+        } else {
+            false
+        }
     }
 
     /// Update inline suggestion (ghost text) for / slash commands based on
@@ -1028,8 +1068,70 @@ impl View {
     /// of wrapped lines that do not fit. Lets the caller clamp [`View::scroll_up`].
     pub fn max_scroll(&self, width: u16, pane_height: u16) -> u16 {
         let content = width.saturating_sub(PANE_GUTTER);
-        let total = wrapped_line_count(&self.output, content as usize);
+        let total = wrapped_line_count(&self.primary_text(), content as usize);
         total.saturating_sub(pane_height as usize) as u16
+    }
+
+    /// Max scroll for the activity drawer (ui3 only).
+    pub fn max_activity_scroll(&self, width: u16, pane_height: u16) -> u16 {
+        let Some(ui3) = &self.ui3 else {
+            return 0;
+        };
+        let content = width.saturating_sub(1);
+        let total = wrapped_line_count(&ui3.activity.display_text(), content as usize);
+        total.saturating_sub(pane_height as usize) as u16
+    }
+
+    fn scroll_ui3_conv(&mut self, amount: i16, max: u16) {
+        if let Some(ui3) = &mut self.ui3 {
+            if amount < 0 {
+                ui3.conv_scroll_offset = ui3.conv_scroll_offset.saturating_sub((-amount) as u16);
+            } else {
+                ui3.conv_scroll_offset = ui3
+                    .conv_scroll_offset
+                    .saturating_add(amount as u16)
+                    .min(max);
+            }
+        }
+    }
+
+    fn scroll_ui3_activity(&mut self, amount: i16, max: u16) {
+        if let Some(ui3) = &mut self.ui3 {
+            if amount < 0 {
+                ui3.activity_scroll_offset =
+                    ui3.activity_scroll_offset.saturating_sub((-amount) as u16);
+            } else {
+                ui3.activity_scroll_offset = ui3
+                    .activity_scroll_offset
+                    .saturating_add(amount as u16)
+                    .min(max);
+            }
+        }
+    }
+
+    /// Scroll the primary pane (conversation or legacy output).
+    pub fn scroll_primary_up(&mut self, amount: u16, max: u16) {
+        if self.ui3.is_some() {
+            self.scroll_ui3_conv(amount as i16, max);
+        } else {
+            self.scroll_up(amount, max);
+        }
+    }
+
+    pub fn scroll_primary_down(&mut self, amount: u16) {
+        if self.ui3.is_some() {
+            self.scroll_ui3_conv(-(amount as i16), 0);
+        } else {
+            self.scroll_down(amount);
+        }
+    }
+
+    pub fn scroll_activity_up(&mut self, amount: u16, max: u16) {
+        self.scroll_ui3_activity(amount as i16, max);
+    }
+
+    pub fn scroll_activity_down(&mut self, amount: u16) {
+        self.scroll_ui3_activity(-(amount as i16), 0);
     }
 }
 
@@ -1606,7 +1708,12 @@ pub fn render(frame: &mut Frame, view: &View) {
         let pending = elapsed.is_some();
         crate::ui::render_chrome(frame, v3.chrome, &ui3.chrome);
         crate::ui::render_conversation(frame, v3.conversation, ui3, pending);
-        crate::ui::render_activity(frame, v3.activity, &ui3.activity);
+        crate::ui::render_activity(
+            frame,
+            v3.activity,
+            &ui3.activity,
+            ui3.activity_scroll_offset,
+        );
         (
             v3.conversation,
             [v3.conversation, v3.separator, v3.status, v3.input],
@@ -2273,6 +2380,10 @@ pub enum Action {
     AdenGrep,
     /// Open transcript search forward (`Ctrl-F` when vim is off).
     SearchForward,
+    /// Toggle collapsed tool cards in conversation (ui3; `Ctrl-T`).
+    ToggleTools,
+    /// Toggle hidden reasoning blocks in assistant cards (ui3; `Ctrl-Shift-R`).
+    ToggleReasoning,
 }
 
 /// Map a key event while typing. Up/Down scroll the transcript (so a mouse
@@ -2308,6 +2419,10 @@ pub fn map_input_key(key: KeyEvent) -> Option<Action> {
         (KeyCode::Char('v'), KeyModifiers::CONTROL) => Some(Action::AdenView),
         (KeyCode::Char('g'), KeyModifiers::CONTROL) => Some(Action::AdenGrep),
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(Action::SearchForward),
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => Some(Action::ToggleTools),
+        (KeyCode::Char('r'), KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
+            Some(Action::ToggleReasoning)
+        }
         (KeyCode::Up, _) => Some(Action::ScrollUp),
         (KeyCode::Down, _) => Some(Action::ScrollDown),
         (KeyCode::PageUp, _) => Some(Action::PageUp),

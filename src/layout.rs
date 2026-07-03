@@ -75,6 +75,15 @@ pub fn main_pane(frame: Rect, view: &View) -> Rect {
     }
 }
 
+/// Activity drawer (ui3 only); legacy callers get zero rect.
+pub fn activity_pane(frame: Rect, view: &View) -> Rect {
+    if structured(view) {
+        areas_v3(frame, view).activity
+    } else {
+        Rect::default()
+    }
+}
+
 /// Composer/input area.
 pub fn input_area(frame: Rect, view: &View) -> Rect {
     if structured(view) {

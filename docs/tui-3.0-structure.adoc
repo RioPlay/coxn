@@ -1,5 +1,5 @@
 = coxn TUI 3.0 — structured shell
-:status: in progress
+:status: shipped (PR0–6)
 :date: 2026-07-02
 :parent: docs/tui-2.0-plan.adoc
 
@@ -27,7 +27,7 @@ spatially distinct; the harness stays gate-honest.
 | Conversation | `View.ui3.turns` ← `Message[]` | `sync_turns` after each turn; live buffer during stream
 | Activity | `View.ui3.activity` | `push_activity`, `set_activity_body`, streaming append
 | Chrome | `View.ui3.chrome` | `set_chrome` on status refresh
-| Legacy `output` | Dual-written during migration | `/copy` fallback until PR5
+| Legacy `output` | Legacy mode only | ui3 uses `export_text()` for `/copy`
 
 == Routing rules
 

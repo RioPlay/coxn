@@ -19,6 +19,8 @@ pub enum MouseEffect {
     None,
     ScrollUp,
     ScrollDown,
+    ActivityScrollUp,
+    ActivityScrollDown,
     SetCursor(usize),
     MenuRow(usize),
     Modal(Action),
@@ -31,6 +33,7 @@ pub enum MouseEffect {
 #[derive(Debug, Clone, Copy)]
 pub struct FrameLayout {
     pub pane: Rect,
+    pub activity: Rect,
     pub input: Rect,
     pub menu: Option<MenuHit>,
     pub modal: Option<ModalHit>,
@@ -54,9 +57,11 @@ pub struct ModalHit {
 /// Split the frame the same way `render` does.
 pub fn frame_layout(frame: Rect, view: &View) -> FrameLayout {
     let main = layout::main_pane(frame, view);
+    let activity = layout::activity_pane(frame, view);
     let input = layout::input_area(frame, view);
     FrameLayout {
         pane: main,
+        activity,
         input,
         menu: view.menu.as_ref().map(|m| menu_hit(frame, m)),
         modal: view.modal.as_ref().and_then(|_| modal_hit(frame, view)),
@@ -203,15 +208,15 @@ fn input_cursor_at(view: &View, input: Rect, col: u16, row: u16) -> usize {
     (line_start + byte_col).min(view.input.len())
 }
 
-fn visual_line_index(view: &View, pane: Rect, row: u16) -> Option<usize> {
+fn visual_line_index(view: &View, pane: Rect, row: u16, text: &str) -> Option<usize> {
     if !in_rect(pane, 0, row) {
         return None;
     }
     let content_width = pane.width.saturating_sub(PANE_GUTTER) as usize;
-    let total = wrapped_line_count(&view.output, content_width);
+    let total = wrapped_line_count(text, content_width);
     let pane_h = pane.height as usize;
     let max_scrollback = total.saturating_sub(pane_h) as u16;
-    let from_bottom = view.scroll_offset.min(max_scrollback);
+    let from_bottom = primary_scroll_offset(view).min(max_scrollback);
     let scroll_row = max_scrollback - from_bottom;
     let local = row.saturating_sub(pane.y) as usize;
     let idx = scroll_row as usize + local;
@@ -246,9 +251,16 @@ fn wrapped_lines(output: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn selection_text(view: &View, pane: Rect, lo: usize, hi: usize) -> String {
+fn primary_scroll_offset(view: &View) -> u16 {
+    view.ui3
+        .as_ref()
+        .map(|u| u.conv_scroll_offset)
+        .unwrap_or(view.scroll_offset)
+}
+
+fn selection_text(text: &str, pane: Rect, lo: usize, hi: usize) -> String {
     let width = pane.width.saturating_sub(PANE_GUTTER) as usize;
-    let lines = wrapped_lines(&view.output, width);
+    let lines = wrapped_lines(text, width);
     if lines.is_empty() {
         return String::new();
     }
@@ -281,8 +293,18 @@ pub fn handle_mouse(
     }
 
     match me.kind {
-        MouseEventKind::ScrollUp => return MouseEffect::ScrollUp,
-        MouseEventKind::ScrollDown => return MouseEffect::ScrollDown,
+        MouseEventKind::ScrollUp => {
+            if layout.activity.width > 0 && in_rect(layout.activity, col, row) {
+                return MouseEffect::ActivityScrollUp;
+            }
+            return MouseEffect::ScrollUp;
+        }
+        MouseEventKind::ScrollDown => {
+            if layout.activity.width > 0 && in_rect(layout.activity, col, row) {
+                return MouseEffect::ActivityScrollDown;
+            }
+            return MouseEffect::ScrollDown;
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             if in_rect(layout.input, col, row)
                 && view.modal.is_none()
@@ -294,7 +316,8 @@ pub fn handle_mouse(
                 view.transcript_drag = None;
                 return MouseEffect::SetCursor(pos);
             }
-            if let Some(vline) = visual_line_index(view, layout.pane, row) {
+            let primary = view.primary_text();
+            if let Some(vline) = visual_line_index(view, layout.pane, row, &primary) {
                 if view.modal.is_none() && view.menu.is_none() {
                     view.transcript_drag = Some((vline, vline));
                     return MouseEffect::None;
@@ -302,7 +325,8 @@ pub fn handle_mouse(
             }
         }
         MouseEventKind::Drag(MouseButton::Left) if view.transcript_drag.is_some() => {
-            if let Some(vline) = visual_line_index(view, layout.pane, row)
+            let primary = view.primary_text();
+            if let Some(vline) = visual_line_index(view, layout.pane, row, &primary)
                 && let Some((_, end)) = view.transcript_drag.as_mut()
             {
                 *end = vline;
@@ -310,7 +334,8 @@ pub fn handle_mouse(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if let Some((lo, hi)) = view.transcript_drag.take() {
-                let text = selection_text(view, layout.pane, lo, hi);
+                let primary = view.primary_text();
+                let text = selection_text(&primary, layout.pane, lo, hi);
                 if !text.is_empty() {
                     return MouseEffect::CopySelection(text);
                 }
@@ -430,7 +455,7 @@ mod tests {
         view.output = "line one\nline two".into();
         let pane = Rect::new(0, 0, 40, 10);
         view.transcript_drag = Some((0, 1));
-        let text = selection_text(&view, pane, 0, 1);
+        let text = selection_text(&view.output, pane, 0, 1);
         assert!(text.contains("line one"));
         assert!(text.contains("line two"));
     }

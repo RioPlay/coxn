@@ -184,6 +184,7 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
     view.init_ui3();
     if view.ui3_active() {
         view.activity_push("coxn", welcome(caps.available));
+        view.output.clear();
     } else {
         view.output = welcome(caps.available);
     }
@@ -345,19 +346,32 @@ fn chrome_state(
     }
 }
 
-/// Sync conversation pane and legacy output from pump messages.
+/// Sync conversation pane from pump messages (no legacy output when ui3).
 fn refresh_conversation(view: &mut View, messages: &[Message]) {
-    view.output = transcript(messages);
     view.sync_turns(messages);
     view.clear_live_turn();
+    if !view.ui3_active() {
+        view.output = transcript(messages);
+    }
 }
 
 /// Boot/sys note: activity drawer when ui3, else append to output.
 fn append_sys_note(view: &mut View, note: &str) {
+    let body = note.trim_start_matches('\n');
     if view.ui3_active() {
-        view.activity_push("sys", note.trim_start_matches('\n'));
+        view.activity_push("sys", body);
     } else {
         view.output.push_str(note);
+    }
+}
+
+/// Append a line to activity (ui3) or legacy output.
+fn append_line(view: &mut View, title: &str, line: &str) {
+    let trimmed = line.trim_start_matches('\n');
+    if view.ui3_active() {
+        view.activity_push(title, trimmed);
+    } else {
+        view.output.push_str(line);
     }
 }
 
@@ -371,17 +385,24 @@ fn show_slash_output(view: &mut View, title: &str, body: String, messages: &[Mes
     }
 }
 
-/// Append ADEN result using "aden: " prefix so the transcript renderer gives it
-/// a dedicated ⊙ sigil and distinct color. Makes the graph actions visually
-/// stand out for better scannability and user feedback.
+/// Append ADEN result — activity when ui3, legacy sigil transcript otherwise.
 fn append_aden(view: &mut View, label: &str, content: &str) {
     view.snap_to_bottom();
-    view.output.push('\n');
     let c = content.trim();
-    if c.is_empty() {
-        view.output.push_str(&format!("aden: {}", label));
+    let body = if c.is_empty() {
+        label.to_string()
     } else {
-        view.output.push_str(&format!("aden: {}\n{}", label, c));
+        format!("{label}\n{c}")
+    };
+    if view.ui3_active() {
+        view.activity_push("aden", body);
+    } else {
+        view.output.push('\n');
+        if c.is_empty() {
+            view.output.push_str(&format!("aden: {label}"));
+        } else {
+            view.output.push_str(&format!("aden: {label}\n{c}"));
+        }
     }
 }
 
@@ -1154,7 +1175,8 @@ fn copy_transcript(view: &View) -> String {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&path, &view.output) {
+    let text = view.export_text();
+    match std::fs::write(&path, &text) {
         Ok(()) => {
             let clip = if std::env::var("COXN_CLIPBOARD")
                 .ok()
@@ -1185,9 +1207,10 @@ fn append_bang_footer(view: &mut View, outcome: &sandbox::RunOutcome, cancelled:
     } else {
         return;
     };
-    view.output.push_str(&line);
     if view.ui3_active() {
         view.activity_append_live(&line);
+    } else {
+        view.output.push_str(&line);
     }
 }
 
@@ -1209,22 +1232,24 @@ async fn run_bang_shell_streaming(
     );
     if view.ui3_active() {
         view.activity_set_live(format!("!{command}"), &header);
+    } else {
+        view.output.push('\n');
+        view.output.push_str(&header);
+        view.output.push('\n');
     }
-    view.output.push('\n');
-    view.output.push_str(&header);
-    view.output.push('\n');
     view.snap_to_bottom();
     let _ = tui.draw(view);
 
     let mut cancelled = false;
     let mut live_body = header;
     let outcome = sandbox::run_streaming(dir, command, false, bwrap, &mut |line| {
-        view.output.push_str(line);
-        view.output.push('\n');
         if view.ui3_active() {
             live_body.push_str(line);
             live_body.push('\n');
             view.activity_set_live(format!("!{command}"), &live_body);
+        } else {
+            view.output.push_str(line);
+            view.output.push('\n');
         }
         view.snap_to_bottom();
         let _ = tui.draw(view);
@@ -1468,15 +1493,16 @@ impl DriveIo<'_> {
     /// Repaint the output pane with the current assistant text and any live
     /// run_command output appended below it.
     fn repaint(&mut self) {
-        // A blank line before the live coxn turn matches the inter-turn rhythm
-        // of transcript() (messages joined with a blank line).
-        self.view.output = if self.run_buf.is_empty() {
-            format!("{}\n\ncoxn: {}", self.prior, self.buf)
-        } else {
-            format!("{}\n\ncoxn: {}\n{}", self.prior, self.buf, self.run_buf)
-        };
         if self.view.ui3_active() {
             self.view.set_live_turn(&self.buf, &self.run_buf);
+        } else {
+            // A blank line before the live coxn turn matches the inter-turn rhythm
+            // of transcript() (messages joined with a blank line).
+            self.view.output = if self.run_buf.is_empty() {
+                format!("{}\n\ncoxn: {}", self.prior, self.buf)
+            } else {
+                format!("{}\n\ncoxn: {}\n{}", self.prior, self.buf, self.run_buf)
+            };
         }
         let _ = self.tui.draw(self.view);
     }
@@ -1909,8 +1935,17 @@ async fn drive(
                 let effect = handle_mouse(view, &layout, me, max_scroll);
                 let mut copy_text = None;
                 match effect {
-                    MouseEffect::ScrollUp => view.scroll_up(SCROLL_STEP, max_scroll),
-                    MouseEffect::ScrollDown => view.scroll_down(SCROLL_STEP),
+                    MouseEffect::ScrollUp => view.scroll_primary_up(SCROLL_STEP, max_scroll),
+                    MouseEffect::ScrollDown => view.scroll_primary_down(SCROLL_STEP),
+                    MouseEffect::ActivityScrollUp => {
+                        view.scroll_activity_up(
+                            SCROLL_STEP,
+                            view.max_activity_scroll(w, layout::ACTIVITY_ROWS),
+                        );
+                    }
+                    MouseEffect::ActivityScrollDown => {
+                        view.scroll_activity_down(SCROLL_STEP);
+                    }
                     MouseEffect::SetCursor(_) => {}
                     MouseEffect::MenuRow(idx) => {
                         if let Some(m) = view.menu.as_mut() {
@@ -2176,12 +2211,14 @@ async fn drive(
             let (w, h) = pane_dims(tui, view);
             match dir {
                 // j/k are single-line motions; only PageUp/Down use SCROLL_STEP.
-                Scroll::LineUp => view.scroll_up(1, view.max_scroll(w, h)),
-                Scroll::LineDown => view.scroll_down(1),
-                Scroll::HalfPageUp => view.scroll_up(h / 2, view.max_scroll(w, h)),
-                Scroll::HalfPageDown => view.scroll_down(h / 2),
-                Scroll::Top => view.scroll_up(view.max_scroll(w, h), view.max_scroll(w, h)),
-                Scroll::Bottom => view.scroll_down(view.max_scroll(w, h)),
+                Scroll::LineUp => view.scroll_primary_up(1, view.max_scroll(w, h)),
+                Scroll::LineDown => view.scroll_primary_down(1),
+                Scroll::HalfPageUp => view.scroll_primary_up(h / 2, view.max_scroll(w, h)),
+                Scroll::HalfPageDown => view.scroll_primary_down(h / 2),
+                Scroll::Top => {
+                    view.scroll_primary_up(view.max_scroll(w, h), view.max_scroll(w, h));
+                }
+                Scroll::Bottom => view.scroll_primary_down(view.max_scroll(w, h)),
             }
             continue;
         }
@@ -2191,12 +2228,14 @@ async fn drive(
             let (w, h) = pane_dims(tui, view);
             for _ in 0..n {
                 match dir {
-                    Scroll::LineUp => view.scroll_up(1, view.max_scroll(w, h)),
-                    Scroll::LineDown => view.scroll_down(1),
-                    Scroll::HalfPageUp => view.scroll_up(h / 2, view.max_scroll(w, h)),
-                    Scroll::HalfPageDown => view.scroll_down(h / 2),
-                    Scroll::Top => view.scroll_up(view.max_scroll(w, h), view.max_scroll(w, h)),
-                    Scroll::Bottom => view.scroll_down(view.max_scroll(w, h)),
+                    Scroll::LineUp => view.scroll_primary_up(1, view.max_scroll(w, h)),
+                    Scroll::LineDown => view.scroll_primary_down(1),
+                    Scroll::HalfPageUp => view.scroll_primary_up(h / 2, view.max_scroll(w, h)),
+                    Scroll::HalfPageDown => view.scroll_primary_down(h / 2),
+                    Scroll::Top => {
+                        view.scroll_primary_up(view.max_scroll(w, h), view.max_scroll(w, h));
+                    }
+                    Scroll::Bottom => view.scroll_primary_down(view.max_scroll(w, h)),
                 }
             }
             continue;
@@ -2467,7 +2506,6 @@ async fn drive(
                     let welcome_text = welcome(view.aden_active);
                     if view.ui3_active() {
                         view.activity_push("coxn", &welcome_text);
-                        view.output = welcome_text;
                         view.sync_turns(pump.messages());
                     } else {
                         view.output = welcome_text;
@@ -2724,16 +2762,23 @@ async fn drive(
             Some(Action::HistoryNext) => view.history_next(),
             Some(Action::ScrollUp) => {
                 let (w, h) = pane_dims(tui, view);
-                view.scroll_up(SCROLL_STEP, view.max_scroll(w, h));
+                view.scroll_primary_up(SCROLL_STEP, view.max_scroll(w, h));
             }
-            Some(Action::ScrollDown) => view.scroll_down(SCROLL_STEP),
+            Some(Action::ScrollDown) => view.scroll_primary_down(SCROLL_STEP),
             Some(Action::PageUp) => {
                 let (w, h) = pane_dims(tui, view);
-                view.scroll_up(h, view.max_scroll(w, h));
+                view.scroll_primary_up(h, view.max_scroll(w, h));
             }
             Some(Action::PageDown) => {
                 let (_, h) = pane_dims(tui, view);
-                view.scroll_down(h);
+                view.scroll_primary_down(h);
+            }
+            Some(Action::ToggleTools) if view.ui3_active() => {
+                view.toggle_tools_collapsed();
+            }
+            Some(Action::ToggleReasoning) if view.ui3_active() => {
+                view.toggle_reasoning_hidden();
+                view.sync_turns(pump.messages());
             }
             // ADEN actions via Ctrl shortcuts (available in Insert mode too).
             // Lets "average joe" use powerful context without learning Normal vim mode.
@@ -3022,7 +3067,6 @@ async fn drive(
                             let welcome_text = welcome(view.aden_active);
                             if view.ui3_active() {
                                 view.activity_push("coxn", &welcome_text);
-                                view.output = welcome_text;
                                 view.sync_turns(pump.messages());
                             } else {
                                 view.output = welcome_text;
@@ -3143,7 +3187,6 @@ async fn drive(
                                 if view.ui3_active() {
                                     view.activity_set_live("/execute", &report);
                                     view.activity_finish_live();
-                                    view.output = format_execute_report(&report);
                                 } else {
                                     view.output = format_execute_report(&report);
                                 }
@@ -3242,11 +3285,10 @@ async fn drive(
                         // A quiet per-turn timing footer in the transcript -- the
                         // record keeps it after the live status bar moves on.
                         if let Some(e) = turn_elapsed.filter(|_| !cancelled) {
-                            let note = format!("\nsys: done in {:.1}s", e.as_secs_f64());
-                            view.output.push_str(&note);
-                            if view.ui3_active() {
-                                view.activity_push("sys", note.trim_start_matches('\n'));
-                            }
+                            append_sys_note(
+                                view,
+                                &format!("\nsys: done in {:.1}s", e.as_secs_f64()),
+                            );
                         }
                         // Refresh the model + savings + context status after the turn.
                         let status = status_line(
@@ -3274,11 +3316,15 @@ async fn drive(
                 // message often carries diff-like text; confirm_with_diff
                 // routes it through paint_diff_line so +/- hunks render.
                 if let Some(block) = pump.take_block() {
-                    view.output.push_str(&format!(
-                        "\nsys: GATE BLOCKED — {} — change reverted\n{}",
-                        block.verdict.label(),
-                        block.message
-                    ));
+                    append_line(
+                        view,
+                        "gate",
+                        &format!(
+                            "GATE BLOCKED — {} — change reverted\n{}",
+                            block.verdict.label(),
+                            block.message
+                        ),
+                    );
                     let prompt = format!("GATE BLOCKED: {}", block.verdict.label());
                     view.confirm_with_diff(prompt, block.message.clone());
                 }

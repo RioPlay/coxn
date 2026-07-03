@@ -52,6 +52,18 @@
 **Tests:** 320 pass; clippy clean
 
 **Next:** dogfood gates, PR5 remove dual-write, PR6 polish
+
+### Pass 4 — 2026-07-02 (TUI 3.0 PR5–6 complete)
+
+**Shipped:**
+- Removed ui3 dual-write: conversation/activity own channels; `/copy` via `export_text()`
+- Conversation + activity scroll (mouse wheel targets pane under cursor)
+- Tool collapse (`Ctrl-T`), reasoning hide (`Ctrl-Shift-R`)
+- `strip_reasoning` for `<think>` blocks in assistant cards
+
+**Tests:** 323 pass; clippy clean
+
+**Residual:** default `COXN_TUI3=1` after dogfood; aden vim paths still write legacy output when ui3 off only
 - Other env vars in tests without locks (lower priority)
 
 **Quick fix after re-review:** `partition cancelled` appends instead of replacing transcript

@@ -23,6 +23,14 @@ Run after each meaningful diff batch, before continuing feature work.
 - [ ] Help overlay and README agree on risk disclosure
 - [ ] Live progress does not destroy transcript
 
+## TUI 3.0 (`COXN_TUI3=1`)
+
+- [ ] Chrome shows model + scope without scrolling conversation
+- [ ] `/execute` and slash listings land in activity drawer only
+- [ ] Conversation cards distinguish you / coxn / tool in <3s scan
+- [ ] `/copy` exports conversation + activity via `export_text()`
+- [ ] `Ctrl-T` / `Ctrl-Shift-R` toggle tools collapse and reasoning hide
+
 ## Tests
 
 - [ ] No parallel `set_var`/`remove_var` on process env without lock

@@ -33,8 +33,29 @@ pub struct TurnView {
     pub tools: Vec<String>,
 }
 
+/// Strip model reasoning blocks from assistant text when the user hides them.
+pub fn strip_reasoning(text: &str) -> String {
+    let mut out = text.to_string();
+    for tag in ["think", "thinking", "reasoning"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        while let Some(start) = out.find(&open) {
+            if let Some(end) = out[start..].find(&close) {
+                let end = start + end + close.len();
+                out.replace_range(start..end, "");
+            } else {
+                break;
+            }
+        }
+    }
+    while out.contains("  ") {
+        out = out.replace("  ", " ");
+    }
+    out.trim().to_string()
+}
+
 impl TurnView {
-    pub fn from_message(m: &Message) -> Self {
+    pub fn from_message(m: &Message, hide_reasoning: bool) -> Self {
         match m.role {
             Role::User => Self {
                 role: TurnRole::User,
@@ -60,9 +81,14 @@ impl TurnView {
             }
             Role::Assistant => {
                 let tools = m.tool_calls.iter().map(tool_call_card).collect();
+                let body = if hide_reasoning {
+                    strip_reasoning(&m.content)
+                } else {
+                    m.content.clone()
+                };
                 Self {
                     role: TurnRole::Assistant,
-                    body: m.content.clone(),
+                    body,
                     tools,
                 }
             }
@@ -70,7 +96,7 @@ impl TurnView {
     }
 
     /// Format as a bordered card for the conversation pane (plain text).
-    pub fn format_card(&self) -> String {
+    pub fn format_card(&self, collapse_tools: bool) -> String {
         let title = self.role.label();
         let mut lines = vec![format!("╭─ {title} ─")];
         if !self.body.is_empty() {
@@ -78,8 +104,18 @@ impl TurnView {
                 lines.push(format!("│ {line}"));
             }
         }
-        for t in &self.tools {
-            lines.push(format!("│ {t}"));
+        if !self.tools.is_empty() {
+            if collapse_tools && self.tools.len() > 1 {
+                lines.push(format!(
+                    "│ {}  … +{} tools (Ctrl+T expand)",
+                    self.tools[0],
+                    self.tools.len() - 1
+                ));
+            } else {
+                for t in &self.tools {
+                    lines.push(format!("│ {t}"));
+                }
+            }
         }
         if lines.len() == 1 {
             lines.push("│ (empty)".to_string());
@@ -116,13 +152,18 @@ pub struct LiveTurn {
 }
 
 impl LiveTurn {
-    pub fn format_card(&self) -> String {
+    pub fn format_card(&self, hide_reasoning: bool, collapse_tools: bool) -> String {
+        let body = if hide_reasoning {
+            strip_reasoning(&self.body)
+        } else {
+            self.body.clone()
+        };
         let turn = TurnView {
             role: TurnRole::Assistant,
-            body: self.body.clone(),
+            body,
             tools: Vec::new(),
         };
-        let mut card = turn.format_card();
+        let mut card = turn.format_card(collapse_tools);
         if !self.run_buf.is_empty() {
             card.push('\n');
             for line in self.run_buf.lines() {
@@ -212,26 +253,68 @@ impl ActivityLog {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ui3State {
     pub chrome: ChromeState,
     pub turns: Vec<TurnView>,
     pub live: Option<LiveTurn>,
     pub activity: ActivityLog,
-    pub conv_scroll: u16,
+    /// Conversation scroll: distance-from-bottom in visual lines (0 = pinned).
+    pub conv_scroll_offset: u16,
+    /// Activity drawer scroll: distance-from-bottom in visual lines.
+    pub activity_scroll_offset: u16,
+    /// Collapse multi-tool assistant turns to one line + count.
+    pub tools_collapsed: bool,
+    /// Hide `<think>`-style reasoning blocks in assistant cards.
+    pub reasoning_hidden: bool,
+}
+
+impl Default for Ui3State {
+    fn default() -> Self {
+        Self {
+            chrome: ChromeState::default(),
+            turns: Vec::new(),
+            live: None,
+            activity: ActivityLog::default(),
+            conv_scroll_offset: 0,
+            activity_scroll_offset: 0,
+            tools_collapsed: true,
+            reasoning_hidden: true,
+        }
+    }
 }
 
 impl Ui3State {
     pub fn sync_turns(&mut self, messages: &[Message]) {
-        self.turns = messages.iter().map(TurnView::from_message).collect();
+        self.turns = messages
+            .iter()
+            .map(|m| TurnView::from_message(m, self.reasoning_hidden))
+            .collect();
     }
 
     pub fn conversation_text(&self) -> String {
-        let mut parts: Vec<String> = self.turns.iter().map(|t| t.format_card()).collect();
+        let mut parts: Vec<String> = self
+            .turns
+            .iter()
+            .map(|t| t.format_card(self.tools_collapsed))
+            .collect();
         if let Some(ref live) = self.live {
-            parts.push(live.format_card());
+            parts.push(live.format_card(self.reasoning_hidden, self.tools_collapsed));
         }
         parts.join("\n\n")
+    }
+
+    /// Full export: conversation cards + activity log (for `/copy`).
+    pub fn export_text(&self) -> String {
+        let conv = self.conversation_text();
+        let activity = self.activity.display_text();
+        if activity.is_empty() {
+            conv
+        } else if conv.is_empty() {
+            activity
+        } else {
+            format!("{conv}\n\n--- activity ---\n{activity}")
+        }
     }
 }
 
@@ -242,10 +325,27 @@ mod tests {
 
     #[test]
     fn turn_card_formats_user_message() {
-        let t = TurnView::from_message(&Message::new(Role::User, "fix the bug"));
-        let card = t.format_card();
+        let t = TurnView::from_message(&Message::new(Role::User, "fix the bug"), false);
+        let card = t.format_card(false);
         assert!(card.contains("╭─ you"));
         assert!(card.contains("fix the bug"));
+    }
+
+    #[test]
+    fn strip_reasoning_removes_think_blocks() {
+        let raw = "answer<think>secret</think> tail";
+        assert_eq!(strip_reasoning(raw), "answer tail");
+    }
+
+    #[test]
+    fn collapsed_tools_show_count() {
+        let t = TurnView {
+            role: TurnRole::Assistant,
+            body: "ok".into(),
+            tools: vec!["▸ read a".into(), "▸ edit b".into()],
+        };
+        let card = t.format_card(true);
+        assert!(card.contains("+1 tools"));
     }
 
     #[test]
@@ -258,6 +358,17 @@ mod tests {
         assert!(text.contains("done"));
         assert!(text.contains("running"));
         assert!(text.contains("line1"));
+    }
+
+    #[test]
+    fn export_text_includes_activity_section() {
+        let mut ui = Ui3State::default();
+        ui.sync_turns(&[Message::new(Role::User, "hi")]);
+        ui.activity.push("/model", "models...");
+        let text = ui.export_text();
+        assert!(text.contains("hi"));
+        assert!(text.contains("activity"));
+        assert!(text.contains("models"));
     }
 
     #[test]
