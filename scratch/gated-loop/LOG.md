@@ -146,4 +146,24 @@
 
 **Also:** `execute_partition_resolves_distinct_role_routes_without_aden` test
 
-**Next:** commit branch; live partition smoke when model+aden available; ship feat/cli-piggybacks-grok-claude
+**Commit:** `bc3d5c1` + doctor auto-detect fix on `feat/cli-piggybacks-grok-claude`
+
+### Pass 11 — 2026-07-03 (doctor parity + wedge)
+
+**Shipped:** `coxn doctor` uses `discover::detect_cli` / `detect_ollama_native` — no false OFFLINE STUB when grok/claude logged in
+
+**Validated:** `scripts/demo-scope-escape.sh` green with grok auto-detect CLI
+
+### Loop status — 2026-07-03
+
+**Branch objectives (N6/N10b/N11 + onboarding): COMPLETE**
+- Grok/Claude/Codex CLI piggybacks, shared NDJSON seam, streaming idle, cancel hygiene
+- Auto-detect + hot-reload + palette onboarding + in-TUI set-key
+- Role routing without aden; hermetic scout/synth tests
+
+**Remaining PLAN items (out of scope for this branch or blocked):**
+- Live `/execute` partition smoke (needs aden + live model on host)
+- Live Ollama smoke (no `ollama` binary here)
+- Optional Anthropic-direct API profile (deferred in PLAN)
+- README scope-escape GIF (docs asset)
+- Ship: merge `feat/cli-piggybacks-grok-claude` → main via PR
