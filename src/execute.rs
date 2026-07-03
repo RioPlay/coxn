@@ -165,6 +165,30 @@ impl TurnIo for LedgerBatchIo<'_> {
     }
 }
 
+/// Optional sink for live `/execute` progress (full report snapshot per update).
+pub(crate) struct ExecuteProgress<'a> {
+    callback: Option<&'a mut dyn FnMut(&str)>,
+}
+
+impl<'a> ExecuteProgress<'a> {
+    pub(crate) fn new(callback: &'a mut dyn FnMut(&str)) -> Self {
+        Self {
+            callback: Some(callback),
+        }
+    }
+
+    fn emit(&mut self, report: &str) {
+        if let Some(cb) = &mut self.callback {
+            cb(report);
+        }
+    }
+}
+
+fn append_report(report: &mut String, progress: &mut ExecuteProgress<'_>, chunk: &str) {
+    report.push_str(chunk);
+    progress.emit(report);
+}
+
 /// Run the aden task partition. With `COXN_EXECUTE_JOBS > 1` (and a fresh,
 /// non-resumed run) the parallel wave scheduler runs independent read-only
 /// scopes concurrently on worker threads; mutating scopes always serialize on
@@ -176,12 +200,13 @@ pub(crate) async fn execute_partition(
     sel: &ModelSel,
     bwrap: bool,
     resume: bool,
+    progress: ExecuteProgress<'_>,
 ) -> String {
     let jobs = execute_jobs();
     if jobs > 1 && !resume {
-        return execute_partition_parallel(dir, caps, sel, bwrap, jobs).await;
+        return execute_partition_parallel(dir, caps, sel, bwrap, jobs, progress).await;
     }
-    execute_partition_sequential(dir, caps, sel, bwrap, resume).await
+    execute_partition_sequential(dir, caps, sel, bwrap, resume, progress).await
 }
 
 /// Parse `COXN_EXECUTE_JOBS` (default `1`, clamped `1..=8`). Values above `1`
@@ -202,6 +227,7 @@ async fn execute_partition_sequential(
     sel: &ModelSel,
     bwrap: bool,
     resume: bool,
+    mut progress: ExecuteProgress<'_>,
 ) -> String {
     let Some((name, seeds, budget)) = task_config() else {
         return "set COXN_TASK_NAME + COXN_TASK_SEEDS first (see /scope)".to_string();
@@ -251,18 +277,23 @@ async fn execute_partition_sequential(
         ordered.len(),
         ledger.run()
     );
+    progress.emit(&report);
     let mut run_status = "success";
     for (i, scope) in ordered.iter().enumerate() {
         if let Some(prior) = prior_statuses.get(&scope.id)
             && prior.status == "success"
         {
-            report.push_str(&format!(
-                "  ✓ [{}/{}] {} ({}) — skipped (complete)\n",
-                i + 1,
-                ordered.len(),
-                scope.id,
-                scope.role
-            ));
+            append_report(
+                &mut report,
+                &mut progress,
+                &format!(
+                    "  ✓ [{}/{}] {} ({}) — skipped (complete)\n",
+                    i + 1,
+                    ordered.len(),
+                    scope.id,
+                    scope.role
+                ),
+            );
             if !prior.result.is_empty() {
                 upstream.push_str(&format!("\n--- {} ---\n{}\n", scope.id, prior.result));
             }
@@ -312,13 +343,17 @@ async fn execute_partition_sequential(
             .ok()
             .flatten()
             .unwrap_or(budget);
-        report.push_str(&format!(
-            "  ⟳ [{}/{}] {} ({}) — running…\n",
-            i + 1,
-            ordered.len(),
-            scope.id,
-            scope.role
-        ));
+        append_report(
+            &mut report,
+            &mut progress,
+            &format!(
+                "  ⟳ [{}/{}] {} ({}) — running…\n",
+                i + 1,
+                ordered.len(),
+                scope.id,
+                scope.role
+            ),
+        );
         let mut context = AGENT_PREAMBLE_BASE.to_string();
         context.push_str(AGENT_PREAMBLE_ADEN);
         context.push_str(&format!(
@@ -365,16 +400,20 @@ async fn execute_partition_sequential(
                         )
                     })
                     .unwrap_or_else(|| format!(", budget {scope_budget}"));
-                report.push_str(&format!(
-                    "  ✓ [{}/{}] {} ({}, {}, {}{}) — done\n",
-                    i + 1,
-                    ordered.len(),
-                    scope.id,
-                    scope.role,
-                    policy.label(),
-                    sub_sel.label(),
-                    usage
-                ));
+                append_report(
+                    &mut report,
+                    &mut progress,
+                    &format!(
+                        "  ✓ [{}/{}] {} ({}, {}, {}{}) — done\n",
+                        i + 1,
+                        ordered.len(),
+                        scope.id,
+                        scope.role,
+                        policy.label(),
+                        sub_sel.label(),
+                        usage
+                    ),
+                );
                 upstream.push_str(&format!("\n--- {} ---\n{}\n", scope.id, result));
                 ledger.append(
                     "scope_finished",
@@ -388,13 +427,17 @@ async fn execute_partition_sequential(
                 );
             }
             Err(e) => {
-                report.push_str(&format!(
-                    "  ✗ [{}/{}] {} ({}) — error: {e}\n",
-                    i + 1,
-                    ordered.len(),
-                    scope.id,
-                    scope.role
-                ));
+                append_report(
+                    &mut report,
+                    &mut progress,
+                    &format!(
+                        "  ✗ [{}/{}] {} ({}) — error: {e}\n",
+                        i + 1,
+                        ordered.len(),
+                        scope.id,
+                        scope.role
+                    ),
+                );
                 run_status = "error";
                 ledger.append(
                     "scope_finished",
@@ -407,8 +450,8 @@ async fn execute_partition_sequential(
         }
     }
     ledger.append("run_finished", None, None, json!({ "status": run_status }));
-    report.push_str("\n=== merged upstream ===\n");
-    report.push_str(&upstream);
+    append_report(&mut report, &mut progress, "\n=== merged upstream ===\n");
+    append_report(&mut report, &mut progress, &upstream);
     report
 }
 // === Parallel wave scheduler (COXN_EXECUTE_JOBS > 1) ============================
@@ -711,6 +754,7 @@ async fn execute_partition_parallel(
     sel: &ModelSel,
     bwrap: bool,
     jobs: usize,
+    mut progress: ExecuteProgress<'_>,
 ) -> String {
     let Some((name, seeds, budget)) = task_config() else {
         return "set COXN_TASK_NAME + COXN_TASK_SEEDS first (see /scope)".to_string();
@@ -749,6 +793,7 @@ async fn execute_partition_parallel(
         ledger.run(),
         jobs
     );
+    progress.emit(&report);
     let mut upstream = String::new();
     let mut completed: HashSet<String> = HashSet::new();
     let mut failed_ids: HashSet<String> = HashSet::new();
@@ -772,10 +817,14 @@ async fn execute_partition_parallel(
             for &i in &pending {
                 run_status = "error";
                 reported += 1;
-                report.push_str(&format!(
-                    "  ✗ [{reported}/{total}] {} ({}) — blocked by an unmet dependency\n",
-                    ordered[i].id, ordered[i].role
-                ));
+                append_report(
+                    &mut report,
+                    &mut progress,
+                    &format!(
+                        "  ✗ [{reported}/{total}] {} ({}) — blocked by an unmet dependency\n",
+                        ordered[i].id, ordered[i].role
+                    ),
+                );
             }
             break;
         }
@@ -859,10 +908,14 @@ async fn execute_partition_parallel(
                         )
                     })
                     .unwrap_or_else(|| format!(", budget {}", outcome.budget));
-                report.push_str(&format!(
-                    "  ✓ [{reported}/{total}] {} ({}, {}, {}){} — done\n",
-                    scope.id, scope.role, outcome.policy_label, outcome.label, usage
-                ));
+                append_report(
+                    &mut report,
+                    &mut progress,
+                    &format!(
+                        "  ✓ [{reported}/{total}] {} ({}, {}, {}){} — done\n",
+                        scope.id, scope.role, outcome.policy_label, outcome.label, usage
+                    ),
+                );
                 upstream.push_str(&format!("\n--- {} ---\n{}\n", scope.id, outcome.result));
                 completed.insert(scope.id.clone());
                 ledger.append(
@@ -877,12 +930,16 @@ async fn execute_partition_parallel(
             } else {
                 run_status = "error";
                 failed_ids.insert(scope.id.clone());
-                report.push_str(&format!(
-                    "  ✗ [{reported}/{total}] {id} ({role}) — error: {err}\n",
-                    id = scope.id,
-                    role = scope.role,
-                    err = outcome.error
-                ));
+                append_report(
+                    &mut report,
+                    &mut progress,
+                    &format!(
+                        "  ✗ [{reported}/{total}] {id} ({role}) — error: {err}\n",
+                        id = scope.id,
+                        role = scope.role,
+                        err = outcome.error
+                    ),
+                );
                 ledger.append(
                     "scope_finished",
                     Some(&scope.id),
@@ -900,8 +957,8 @@ async fn execute_partition_parallel(
     }
 
     ledger.append("run_finished", None, None, json!({ "status": run_status }));
-    report.push_str("\n=== merged upstream ===\n");
-    report.push_str(&upstream);
+    append_report(&mut report, &mut progress, "\n=== merged upstream ===\n");
+    append_report(&mut report, &mut progress, &upstream);
     report
 }
 #[cfg(test)]
@@ -939,6 +996,20 @@ mod tests {
         assert!(!names.contains(&"edit".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
         assert!(!names.contains(&"run_command".to_string()));
+    }
+
+    #[test]
+    fn append_report_emits_on_every_append() {
+        let mut snapshots = Vec::new();
+        let mut capture = |r: &str| snapshots.push(r.to_string());
+        let mut progress = ExecuteProgress::new(&mut capture);
+        let mut report = "executing partition 't' (2 scopes)…\n".to_string();
+        progress.emit(&report);
+        append_report(&mut report, &mut progress, "  ⟳ [1/2] scout — running…\n");
+        append_report(&mut report, &mut progress, "  ✓ [1/2] scout — done\n");
+        assert_eq!(snapshots.len(), 3);
+        assert!(snapshots[2].contains("✓ [1/2] scout"));
+        assert_eq!(report, snapshots[2]);
     }
 
     #[test]

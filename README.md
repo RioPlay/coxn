@@ -240,7 +240,7 @@ status line is honest about which mode is active.
 /copy            save transcript to ~/.local/share/coxn/last-transcript.txt
 /auth status     check configured provider auth
 /auth login <id> print native login or key setup command
-/execute         run aden task partition sequentially
+/execute         run aden task partition (live ✓/⟳/✗ progress in transcript)
 ```
 
 CLI:

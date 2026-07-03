@@ -2870,8 +2870,24 @@ async fn drive(
                                     "executing partition…".to_string()
                                 });
                                 let _ = tui.draw(view);
-                                view.output =
-                                    execute::execute_partition(dir, caps, sel, bwrap, resume).await;
+                                let format_execute_report =
+                                    |report: &str| format!("sys: /execute\n{report}");
+                                let mut on_execute_progress = |report: &str| {
+                                    view.output = format_execute_report(report);
+                                    view.snap_to_bottom();
+                                    let _ = tui.draw(view);
+                                };
+                                view.output = format_execute_report(
+                                    &execute::execute_partition(
+                                        dir,
+                                        caps,
+                                        sel,
+                                        bwrap,
+                                        resume,
+                                        execute::ExecuteProgress::new(&mut on_execute_progress),
+                                    )
+                                    .await,
+                                );
                             } else {
                                 view.output = "partition cancelled".to_string();
                             }

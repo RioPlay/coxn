@@ -14,14 +14,14 @@ pre-apply diff; vim modes opt-in; discovery via palette and `@` files.
   `@` fuzzy file picker; tool cards in transcript; README/help binding sync
 * Epic 1B: trust ladder status chips; `COXN_AUTO_APPROVE` warnings in doctor/boot
 * Epic 4 (partial): `/undo` (git checkout last edit); `/export` markdown
-* Epic 5 (partial): `/execute` confirm card; ✓/⟳/✗ progress symbols in report
+* Epic 5 (partial): `/execute` confirm card; live ✓/⟳/✗ progress in transcript
 * Epic 3 polish: `!` shell prefix; `mode: CHAT` status; `?` help; boot mode tip
 
 == Remaining (non-blocking)
 
 * Epic 3: reasoning block toggle
 * Epic 4: richer `/copy` + session card polish
-* Epic 5: live partition progress lanes in transcript
+* Epic 5: per-scope sub-agent streaming (scope body still batch)
 * Epic 6: `drive/` module split; full PTY approval-key smoke in CI
 
 == Key bindings (default chat-first)
