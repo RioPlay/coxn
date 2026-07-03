@@ -2946,7 +2946,7 @@ async fn drive(
                                     .await,
                                 );
                             } else {
-                                view.output = "partition cancelled".to_string();
+                                view.output.push_str("\nsys: partition cancelled\n");
                             }
                             view.set_status(status_line(
                                 dir,

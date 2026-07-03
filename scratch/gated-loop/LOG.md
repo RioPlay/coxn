@@ -27,4 +27,17 @@
 - Tests: `ENV_TEST_LOCK` mutex for `COXN_VIM` mutations
 - Docs: README/help/welcome disclose gate + sandbox
 
-**Status:** awaiting re-review
+**Status:** pass 2 accepted (`207b7ff`) — P1 closed, residual P2 documented
+
+### Pass 2 — 2026-07-02 (review fixes)
+
+**Commit:** `207b7ff`
+
+**gstack re-review verdict:** Accept — ungated `!cmd` and transcript wipe fixed; `/execute` cancel between scopes; env test locks.
+
+**Residual (accepted / backlog):**
+- Cancel during single-scope `run_turn_streaming` (needs TurnIo hook)
+- Parallel wave in-flight workers not interrupted on cancel
+- Other env vars in tests without locks (lower priority)
+
+**Quick fix after re-review:** `partition cancelled` appends instead of replacing transcript
