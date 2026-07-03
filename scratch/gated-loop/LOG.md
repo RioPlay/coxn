@@ -183,6 +183,6 @@
 **Shipped:**
 - `execute_route_guard_blocks_text_only_role_route` test (scout → grok-cli)
 - Health stack green; `demo-scope-escape.sh` wedge green with grok auto-detect
-- Branch pushed; PR opened for `feat/cli-piggybacks-grok-claude` → main
+- Branch pushed; PR #3 opened for `feat/cli-piggybacks-grok-claude` → main
 
 **Loop closed:** N6/N10b/N11 + onboarding + loose ends complete. Live partition/Ollama smoke remain host-dependent open items in PLAN.
