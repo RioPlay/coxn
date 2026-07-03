@@ -73,6 +73,8 @@
 - Help overlay documents structured shell keys
 
 **Tests:** 325 pass
+
+**Commit:** `6e9a4f7`
 - Other env vars in tests without locks (lower priority)
 
 **Quick fix after re-review:** `partition cancelled` appends instead of replacing transcript
