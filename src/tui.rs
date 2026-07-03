@@ -1994,7 +1994,7 @@ pub fn render(frame: &mut Frame, view: &View) {
             ("Ctrl-F / Ctrl-Shift-F", Some("transcript search (vim off)")),
             ("@", Some("attach project file (fuzzy picker)")),
             ("!cmd", Some("run shell locally (sandboxed), no model turn")),
-            ("g? or /help", Some("this help (vim modes need COXN_VIM=1)")),
+            ("? / g? / /help", Some("help overlay (? when input empty in chat mode)")),
             ("mouse wheel", Some("scrolls transcript")),
             ("", None),
             ("PICKER (open menu)", None),

@@ -14,11 +14,12 @@ pre-apply diff; vim modes opt-in; discovery via palette and `@` files.
   `@` fuzzy file picker; tool cards in transcript; README/help binding sync
 * Epic 1B: trust ladder status chips; `COXN_AUTO_APPROVE` warnings in doctor/boot
 * Epic 4 (partial): `/undo` (git checkout last edit); `/export` markdown
-* Epic 5 (partial): `/execute` confirm card with partition preview
+* Epic 5 (partial): `/execute` confirm card; ✓/⟳/✗ progress symbols in report
+* Epic 3 polish: `!` shell prefix; `mode: CHAT` status; `?` help; boot mode tip
 
 == Remaining (non-blocking)
 
-* Epic 3: `!` shell prefix in composer; reasoning block toggle
+* Epic 3: reasoning block toggle
 * Epic 4: richer `/copy` + session card polish
 * Epic 5: live partition progress lanes in transcript
 * Epic 6: `drive/` module split; full PTY approval-key smoke in CI
@@ -30,7 +31,8 @@ pre-apply diff; vim modes opt-in; discovery via palette and `@` files.
 | Ctrl-Space / Ctrl-P | Fuzzy palette |
 | Ctrl-F / Ctrl-Shift-F | Transcript search (vim off) |
 | @ | Attach project file |
-| g? | Help overlay |
+| ? / g? | Help overlay (? when input empty) |
+| !cmd | Run shell locally (sandboxed), no model turn |
 | o/s/d/x | Tool approval (modal) |
 | y/n | Gate block proceed/cancel |
 
