@@ -285,7 +285,7 @@ New follow-up phases:
 * [ ] A8 Claude environment presets: document and example-config an
   OpenRouter-through-Claude profile using `env.ANTHROPIC_*` and a dedicated
   `home_path`; make `auth login` print the exact HOME-scoped commands.
-* [ ] A9 CLI backend MVP: `AnyModel::CliPiggyback` for Codex first, text-only
+* [x] A9 CLI backend MVP: `AnyModel::CodexPiggyback` for Codex first, text-only
   turns through `codex app-server`, no tool parity. Preserve coxn's approval/gate
   boundary by keeping coxn tools on the coxn side.
 * [ ] A10 Claude backend MVP: spawn Claude with per-instance `HOME` and env;

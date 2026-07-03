@@ -12,9 +12,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 
 use crate::app::{
-    AGENT_PREAMBLE_ADEN, AGENT_PREAMBLE_BASE, ModelSel, openai_model, resolve_instance_from_config,
-    resolve_role, task_config,
+    AGENT_PREAMBLE_ADEN, AGENT_PREAMBLE_BASE, ModelSel, openai_model, rebuild_codex_model,
+    resolve_instance_from_config, resolve_role, task_config,
 };
+use crate::codex_model::{self, CODEX_ENDPOINT_SCHEME};
 use crate::commands::{Command, complete_input, parse_command};
 use crate::model::{AnyModel, Message, Role, StubModel, ThinkingLevel, ToolCall, Usage};
 use crate::mouse::{MouseEffect, frame_layout, handle_mouse, osc52_copy};
@@ -334,10 +335,34 @@ fn resolve_model(dir: &Path, caps: &aden::AdenCaps) -> (AnyModel, ModelSel) {
 /// Render the `/model` listing: every model the provider advertises (loaded or
 /// not), the active one marked. Falls back to the label when there is no
 /// provider or the listing cannot be fetched.
-fn model_listing(sel: &ModelSel) -> String {
+fn model_listing(dir: &Path, sel: &ModelSel) -> String {
     let Some(e) = &sel.endpoint else {
         return format!("model: {}", sel.label());
     };
+    if e.base_url.starts_with(CODEX_ENDPOINT_SCHEME) {
+        let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) else {
+            return format!("model: {}", sel.label());
+        };
+        let cfg = provider::load_config(dir);
+        let instance = cfg.instance(&e.instance_id);
+        let codex_home = instance.and_then(|i| i.shadow_home.as_deref().or(i.home_path.as_deref()));
+        let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
+        return match codex_model::list_models(binary, codex_home, env) {
+            Some(models) if !models.is_empty() => {
+                let mut out = format!("models on {binary} (/model <name|#> to switch):\n");
+                for (i, m) in models.iter().enumerate() {
+                    let mark = if *m == sel.name { '*' } else { ' ' };
+                    out.push_str(&format!("  {mark} {:>2}. {m}\n", i + 1));
+                }
+                out.push_str("(* = active; codex CLI piggyback — text-only turns)");
+                out
+            }
+            _ => format!(
+                "model: {}  (could not list models from {binary})",
+                sel.label()
+            ),
+        };
+    }
     match openai::list_models(&e.base_url, e.key.as_deref()) {
         Some(models) if !models.is_empty() => {
             // Best-effort load state, so the user can pick a hot model and skip a
@@ -384,6 +409,29 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
     let Some(e) = &sel.endpoint else {
         return "no provider to switch on (offline stub)".to_string();
     };
+    if e.base_url.starts_with(CODEX_ENDPOINT_SCHEME) {
+        let cfg = provider::load_config(dir);
+        let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) else {
+            return "invalid codex endpoint".to_string();
+        };
+        let instance = cfg.instance(&e.instance_id);
+        let codex_home = instance.and_then(|i| i.shadow_home.as_deref().or(i.home_path.as_deref()));
+        let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
+        let listed = codex_model::list_models(binary, codex_home, env).unwrap_or_default();
+        let chosen = match target.parse::<usize>() {
+            Ok(n) => match listed.get(n.wrapping_sub(1)) {
+                Some(m) => m.clone(),
+                None => return format!("no model #{n} (there are {})", listed.len()),
+            },
+            Err(_) => target.to_string(),
+        };
+        let Some(model) = rebuild_codex_model(dir, sel, chosen.clone()) else {
+            return "failed to rebuild codex model".to_string();
+        };
+        pump.set_model(model);
+        sel.name = chosen;
+        return format!("switched to {}", sel.label());
+    }
     let listed = openai::list_models(&e.base_url, e.key.as_deref()).unwrap_or_default();
     let chosen = match target.parse::<usize>() {
         Ok(n) => match listed.get(n.wrapping_sub(1)) {
@@ -402,13 +450,26 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
 }
 /// Build the `/model` picker (every advertised model, hot ones marked, the
 /// active one starred). `None` for the offline stub or an unreachable endpoint.
-fn model_menu(sel: &ModelSel) -> Option<Menu> {
+fn model_menu(dir: &Path, sel: &ModelSel) -> Option<Menu> {
     let e = sel.endpoint.as_ref()?;
-    let models = openai::list_models(&e.base_url, e.key.as_deref())?;
+    let models = if e.base_url.starts_with(CODEX_ENDPOINT_SCHEME) {
+        let binary = codex_model::codex_binary_from_endpoint(&e.base_url)?;
+        let cfg = provider::load_config(dir);
+        let instance = cfg.instance(&e.instance_id);
+        let codex_home = instance.and_then(|i| i.shadow_home.as_deref().or(i.home_path.as_deref()));
+        let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
+        codex_model::list_models(binary, codex_home, env)?
+    } else {
+        openai::list_models(&e.base_url, e.key.as_deref())?
+    };
     if models.is_empty() {
         return None;
     }
-    let loaded = openai::loaded_models(&e.base_url, e.key.as_deref()).unwrap_or_default();
+    let loaded = if e.base_url.starts_with(CODEX_ENDPOINT_SCHEME) {
+        Vec::new()
+    } else {
+        openai::loaded_models(&e.base_url, e.key.as_deref()).unwrap_or_default()
+    };
     let selected = models.iter().position(|m| *m == sel.name).unwrap_or(0);
     let items = models
         .into_iter()
@@ -470,7 +531,7 @@ fn session_menu() -> Option<Menu> {
 }
 
 /// Fuzzy unified palette (M4): slash verbs, models, sessions, recent commands.
-fn palette_menu(sel: &ModelSel, history: &[String]) -> Menu {
+fn palette_menu(dir: &Path, sel: &ModelSel, history: &[String]) -> Menu {
     let mut catalog: Vec<MenuItem> = Vec::new();
 
     for cmd in crate::commands::COMMANDS {
@@ -480,7 +541,7 @@ fn palette_menu(sel: &ModelSel, history: &[String]) -> Menu {
         });
     }
 
-    if let Some(model_picker) = model_menu(sel) {
+    if let Some(model_picker) = model_menu(dir, sel) {
         for item in model_picker.items {
             catalog.push(MenuItem {
                 label: format!("model  {}", item.label),
@@ -1551,7 +1612,7 @@ async fn drive(
                 .as_ref()
                 .is_none_or(|m| m.kind != MenuKind::Palette)
             {
-                view.open_palette(palette_menu(sel, &view.history));
+                view.open_palette(palette_menu(dir, sel, &view.history));
             }
             continue;
         }
@@ -1911,9 +1972,9 @@ async fn drive(
                 ExCmd::Help => view.toggle_help(),
                 ExCmd::Model(None) => {
                     refresh_discovery(dir, pump, sel, true);
-                    match model_menu(sel) {
+                    match model_menu(dir, sel) {
                         Some(menu) => view.open_menu(menu),
-                        None => view.output = model_listing(sel),
+                        None => view.output = model_listing(dir, sel),
                     }
                 }
                 ExCmd::Model(Some(target)) => {
@@ -2287,9 +2348,9 @@ async fn drive(
                             // Re-discover first: a backend started after boot is
                             // selectable now, no reboot.
                             refresh_discovery(dir, pump, sel, true);
-                            match model_menu(sel) {
+                            match model_menu(dir, sel) {
                                 Some(menu) => view.open_menu(menu),
-                                None => view.output = model_listing(sel),
+                                None => view.output = model_listing(dir, sel),
                             }
                         }
                         Command::Model(Some(target)) => {

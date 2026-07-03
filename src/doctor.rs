@@ -96,6 +96,9 @@ pub fn run(dir: &Path) -> i32 {
                         blocking = true;
                     }
                     println!("{line}");
+                    if matches!(outcome, codex_probe::CodexProbeOutcome::Authenticated(_)) {
+                        println!("  exec: codex CLI piggyback (text-only turns)");
+                    }
                 }
                 provider::ProviderDriver::ClaudeCli => {
                     let bin = instance.binary.as_deref().unwrap_or("claude");

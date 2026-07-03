@@ -274,10 +274,15 @@ impl<M: Model> Pump<M> {
 
     /// Build the request for the current conversation state.
     fn request(&self) -> ModelRequest {
+        let tools = if self.model.supports_tool_calling() {
+            self.tools.advertised_defs()
+        } else {
+            Vec::new()
+        };
         ModelRequest {
             system: self.system.clone(),
             messages: self.messages.clone(),
-            tools: self.tools.advertised_defs(),
+            tools,
             thinking: self.thinking,
         }
     }

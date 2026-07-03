@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Codex CLI piggyback backend** (`AnyModel::CodexPiggyback`): text-only turns
+  through `codex app-server` (`thread/start` + `turn/start`); `coxn auth setup codex`
+  preset; `/model` lists Codex models when active instance uses `driver = "codex"`.
+  coxn tool schemas are not forwarded (chat-only on Codex instances).
+
 ## [0.3.2.0] - 2026-07-02
 
 ### Changed

@@ -224,6 +224,12 @@ impl std::error::Error for ModelError {}
 /// (Anthropic, OpenAI, local, ...) is one implementation; the pump never names
 /// one. The returned future is `Send` so the seam composes with any runtime.
 pub trait Model {
+    /// Whether this backend accepts coxn tool definitions on each request.
+    /// CLI piggyback backends that only do text turns return `false`.
+    fn supports_tool_calling(&self) -> bool {
+        true
+    }
+
     fn call(
         &self,
         request: ModelRequest,
@@ -292,14 +298,25 @@ pub enum AnyModel {
     Stub(StubModel),
     OpenAiCompat(crate::openai::OpenAiCompatModel),
     Ollama(crate::ollama::OllamaModel),
+    CodexPiggyback(crate::codex_model::CodexPiggybackModel),
 }
 
 impl Model for AnyModel {
+    fn supports_tool_calling(&self) -> bool {
+        match self {
+            AnyModel::Stub(model) => model.supports_tool_calling(),
+            AnyModel::OpenAiCompat(model) => model.supports_tool_calling(),
+            AnyModel::Ollama(model) => model.supports_tool_calling(),
+            AnyModel::CodexPiggyback(model) => model.supports_tool_calling(),
+        }
+    }
+
     async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
         match self {
             AnyModel::Stub(model) => model.call(request).await,
             AnyModel::OpenAiCompat(model) => model.call(request).await,
             AnyModel::Ollama(model) => model.call(request).await,
+            AnyModel::CodexPiggyback(model) => model.call(request).await,
         }
     }
 
@@ -314,6 +331,7 @@ impl Model for AnyModel {
             AnyModel::Stub(model) => model.stream(request, on_delta).await,
             AnyModel::OpenAiCompat(model) => model.stream(request, on_delta).await,
             AnyModel::Ollama(model) => model.stream(request, on_delta).await,
+            AnyModel::CodexPiggyback(model) => model.stream(request, on_delta).await,
         }
     }
 }

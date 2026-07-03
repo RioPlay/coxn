@@ -181,6 +181,15 @@ pub fn presets() -> &'static [ProviderPreset] {
             model: "x-ai/grok-2-1212",
             needs_key: true,
         },
+        ProviderPreset {
+            id: "codex",
+            label: "Codex CLI (app-server piggyback)",
+            instance_id: "codex",
+            driver: "codex",
+            base_url: "",
+            model: "gpt-5.4-mini",
+            needs_key: false,
+        },
     ]
 }
 

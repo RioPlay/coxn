@@ -16,6 +16,11 @@ driver = "openai_compat"
 base_url = "https://api.openai.com/v1"
 enabled = false
 
+[provider.codex]
+driver = "codex"
+binary = "codex"
+enabled = false
+
 [route]
 active = "local:qwen2.5-coder"
 scout = "local:qwen2.5-coder"
@@ -24,4 +29,4 @@ orchestrate = "local:llama3"
 
 # Presets (coxn auth setup <id>):
 #   local-ollama, ollama-native, lmstudio
-#   openai, openrouter-claude, openrouter-gpt, openrouter-gemini, openrouter-grok
+#   openai, openrouter-claude, openrouter-gpt, openrouter-gemini, openrouter-grok, codex

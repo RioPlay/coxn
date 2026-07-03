@@ -13,6 +13,9 @@
 
 use std::path::Path;
 
+use std::path::PathBuf;
+
+use crate::codex_model::{self, CODEX_ENDPOINT_SCHEME, CodexPiggybackModel};
 use crate::model::{AnyModel, StubModel};
 use crate::{aden, ollama, openai, provider};
 
@@ -73,6 +76,38 @@ pub(crate) fn openai_model(
                 instance_id,
                 base_url,
                 key,
+                source: source.into(),
+            }),
+        },
+    )
+}
+
+/// Build a Codex CLI piggyback model paired with its selection state.
+pub(crate) fn codex_model(
+    instance_id: String,
+    binary: String,
+    model: String,
+    codex_home: Option<String>,
+    env: Vec<(String, String)>,
+    cwd: PathBuf,
+    source: impl Into<String>,
+) -> (AnyModel, ModelSel) {
+    let endpoint = format!("{CODEX_ENDPOINT_SCHEME}{binary}");
+    let backend = AnyModel::CodexPiggyback(CodexPiggybackModel::new(
+        binary.clone(),
+        model.clone(),
+        codex_home,
+        env,
+        cwd,
+    ));
+    (
+        backend,
+        ModelSel {
+            name: model,
+            endpoint: Some(Endpoint {
+                instance_id,
+                base_url: endpoint,
+                key: None,
                 source: source.into(),
             }),
         },
@@ -161,10 +196,57 @@ pub(crate) fn resolve_instance_from_config(
                 source,
             ))
         }
-        provider::ProviderDriver::Codex
-        | provider::ProviderDriver::ClaudeCli
-        | provider::ProviderDriver::Unknown(_) => None,
+        provider::ProviderDriver::Codex => {
+            let binary = instance
+                .binary
+                .clone()
+                .unwrap_or_else(|| "codex".to_string());
+            if !crate::codex_app_server::binary_installed(&binary) {
+                return None;
+            }
+            let cwd = std::env::current_dir().ok()?;
+            let codex_home = instance
+                .shadow_home
+                .clone()
+                .or_else(|| instance.home_path.clone());
+            Some(codex_model(
+                instance.id.clone(),
+                binary,
+                selection.model,
+                codex_home,
+                instance.env.clone(),
+                cwd,
+                source,
+            ))
+        }
+        provider::ProviderDriver::ClaudeCli | provider::ProviderDriver::Unknown(_) => None,
     }
+}
+
+/// Rebuild the active Codex backend after `/model` switches model name.
+pub(crate) fn rebuild_codex_model(
+    dir: &Path,
+    sel: &ModelSel,
+    model_name: String,
+) -> Option<AnyModel> {
+    let endpoint = sel.endpoint.as_ref()?;
+    let binary = codex_model::codex_binary_from_endpoint(&endpoint.base_url)?;
+    let cfg = provider::load_config(dir);
+    let instance = cfg.instance(&endpoint.instance_id)?;
+    if !matches!(instance.driver, provider::ProviderDriver::Codex) {
+        return None;
+    }
+    let codex_home = instance
+        .shadow_home
+        .clone()
+        .or_else(|| instance.home_path.clone());
+    Some(AnyModel::CodexPiggyback(CodexPiggybackModel::new(
+        binary.to_string(),
+        model_name,
+        codex_home,
+        instance.env.clone(),
+        dir,
+    )))
 }
 
 /// Resolve a role to an `instance:model` selection via `[route]`.

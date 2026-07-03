@@ -7,6 +7,8 @@ mod aden;
 mod agents;
 mod app;
 mod auth;
+mod codex_app_server;
+mod codex_model;
 mod codex_probe;
 mod commands;
 mod doctor;
