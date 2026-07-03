@@ -8,8 +8,10 @@
 | 2026-07-02 | `ENV_TEST_LOCK` for `COXN_VIM` / `COXN_AUTO_APPROVE` tests | Parallel test flake from process-global env |
 | 2026-07-02 | `scratch/gated-loop/` tracking | User asked for improving loop with memory of what works |
 
+| 2026-07-02 | `partition cancelled` appends to transcript | Pass-2 P3: decline confirm no longer wipes chat |
+
 ## Not yet in loop (candidates)
 
 - Poll cancel during single-scope `pump.run_turn_streaming` (needs TurnIo hook)
-- `partition cancelled` should append not replace transcript
+- Shared global `ENV_TEST_LOCK` across modules (vs per-module mutexes)
 - O(n²) execute progress snapshots on huge merged upstream — throttle or diff-append
