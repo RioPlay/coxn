@@ -8,7 +8,7 @@ spatially distinct; the harness stays gate-honest.
 
 == Enable
 
-`COXN_TUI3=1` (or `on`/`true`/`yes`). Default off until dogfood passes.
+On by default. Set `COXN_TUI3=0` (or `off`/`false`/`no`) for legacy single-pane.
 
 == Regions
 

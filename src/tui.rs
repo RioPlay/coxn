@@ -2150,7 +2150,7 @@ pub fn render(frame: &mut Frame, view: &View) {
     // Help overlay: Ledger-styled cheatsheet, topmost so it renders over any
     // other overlay. Closed by Esc / q / ? (wired in the event loop).
     if view.show_help {
-        let help_lines: Vec<Line<'static>> = [
+        let mut help_entries: Vec<(&str, Option<&str>)> = vec![
             // COCKPIT - ADEN graph harness for high velocity coding
             ("COCKPIT (ADEN graph)", None),
             (
@@ -2249,28 +2249,56 @@ pub fn render(frame: &mut Frame, view: &View) {
                 Some("ADEN symbol actions (understand/view/impact + more)"),
             ),
             ("", None),
-            ("Esc  q  ?", Some("close this overlay")),
-        ]
-        .iter()
-        .map(|(key, desc)| {
-            if key.is_empty() {
-                // blank separator row
-                Line::from("")
-            } else if let Some(d) = desc {
-                // key in ACCENT, separator in QUIET, description in DIM
-                Line::from(vec![
-                    Span::styled(format!("{key:<18}"), Style::default().fg(ACCENT)),
-                    Span::styled(d.to_string(), Style::default().fg(DIM)),
-                ])
-            } else {
-                // section header in SECONDARY (slightly brighter than DIM)
-                Line::from(Span::styled(
-                    key.to_string(),
-                    Style::default().fg(SECONDARY),
-                ))
-            }
-        })
-        .collect();
+        ];
+        if view.ui3_active() {
+            help_entries.extend([
+                ("STRUCTURED SHELL", None),
+                (
+                    "chrome bar",
+                    Some("model · scope · trust · aden always visible"),
+                ),
+                (
+                    "conversation",
+                    Some("turn cards — chat never replaced by /commands"),
+                ),
+                (
+                    "activity drawer",
+                    Some("/execute, !cmd, slash output, aden results"),
+                ),
+                ("Ctrl-T", Some("collapse multi-tool assistant cards")),
+                (
+                    "Ctrl-Shift-R",
+                    Some("show/hide reasoning blocks in assistant text"),
+                ),
+                (
+                    "wheel on activity",
+                    Some("scroll activity drawer; wheel elsewhere scrolls chat"),
+                ),
+                ("", None),
+            ]);
+        }
+        help_entries.push(("Esc  q  ?", Some("close this overlay")));
+        let help_lines: Vec<Line<'static>> = help_entries
+            .iter()
+            .map(|(key, desc)| {
+                if key.is_empty() {
+                    // blank separator row
+                    Line::from("")
+                } else if let Some(d) = desc {
+                    // key in ACCENT, separator in QUIET, description in DIM
+                    Line::from(vec![
+                        Span::styled(format!("{key:<18}"), Style::default().fg(ACCENT)),
+                        Span::styled(d.to_string(), Style::default().fg(DIM)),
+                    ])
+                } else {
+                    // section header in SECONDARY (slightly brighter than DIM)
+                    Line::from(Span::styled(
+                        key.to_string(),
+                        Style::default().fg(SECONDARY),
+                    ))
+                }
+            })
+            .collect();
 
         // Width: widest line content (key col + desc col) or a floor of 44.
         let content_width: u16 = help_lines

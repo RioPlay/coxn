@@ -1,6 +1,6 @@
 //! TUI 3.0 structured shell — turn model, activity feed, region render.
 //!
-//! Opt-in via `COXN_TUI3=1`. Legacy single-pane render remains default.
+//! Structured shell by default; set `COXN_TUI3=0` for legacy single-pane.
 
 pub mod render;
 pub mod transcript;
@@ -8,9 +8,34 @@ pub mod transcript;
 pub use render::{render_activity, render_chrome, render_conversation};
 pub use transcript::{ChromeState, LiveTurn, Ui3State};
 
-/// True when structured TUI 3.0 layout is enabled.
+/// True when structured TUI 3.0 layout is enabled (default on; `COXN_TUI3=0` disables).
 pub fn enabled() -> bool {
-    std::env::var("COXN_TUI3")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "on" | "true" | "yes"))
+    match std::env::var("COXN_TUI3").ok().as_deref() {
+        Some("0" | "off" | "false" | "no") => false,
+        Some(_) | None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn enabled_by_default() {
+        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        unsafe { std::env::remove_var("COXN_TUI3") };
+        assert!(enabled());
+    }
+
+    #[test]
+    fn disabled_when_zero() {
+        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        unsafe { std::env::set_var("COXN_TUI3", "0") };
+        assert!(!enabled());
+        unsafe { std::env::remove_var("COXN_TUI3") };
+    }
 }

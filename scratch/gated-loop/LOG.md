@@ -64,6 +64,15 @@
 **Tests:** 323 pass; clippy clean
 
 **Residual:** default `COXN_TUI3=1` after dogfood; aden vim paths still write legacy output when ui3 off only
+
+### Pass 5 — 2026-07-02 (default-on + feed routing)
+
+**Shipped:**
+- `COXN_TUI3` default on (`0` disables legacy pane)
+- All aden/vim/ex/sys feeds route through `push_feed` / `append_aden` when ui3
+- Help overlay documents structured shell keys
+
+**Tests:** 325 pass
 - Other env vars in tests without locks (lower priority)
 
 **Quick fix after re-review:** `partition cancelled` appends instead of replacing transcript

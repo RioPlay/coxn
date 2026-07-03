@@ -375,6 +375,16 @@ fn append_line(view: &mut View, title: &str, line: &str) {
     }
 }
 
+/// Feed a prefixed line (`aden:`, `sys:`, etc.) to activity or legacy output.
+fn push_feed(view: &mut View, prefix: &str, body: &str) {
+    if view.ui3_active() {
+        view.activity_push(prefix, body);
+    } else {
+        view.output.push('\n');
+        view.output.push_str(&format!("{prefix}: {body}"));
+    }
+}
+
 /// Slash/listing output: activity when ui3 without wiping conversation.
 fn show_slash_output(view: &mut View, title: &str, body: String, messages: &[Message]) {
     if view.ui3_active() {
@@ -1714,13 +1724,14 @@ fn dispatch_menu_pick(
                             append_aden(view, &format!("understand '{}'", sym), &out);
                             view.last_aden = Some(format!("understand '{}'", sym));
                         }
-                        Err(e) => view
-                            .output
-                            .push_str(&format!("\naden: understand failed: {e}")),
+                        Err(e) => push_feed(view, "aden", &format!("understand failed: {e}")),
                     }
                 } else {
-                    view.output
-                        .push_str(&format!("\naden: (not present) would understand: {}", sym));
+                    push_feed(
+                        view,
+                        "aden",
+                        &format!("(not present) would understand: {sym}"),
+                    );
                 }
                 view.snap_to_bottom();
             } else if value.starts_with("ADEN_VIEW:") {
@@ -1728,15 +1739,13 @@ fn dispatch_menu_pick(
                 if pump.registry_mut().has_aden() {
                     match aden::launch_view(dir, Some(sym)) {
                         Ok(()) => {
-                            view.output
-                                .push_str(&format!("\naden: launched view for '{}'", sym));
-                            view.last_aden = Some(format!("view '{}'", sym));
+                            push_feed(view, "aden", &format!("launched view for '{sym}'"));
+                            view.last_aden = Some(format!("view '{sym}'"));
                         }
-                        Err(e) => view.output.push_str(&format!("\naden: view failed: {e}")),
+                        Err(e) => push_feed(view, "aden", &format!("view failed: {e}")),
                     }
                 } else {
-                    view.output
-                        .push_str(&format!("\naden: (not present) would view: {}", sym));
+                    push_feed(view, "aden", &format!("(not present) would view: {sym}"));
                 }
                 view.snap_to_bottom();
             } else if value.starts_with("ADEN_IMPACT:") {
@@ -1747,11 +1756,10 @@ fn dispatch_menu_pick(
                             append_aden(view, &format!("impact '{}'", sym), &out);
                             view.last_aden = Some(format!("impact '{}'", sym));
                         }
-                        Err(e) => view.output.push_str(&format!("\naden: impact failed: {e}")),
+                        Err(e) => push_feed(view, "aden", &format!("impact failed: {e}")),
                     }
                 } else {
-                    view.output
-                        .push_str(&format!("\naden: (not present) would impact: {}", sym));
+                    push_feed(view, "aden", &format!("(not present) would impact: {sym}"));
                 }
                 view.snap_to_bottom();
             } else if value == "ADEN_COMMUNITIES" {
@@ -1761,13 +1769,10 @@ fn dispatch_menu_pick(
                             append_aden(view, "communities", &out);
                             view.last_aden = Some("communities".to_string());
                         }
-                        Err(e) => view
-                            .output
-                            .push_str(&format!("\naden: communities failed: {e}")),
+                        Err(e) => push_feed(view, "aden", &format!("communities failed: {e}")),
                     }
                 } else {
-                    view.output
-                        .push_str("\naden: (not present) would show communities");
+                    push_feed(view, "aden", "(not present) would show communities");
                 }
                 view.snap_to_bottom();
             } else if value == "ADEN_DOCTOR" {
@@ -1777,11 +1782,10 @@ fn dispatch_menu_pick(
                             append_aden(view, "doctor", &out);
                             view.last_aden = Some("doctor".to_string());
                         }
-                        Err(e) => view.output.push_str(&format!("\naden: doctor failed: {e}")),
+                        Err(e) => push_feed(view, "aden", &format!("doctor failed: {e}")),
                     }
                 } else {
-                    view.output
-                        .push_str("\naden: (not present) would run doctor");
+                    push_feed(view, "aden", "(not present) would run doctor");
                 }
                 view.snap_to_bottom();
             } else if value == "ADEN_AUDIT" {
@@ -1791,11 +1795,10 @@ fn dispatch_menu_pick(
                             append_aden(view, "audit", &out);
                             view.last_aden = Some("audit".to_string());
                         }
-                        Err(e) => view.output.push_str(&format!("\naden: audit failed: {e}")),
+                        Err(e) => push_feed(view, "aden", &format!("audit failed: {e}")),
                     }
                 } else {
-                    view.output
-                        .push_str("\naden: (not present) would run audit");
+                    push_feed(view, "aden", "(not present) would run audit");
                 }
                 view.snap_to_bottom();
             } else {
@@ -2032,15 +2035,15 @@ async fn drive(
                 (KeyCode::Char('r'), KeyModifiers::NONE) => {
                     handled_offline_key = true;
                     if let Some(note) = refresh_discovery(dir, pump, sel, true) {
-                        view.output.push('\n');
-                        view.output.push_str(&format!("sys: {note}"));
+                        append_sys_note(view, &format!("\nsys: {note}"));
                     } else {
-                        view.output.push('\n');
-                        view.output
-                            .push_str("sys: still offline — start a model server and retry");
+                        append_sys_note(
+                            view,
+                            "\nsys: still offline — start a model server and retry",
+                        );
                     }
                     if !sel.is_offline_stub() {
-                        view.output.push_str("\nsys: model online — ready to chat");
+                        append_sys_note(view, "\nsys: model online — ready to chat");
                         view.set_status(boot_status(&sel.label(), task, caps.available));
                     }
                 }
@@ -2305,9 +2308,10 @@ async fn drive(
         // Vim-native aden symbol navigation: K or gd on a word at input cursor.
         if let Outcome::AdenLookup(ref sym) = vim_outcome {
             if sym.is_empty() {
-                view.output.push('\n');
-                view.output.push_str(
-                    "aden: place cursor on a symbol word in the input (or use :understand <sym>)",
+                push_feed(
+                    view,
+                    "aden",
+                    "place cursor on a symbol word in the input (or use :understand <sym>)",
                 );
                 continue;
             }
@@ -2318,24 +2322,25 @@ async fn drive(
                         view.last_aden = Some(format!("understand '{}'", sym));
                     }
                     Err(e) => {
-                        view.output.push('\n');
-                        view.output
-                            .push_str(&format!("aden: understand '{}' failed: {e}", sym));
+                        push_feed(view, "aden", &format!("understand '{sym}' failed: {e}"));
                     }
                 }
             } else {
-                view.output.push('\n');
-                view.output
-                    .push_str(&format!("aden: (not present) would understand: {}", sym));
+                push_feed(
+                    view,
+                    "aden",
+                    &format!("(not present) would understand: {sym}"),
+                );
             }
             continue;
         }
         // ga : assemble context for symbol at cursor.
         if let Outcome::AdenAsm(ref sym) = vim_outcome {
             if sym.is_empty() {
-                view.output.push('\n');
-                view.output.push_str(
-                    "aden: place cursor on a symbol word in the input (or use :asm via understand)",
+                push_feed(
+                    view,
+                    "aden",
+                    "place cursor on a symbol word in the input (or use :asm via understand)",
                 );
                 continue;
             }
@@ -2345,16 +2350,10 @@ async fn drive(
                         append_aden(view, &format!("asm '{}'", sym), &out);
                         view.last_aden = Some(format!("asm '{}'", sym));
                     }
-                    Err(e) => {
-                        view.output.push('\n');
-                        view.output
-                            .push_str(&format!("aden: asm '{}' failed: {e}", sym));
-                    }
+                    Err(e) => push_feed(view, "aden", &format!("asm '{sym}' failed: {e}")),
                 }
             } else {
-                view.output.push('\n');
-                view.output
-                    .push_str(&format!("aden: (not present) would asm: {}", sym));
+                push_feed(view, "aden", &format!("(not present) would asm: {sym}"));
             }
             continue;
         }
@@ -2362,25 +2361,20 @@ async fn drive(
         // gi : impact / blast radius.
         if let Outcome::AdenImpact(ref sym) = vim_outcome {
             if sym.is_empty() {
-                view.output.push('\n');
-                view.output.push_str(
-                    "aden: place cursor on a symbol word in the input (or use :impact <sym>)",
+                push_feed(
+                    view,
+                    "aden",
+                    "place cursor on a symbol word in the input (or use :impact <sym>)",
                 );
                 continue;
             }
             if pump.registry_mut().has_aden() {
                 match aden::pull(dir, aden::Pull::Impact(sym)) {
                     Ok(out) => append_aden(view, &format!("impact '{}'", sym), &out),
-                    Err(e) => {
-                        view.output.push('\n');
-                        view.output
-                            .push_str(&format!("aden: impact '{}' failed: {e}", sym));
-                    }
+                    Err(e) => push_feed(view, "aden", &format!("impact '{sym}' failed: {e}")),
                 }
             } else {
-                view.output.push('\n');
-                view.output
-                    .push_str(&format!("aden: (not present) would impact: {}", sym));
+                push_feed(view, "aden", &format!("(not present) would impact: {sym}"));
             }
             continue;
         }
@@ -2388,30 +2382,24 @@ async fn drive(
         // gv : launch aden view for symbol at cursor.
         if let Outcome::AdenView(ref sym) = vim_outcome {
             if sym.is_empty() {
-                view.output.push('\n');
-                view.output
-                    .push_str("aden: place cursor on a symbol word (or use :view [sym])");
+                push_feed(
+                    view,
+                    "aden",
+                    "place cursor on a symbol word (or use :view [sym])",
+                );
                 continue;
             }
             if pump.registry_mut().has_aden() {
                 match aden::launch_view(dir, Some(sym)) {
                     Ok(()) => {
                         view.snap_to_bottom();
-                        view.output.push('\n');
-                        view.output
-                            .push_str(&format!("aden: launched view for '{}'", sym));
-                        view.last_aden = Some(format!("view '{}'", sym));
+                        push_feed(view, "aden", &format!("launched view for '{sym}'"));
+                        view.last_aden = Some(format!("view '{sym}'"));
                     }
-                    Err(e) => {
-                        view.output.push('\n');
-                        view.output
-                            .push_str(&format!("aden: view '{}' failed: {e}", sym));
-                    }
+                    Err(e) => push_feed(view, "aden", &format!("view '{sym}' failed: {e}")),
                 }
             } else {
-                view.output.push('\n');
-                view.output
-                    .push_str(&format!("aden: (not present) would view: {}", sym));
+                push_feed(view, "aden", &format!("(not present) would view: {sym}"));
             }
             continue;
         }
@@ -2419,27 +2407,23 @@ async fn drive(
         // / : aden grep on word at cursor (fuzzy search style).
         if let Outcome::AdenGrep(ref pat) = vim_outcome {
             if pat.is_empty() {
-                view.output.push('\n');
-                view.output
-                    .push_str("grep: move cursor over a word or type pattern first");
+                push_feed(
+                    view,
+                    "grep",
+                    "move cursor over a word or type pattern first",
+                );
                 continue;
             }
             if pump.registry_mut().has_aden() {
                 match aden::pull(dir, aden::Pull::Grep(pat)) {
                     Ok(out) => {
-                        append_aden(view, &format!("grep '{}'", pat), &out);
-                        view.last_aden = Some(format!("grep '{}'", pat));
+                        append_aden(view, &format!("grep '{pat}'"), &out);
+                        view.last_aden = Some(format!("grep '{pat}'"));
                     }
-                    Err(e) => {
-                        view.output.push('\n');
-                        view.output
-                            .push_str(&format!("aden: grep '{}' failed: {e}", pat));
-                    }
+                    Err(e) => push_feed(view, "aden", &format!("grep '{pat}' failed: {e}")),
                 }
             } else {
-                view.output.push('\n');
-                view.output
-                    .push_str(&format!("(aden not present) would grep: {pat}"));
+                push_feed(view, "aden", &format!("(not present) would grep: {pat}"));
             }
             continue;
         }
@@ -2449,16 +2433,10 @@ async fn drive(
             if pump.registry_mut().has_aden() {
                 match aden::communities(dir) {
                     Ok(out) => append_aden(view, "communities", &out),
-                    Err(e) => {
-                        view.output.push('\n');
-                        view.output
-                            .push_str(&format!("aden: communities failed: {e}"));
-                    }
+                    Err(e) => push_feed(view, "aden", &format!("communities failed: {e}")),
                 }
             } else {
-                view.output.push('\n');
-                view.output
-                    .push_str("(aden not present) would show communities");
+                push_feed(view, "aden", "(not present) would show communities");
             }
             continue;
         }
@@ -2528,50 +2506,47 @@ async fn drive(
                     if pump.registry_mut().has_aden() {
                         match aden::pull(dir, aden::Pull::Understand(&sym)) {
                             Ok(out) => {
-                                append_aden(view, &format!("understand '{}'", sym), &out);
-                                view.last_aden = Some(format!("understand '{}'", sym));
+                                append_aden(view, &format!("understand '{sym}'"), &out);
+                                view.last_aden = Some(format!("understand '{sym}'"));
                             }
                             Err(e) => {
-                                view.output.push('\n');
-                                view.output
-                                    .push_str(&format!("aden: understand '{}' error: {e}", sym));
+                                push_feed(view, "aden", &format!("understand '{sym}' error: {e}"));
                             }
                         }
                     } else {
-                        view.output.push('\n');
-                        view.output
-                            .push_str("aden not available (install aden and generate a graph)");
+                        push_feed(
+                            view,
+                            "aden",
+                            "not available (install aden and generate a graph)",
+                        );
                     }
                 }
                 ExCmd::Grep(pat) => {
                     if pump.registry_mut().has_aden() {
                         match aden::pull(dir, aden::Pull::Grep(&pat)) {
-                            Ok(out) => append_aden(view, &format!("grep '{}'", pat), &out),
-                            Err(e) => {
-                                view.output.push('\n');
-                                view.output
-                                    .push_str(&format!("aden: grep '{}' error: {e}", pat));
-                            }
+                            Ok(out) => append_aden(view, &format!("grep '{pat}'"), &out),
+                            Err(e) => push_feed(view, "aden", &format!("grep '{pat}' error: {e}")),
                         }
                     } else {
-                        view.output.push('\n');
-                        view.output
-                            .push_str("aden not available (install aden and generate a graph)");
+                        push_feed(
+                            view,
+                            "aden",
+                            "not available (install aden and generate a graph)",
+                        );
                     }
                 }
                 ExCmd::Ask(question) => {
                     if pump.registry_mut().has_aden() {
                         match aden::pull(dir, aden::Pull::Ask(&question)) {
-                            Ok(out) => append_aden(view, &format!("ask '{}'", question), &out),
-                            Err(e) => {
-                                view.output.push('\n');
-                                view.output.push_str(&format!("aden: ask error: {e}"));
-                            }
+                            Ok(out) => append_aden(view, &format!("ask '{question}'"), &out),
+                            Err(e) => push_feed(view, "aden", &format!("ask error: {e}")),
                         }
                     } else {
-                        view.output.push('\n');
-                        view.output
-                            .push_str("aden not available (install aden and generate a graph)");
+                        push_feed(
+                            view,
+                            "aden",
+                            "not available (install aden and generate a graph)",
+                        );
                     }
                 }
                 ExCmd::View(anchor) => {
@@ -2579,108 +2554,79 @@ async fn drive(
                         match aden::launch_view(dir, anchor.as_deref()) {
                             Ok(()) => {
                                 let label = anchor.as_deref().unwrap_or("<root>");
-                                view.output.push('\n');
-                                view.output.push_str(&format!(
-                                    "aden: launched view for {} (see browser)",
-                                    label
-                                ));
+                                push_feed(
+                                    view,
+                                    "aden",
+                                    &format!("launched view for {label} (see browser)"),
+                                );
                             }
-                            Err(e) => {
-                                view.output.push('\n');
-                                view.output.push_str(&format!("aden: view failed: {e}"));
-                            }
+                            Err(e) => push_feed(view, "aden", &format!("view failed: {e}")),
                         }
                     } else {
-                        view.output.push('\n');
-                        view.output.push_str("aden not available for :view");
+                        push_feed(view, "aden", "not available for :view");
                     }
                 }
                 ExCmd::Viz(anchor) => {
                     if pump.registry_mut().has_aden() {
                         match aden::diagram(dir, anchor.as_deref()) {
                             Ok(out) => {
-                                view.output.push('\n');
-                                view.output.push_str("aden: mermaid\n```mermaid\n");
-                                view.output.push_str(out.trim());
-                                view.output.push_str("\n```");
+                                append_aden(
+                                    view,
+                                    "mermaid",
+                                    &format!("```mermaid\n{}\n```", out.trim()),
+                                );
                             }
-                            Err(e) => {
-                                view.output.push('\n');
-                                view.output.push_str(&format!("aden: viz failed: {e}"));
-                            }
+                            Err(e) => push_feed(view, "aden", &format!("viz failed: {e}")),
                         }
                     } else {
-                        view.output.push('\n');
-                        view.output
-                            .push_str("aden not available for :viz/:mermaid/:gm");
+                        push_feed(view, "aden", "not available for :viz/:mermaid/:gm");
                     }
                 }
                 ExCmd::Doctor => {
                     if pump.registry_mut().has_aden() {
                         match aden::doctor(dir) {
                             Ok(out) => append_aden(view, "doctor", &out),
-                            Err(e) => {
-                                view.output.push('\n');
-                                view.output.push_str(&format!("aden: doctor failed: {e}"));
-                            }
+                            Err(e) => push_feed(view, "aden", &format!("doctor failed: {e}")),
                         }
                     } else {
-                        view.output.push('\n');
-                        view.output.push_str("aden not available for :doctor");
+                        push_feed(view, "aden", "not available for :doctor");
                     }
                 }
                 ExCmd::Impact(sym) => {
                     if pump.registry_mut().has_aden() {
-                        // Use query impact or understand (understand already includes downstream).
-                        // For explicit, fall back to understand for now (rich output).
                         match aden::pull(dir, aden::Pull::Impact(&sym)) {
-                            Ok(out) => append_aden(view, &format!("impact '{}'", sym), &out),
+                            Ok(out) => append_aden(view, &format!("impact '{sym}'"), &out),
                             Err(e) => {
-                                view.output.push('\n');
-                                view.output
-                                    .push_str(&format!("aden: impact '{}' failed: {e}", sym));
+                                push_feed(view, "aden", &format!("impact '{sym}' failed: {e}"));
                             }
                         }
                     } else {
-                        view.output.push('\n');
-                        view.output.push_str("aden not available for :impact");
+                        push_feed(view, "aden", "not available for :impact");
                     }
                 }
                 ExCmd::Communities => {
                     if pump.registry_mut().has_aden() {
                         match aden::communities(dir) {
                             Ok(out) => append_aden(view, "communities", &out),
-                            Err(e) => {
-                                view.output.push('\n');
-                                view.output
-                                    .push_str(&format!("aden: communities failed: {e}"));
-                            }
+                            Err(e) => push_feed(view, "aden", &format!("communities failed: {e}")),
                         }
                     } else {
-                        view.output.push('\n');
-                        view.output.push_str("aden not available for :communities");
+                        push_feed(view, "aden", "not available for :communities");
                     }
                 }
                 ExCmd::Audit => {
                     if pump.registry_mut().has_aden() {
                         match aden::audit(dir) {
                             Ok(out) => append_aden(view, "audit", &out),
-                            Err(e) => {
-                                view.output.push('\n');
-                                view.output.push_str(&format!("aden: audit failed: {e}"));
-                            }
+                            Err(e) => push_feed(view, "aden", &format!("audit failed: {e}")),
                         }
                     } else {
-                        view.output.push('\n');
-                        view.output.push_str("aden not available for :audit");
+                        push_feed(view, "aden", "not available for :audit");
                     }
                 }
                 ExCmd::Unknown(s) => {
-                    if s.is_empty() {
-                        // Bare ':' + Enter with no text: silently ignore.
-                    } else {
-                        view.output.push('\n');
-                        view.output.push_str(&format!("not a command: {s}"));
+                    if !s.is_empty() {
+                        push_feed(view, "ex", &format!("not a command: {s}"));
                     }
                 }
             }
@@ -2785,94 +2731,89 @@ async fn drive(
             Some(Action::AdenUnderstand) => {
                 let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
                 if sym.is_empty() {
-                    view.output.push('\n');
-                    view.output.push_str(
-                        "aden: no word at cursor for understand (Ctrl-L or :understand sym)",
+                    push_feed(
+                        view,
+                        "aden",
+                        "no word at cursor for understand (Ctrl-L or :understand sym)",
                     );
                 } else if pump.registry_mut().has_aden() {
                     match aden::pull(dir, aden::Pull::Understand(&sym)) {
                         Ok(out) => {
-                            append_aden(view, &format!("understand '{}'", sym), &out);
-                            view.last_aden = Some(format!("understand '{}'", sym));
+                            append_aden(view, &format!("understand '{sym}'"), &out);
+                            view.last_aden = Some(format!("understand '{sym}'"));
                         }
-                        Err(e) => view
-                            .output
-                            .push_str(&format!("\naden: understand failed: {e}")),
+                        Err(e) => push_feed(view, "aden", &format!("understand failed: {e}")),
                     }
                 } else {
-                    view.output.push('\n');
-                    view.output
-                        .push_str(&format!("aden: (not present) would understand: {}", sym));
+                    push_feed(
+                        view,
+                        "aden",
+                        &format!("(not present) would understand: {sym}"),
+                    );
                 }
             }
             Some(Action::AdenAsm) => {
                 let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
                 if sym.is_empty() {
-                    view.output.push('\n');
-                    view.output
-                        .push_str("aden: no word at cursor for asm (Ctrl-A)");
+                    push_feed(view, "aden", "no word at cursor for asm (Ctrl-A)");
                 } else if pump.registry_mut().has_aden() {
                     match aden::pull(dir, aden::Pull::Asm(&sym)) {
-                        Ok(out) => append_aden(view, &format!("asm '{}'", sym), &out),
-                        Err(e) => view.output.push_str(&format!("\naden: asm failed: {e}")),
+                        Ok(out) => append_aden(view, &format!("asm '{sym}'"), &out),
+                        Err(e) => push_feed(view, "aden", &format!("asm failed: {e}")),
                     }
                 } else {
-                    view.output.push('\n');
-                    view.output
-                        .push_str(&format!("aden: (not present) would asm: {}", sym));
+                    push_feed(view, "aden", &format!("(not present) would asm: {sym}"));
                 }
             }
             Some(Action::AdenImpact) => {
                 let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
                 if sym.is_empty() {
-                    view.output.push('\n');
-                    view.output
-                        .push_str("aden: no word at cursor for impact (Ctrl-I or :impact sym)");
+                    push_feed(
+                        view,
+                        "aden",
+                        "no word at cursor for impact (Ctrl-I or :impact sym)",
+                    );
                 } else if pump.registry_mut().has_aden() {
                     match aden::pull(dir, aden::Pull::Impact(&sym)) {
-                        Ok(out) => append_aden(view, &format!("impact '{}'", sym), &out),
-                        Err(e) => view.output.push_str(&format!("\naden: impact failed: {e}")),
+                        Ok(out) => append_aden(view, &format!("impact '{sym}'"), &out),
+                        Err(e) => push_feed(view, "aden", &format!("impact failed: {e}")),
                     }
                 } else {
-                    view.output.push('\n');
-                    view.output
-                        .push_str(&format!("aden: (not present) would impact: {}", sym));
+                    push_feed(view, "aden", &format!("(not present) would impact: {sym}"));
                 }
             }
             Some(Action::AdenView) => {
                 let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
                 if sym.is_empty() {
-                    view.output.push('\n');
-                    view.output
-                        .push_str("aden: no word at cursor for view (Ctrl-V or :view sym)");
+                    push_feed(
+                        view,
+                        "aden",
+                        "no word at cursor for view (Ctrl-V or :view sym)",
+                    );
                 } else if pump.registry_mut().has_aden() {
                     match aden::launch_view(dir, Some(&sym)) {
-                        Ok(()) => view
-                            .output
-                            .push_str(&format!("\naden: launched view for '{}'", sym)),
-                        Err(e) => view.output.push_str(&format!("\naden: view failed: {e}")),
+                        Ok(()) => push_feed(view, "aden", &format!("launched view for '{sym}'")),
+                        Err(e) => push_feed(view, "aden", &format!("view failed: {e}")),
                     }
                 } else {
-                    view.output.push('\n');
-                    view.output
-                        .push_str(&format!("aden: (not present) would view: {}", sym));
+                    push_feed(view, "aden", &format!("(not present) would view: {sym}"));
                 }
             }
             Some(Action::AdenGrep) => {
                 let sym = vim::word_at_cursor(&view.input, view.cursor).unwrap_or_default();
                 if sym.is_empty() {
-                    view.output.push('\n');
-                    view.output
-                        .push_str("aden: no word at cursor for grep (Ctrl-G or :grep pat)");
+                    push_feed(
+                        view,
+                        "aden",
+                        "no word at cursor for grep (Ctrl-G or :grep pat)",
+                    );
                 } else if pump.registry_mut().has_aden() {
                     match aden::pull(dir, aden::Pull::Grep(&sym)) {
-                        Ok(out) => append_aden(view, &format!("grep '{}'", sym), &out),
-                        Err(e) => view.output.push_str(&format!("\naden: grep failed: {e}")),
+                        Ok(out) => append_aden(view, &format!("grep '{sym}'"), &out),
+                        Err(e) => push_feed(view, "aden", &format!("grep failed: {e}")),
                     }
                 } else {
-                    view.output.push('\n');
-                    view.output
-                        .push_str(&format!("aden: (not present) would grep: {}", sym));
+                    push_feed(view, "aden", &format!("(not present) would grep: {sym}"));
                 }
             }
             Some(Action::Submit) => {
@@ -3216,7 +3157,8 @@ async fn drive(
                 // Hot-plug: if no model was up at boot, a backend started since is
                 // found now (and aden tools registered) so this very turn uses it.
                 if let Some(note) = refresh_discovery(dir, pump, sel, false) {
-                    view.set_status(note);
+                    view.set_status(&note);
+                    append_sys_note(view, &format!("\nsys: {note}"));
                 }
                 if sel.is_offline_stub() {
                     show_slash_output(
