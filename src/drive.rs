@@ -212,10 +212,10 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
     // slowest aden spawn and is purely cosmetic, so defer it to the first
     // post-turn refresh and let the user reach the prompt sooner.
     view.set_status(boot_status(&sel.label(), &task.status, caps.available));
-    let scope_cache: Option<String> = None;
+    let scope_cache = ScopeCaches::default();
     view.set_chrome(chrome_state(
         &sel.label(),
-        &scope_label(&task.status, &scope_cache),
+        &scope_cache.chrome_label(&task.status),
         None,
         caps.available,
         &Trust::default(),
@@ -297,13 +297,10 @@ fn status_line(
     usage: Option<Usage>,
     aden_active: bool,
     trust: &Trust,
-    scope_cache: &mut Option<String>,
+    scope_cache: &mut ScopeCaches,
 ) -> String {
-    refresh_scope_cache(dir, task, scope_cache);
-    let base = match scope_cache.as_deref() {
-        Some(s) if s.starts_with("aden ") => format!("model: {model_label}  |  scope: {s}"),
-        _ => boot_status(model_label, task, aden_active),
-    };
+    scope_cache.refresh(dir);
+    let base = scope_cache.status_scope(model_label, task, aden_active);
     let line = match usage {
         Some(u) if u.prompt_tokens > 0 => format!("{base}  |  ctx: {}", ctx_meter(u.prompt_tokens)),
         _ => base,
@@ -322,27 +319,36 @@ fn ctx_meter(prompt_tokens: u32) -> String {
     }
 }
 
-/// Scope label for chrome/status. `savings_cache` is filled at most once per
-/// session refresh (after turns) — never call `aden::savings` from the idle
-/// redraw loop (it spawns `aden status` and stalls the TUI at ~10 Hz).
-fn scope_label(task: &str, savings_cache: &Option<String>) -> String {
-    savings_cache.clone().unwrap_or_else(|| {
-        if task.is_empty() {
-            "ungated".to_string()
-        } else {
-            task.to_string()
-        }
-    })
+/// Cached scope labels for chrome/status. Refreshed after turns and slash
+/// commands — never call `aden::savings` from the idle redraw loop (it spawns
+/// `aden status` and stalls the TUI at ~10 Hz).
+#[derive(Clone, Default)]
+struct ScopeCaches {
+    savings_detail: Option<String>,
 }
 
-fn refresh_scope_cache(dir: &Path, task: &str, savings_cache: &mut Option<String>) {
-    *savings_cache = aden::savings(dir).or_else(|| {
-        if task.is_empty() {
-            Some("ungated".to_string())
-        } else {
-            Some(task.to_string())
+impl ScopeCaches {
+    fn refresh(&mut self, dir: &Path) {
+        self.savings_detail = aden::savings_detail(dir);
+    }
+
+    fn chrome_label(&self, task: &str) -> String {
+        match self.savings_detail.as_deref() {
+            Some(d) => aden::format_savings_chrome(d),
+            None if task.is_empty() => "ungated".to_string(),
+            None => task.to_string(),
         }
-    });
+    }
+
+    fn status_scope(&self, model_label: &str, task: &str, aden_active: bool) -> String {
+        match self.savings_detail.as_deref() {
+            Some(d) => format!(
+                "model: {model_label}  |  scope: {}",
+                aden::format_savings_status(d)
+            ),
+            None => boot_status(model_label, task, aden_active),
+        }
+    }
 }
 
 /// Chrome bar fields for TUI 3.0 (parallel to [`status_line`]).
@@ -1691,7 +1697,7 @@ fn dispatch_menu_pick(
     approvals: &mut HashSet<String>,
     approved_commands: &mut HashSet<String>,
     session: &mut session::Session,
-    scope_cache: &mut Option<String>,
+    scope_cache: &mut ScopeCaches,
 ) {
     match kind {
         MenuKind::Model => {
@@ -1914,13 +1920,13 @@ async fn drive(
     // One-time tip for average users the first time they trigger an ADEN action.
     let mut aden_tip_shown = false;
     let task_gated = !task.is_empty() && task.contains("gated");
-    let mut scope_cache: Option<String> = None;
+    let mut scope_cache = ScopeCaches::default();
     loop {
         // Keep the aden badge on the status line in sync with caps each frame.
         view.aden_active = caps.available;
         view.set_chrome(chrome_state(
             &sel.label(),
-            &scope_label(task, &scope_cache),
+            &scope_cache.chrome_label(task),
             pump.last_usage(),
             caps.available,
             &trust,

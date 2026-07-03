@@ -301,26 +301,78 @@ impl Gate for AdenGate {
     }
 }
 
-/// A compact savings summary for the status line, from `aden status`. `None`
-/// when aden cannot run, the command fails, or no savings are recorded.
-pub fn savings(dir: &Path) -> Option<String> {
+/// Raw savings detail from the All-time line (text after `→`). Pure parse helper.
+pub fn savings_detail_from_status(status: &str) -> Option<String> {
+    let line = status
+        .lines()
+        .find(|l| l.trim_start().starts_with("All-time"))?;
+    // "...All-time : N aden calls → est. ~X tool calls + ~Y tokens saved vs ..."
+    let detail = line.split('→').nth(1).unwrap_or(line).trim();
+    (!detail.is_empty()).then(|| detail.to_string())
+}
+
+/// The raw All-time savings detail from `aden status` (no `aden` prefix).
+pub fn savings_detail(dir: &Path) -> Option<String> {
     let mut cmd = Command::new(aden_bin());
     read_only_aden_env(&mut cmd);
     let out = cmd.arg("status").arg(dir).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    extract_savings(&String::from_utf8_lossy(&out.stdout))
+    savings_detail_from_status(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Pull the all-time savings detail out of `aden status` text. Pure for testing.
-fn extract_savings(status: &str) -> Option<String> {
-    let line = status
-        .lines()
-        .find(|l| l.trim_start().starts_with("All-time"))?;
-    // "...All-time : N aden calls → est. ~X tool calls + ~Y tokens saved vs ..."
-    let detail = line.split('→').nth(1).unwrap_or(line).trim();
-    (!detail.is_empty()).then(|| format!("aden {detail}"))
+/// Status-line scope text for a savings detail (always tagged `[est.]`).
+pub fn format_savings_status(detail: &str) -> String {
+    let d = detail.trim();
+    let body = d
+        .strip_prefix("[est.]")
+        .or_else(|| d.strip_prefix("est."))
+        .map(str::trim)
+        .unwrap_or(d);
+    format!("aden [est.] {body}")
+}
+
+/// Chrome-bar scope text: shorter, still tagged `[est.]`.
+pub fn format_savings_chrome(detail: &str) -> String {
+    let d = detail.trim();
+    let d = d
+        .strip_prefix("[est.]")
+        .or_else(|| d.strip_prefix("est."))
+        .map(str::trim)
+        .unwrap_or(d);
+    if let Some((tools, tokens)) = parse_savings_detail_parts(d) {
+        format!("aden [est.] {tokens} · ~{tools} tools")
+    } else {
+        format!("aden [est.] {d}")
+    }
+}
+
+/// Parse `~N tool calls + ~Xk tokens saved vs grep-and-read`.
+fn parse_savings_detail_parts(detail: &str) -> Option<(u64, String)> {
+    let mut tools: Option<u64> = None;
+    let mut tokens: Option<String> = None;
+    for part in detail.split('+') {
+        let p = part.trim();
+        if let Some(rest) = p.strip_prefix("~") {
+            if p.contains("tool calls") {
+                tools = rest.split_whitespace().next()?.parse().ok();
+            } else if p.contains("tokens saved") {
+                let tok = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(rest)
+                    .trim_end_matches("tokens")
+                    .trim_end_matches("saved")
+                    .trim();
+                tokens = Some(tok.to_string());
+            }
+        }
+    }
+    match (tools, tokens) {
+        (Some(t), Some(tok)) => Some((t, tok)),
+        _ => None,
+    }
 }
 
 /// Read a runtime preference from `.aden/config.toml` via `aden config get`.
@@ -444,6 +496,51 @@ pub fn list_symbols(dir: &Path, filter: Option<&str>) -> Result<String, AdenErro
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone, Default, serde::Deserialize, PartialEq, Eq)]
+    struct SavingsLedgerJson {
+        queries: u64,
+        returned_tokens: u64,
+        baseline_tokens: u64,
+        saved_tokens: i64,
+        #[serde(default)]
+        tool_calls_saved: u64,
+    }
+
+    fn validate_savings_ledger(ledger: &SavingsLedgerJson) -> Result<(), String> {
+        let expected = ledger.baseline_tokens as i64 - ledger.returned_tokens as i64;
+        if ledger.saved_tokens != expected {
+            return Err(format!(
+                "saved_tokens {} != baseline_tokens - returned_tokens ({expected})",
+                ledger.saved_tokens
+            ));
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, Default, serde::Deserialize)]
+    struct SavingsSessionJson {
+        #[serde(default, flatten)]
+        ledger: SavingsLedgerJson,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct SavingsFileJson {
+        schema: u32,
+        all_time: SavingsLedgerJson,
+        #[serde(default)]
+        session: SavingsSessionJson,
+    }
+
+    fn validate_savings_file_json(json: &str) -> Result<(), String> {
+        let file: SavingsFileJson = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if file.schema != 2 {
+            return Err(format!("unsupported savings schema {}", file.schema));
+        }
+        validate_savings_ledger(&file.all_time)?;
+        validate_savings_ledger(&file.session.ledger)?;
+        Ok(())
+    }
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
@@ -491,12 +588,70 @@ mod tests {
             Savings estimate (vs grep-and-read) [est.]:\n\
             \x20 This session: 3 aden calls → est. ~8 tool calls + ~2k tokens saved vs grep-and-read\n\
             \x20 All-time    : 40 aden calls → est. ~90 tool calls + ~30k tokens saved vs grep-and-read\n";
-        let got = extract_savings(status).expect("savings line present");
-        assert!(got.starts_with("aden est."), "{got}");
+        let got = savings_detail_from_status(status)
+            .map(|d| format_savings_status(&d))
+            .expect("savings line present");
+        assert!(got.starts_with("aden [est.]"), "{got}");
         assert!(got.contains("~90 tool calls"));
         assert!(got.contains("~30k tokens saved"));
         // No all-time line -> None.
-        assert!(extract_savings("Aden Status: .\nno savings\n").is_none());
+        assert!(savings_detail_from_status("Aden Status: .\nno savings\n").is_none());
+    }
+
+    #[test]
+    fn format_savings_chrome_shortens_detail() {
+        let detail = "est. ~58 tool calls + ~481k tokens saved vs grep-and-read";
+        let chrome = format_savings_chrome(detail);
+        assert!(chrome.contains("aden [est.]"), "{chrome}");
+        assert!(chrome.contains("481k"), "{chrome}");
+        assert!(chrome.contains("~58 tools"), "{chrome}");
+    }
+
+    #[test]
+    fn validate_savings_file_json_checks_ledger_math() {
+        let ok = r#"{
+            "schema": 2,
+            "all_time": {
+                "queries": 25,
+                "returned_tokens": 99602,
+                "baseline_tokens": 540690,
+                "saved_tokens": 441088,
+                "tool_calls_saved": 53
+            },
+            "session": {
+                "started_unix": 1,
+                "last_unix": 1,
+                "queries": 0,
+                "returned_tokens": 0,
+                "baseline_tokens": 0,
+                "saved_tokens": 0,
+                "tool_calls_saved": 0
+            }
+        }"#;
+        validate_savings_file_json(ok).expect("valid ledger");
+
+        let bad = r#"{
+            "schema": 2,
+            "all_time": {
+                "queries": 1,
+                "returned_tokens": 100,
+                "baseline_tokens": 500,
+                "saved_tokens": 999,
+                "tool_calls_saved": 1
+            },
+            "session": {}
+        }"#;
+        assert!(validate_savings_file_json(bad).is_err());
+    }
+
+    #[test]
+    fn validate_repo_savings_json_if_present() {
+        let path = Path::new(".aden/savings.json");
+        if !path.exists() {
+            return;
+        }
+        let json = std::fs::read_to_string(path).expect("read savings.json");
+        validate_savings_file_json(&json).expect("repo savings.json must be internally consistent");
     }
 
     #[test]
