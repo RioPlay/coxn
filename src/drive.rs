@@ -212,13 +212,14 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
     // slowest aden spawn and is purely cosmetic, so defer it to the first
     // post-turn refresh and let the user reach the prompt sooner.
     view.set_status(boot_status(&sel.label(), &task.status, caps.available));
+    let scope_cache: Option<String> = None;
     view.set_chrome(chrome_state(
-        dir,
         &sel.label(),
-        &task.status,
+        &scope_label(&task.status, &scope_cache),
         None,
         caps.available,
         &Trust::default(),
+        !task.status.is_empty() && task.status.contains("gated"),
     ));
     if trust::auto_approve_enabled() {
         append_sys_note(
@@ -296,10 +297,12 @@ fn status_line(
     usage: Option<Usage>,
     aden_active: bool,
     trust: &Trust,
+    scope_cache: &mut Option<String>,
 ) -> String {
-    let base = match aden::savings(dir) {
-        Some(savings) => format!("model: {model_label}  |  scope: {savings}"),
-        None => boot_status(model_label, task, aden_active),
+    refresh_scope_cache(dir, task, scope_cache);
+    let base = match scope_cache.as_deref() {
+        Some(s) if s.starts_with("aden ") => format!("model: {model_label}  |  scope: {s}"),
+        _ => boot_status(model_label, task, aden_active),
     };
     let line = match usage {
         Some(u) if u.prompt_tokens > 0 => format!("{base}  |  ctx: {}", ctx_meter(u.prompt_tokens)),
@@ -319,28 +322,45 @@ fn ctx_meter(prompt_tokens: u32) -> String {
     }
 }
 
+/// Scope label for chrome/status. `savings_cache` is filled at most once per
+/// session refresh (after turns) — never call `aden::savings` from the idle
+/// redraw loop (it spawns `aden status` and stalls the TUI at ~10 Hz).
+fn scope_label(task: &str, savings_cache: &Option<String>) -> String {
+    savings_cache.clone().unwrap_or_else(|| {
+        if task.is_empty() {
+            "ungated".to_string()
+        } else {
+            task.to_string()
+        }
+    })
+}
+
+fn refresh_scope_cache(dir: &Path, task: &str, savings_cache: &mut Option<String>) {
+    *savings_cache = aden::savings(dir).or_else(|| {
+        if task.is_empty() {
+            Some("ungated".to_string())
+        } else {
+            Some(task.to_string())
+        }
+    });
+}
+
 /// Chrome bar fields for TUI 3.0 (parallel to [`status_line`]).
 fn chrome_state(
-    dir: &Path,
     model_label: &str,
-    task: &str,
+    scope: &str,
     usage: Option<Usage>,
     aden_active: bool,
     trust: &Trust,
+    task_gated: bool,
 ) -> ChromeState {
-    let scope = match aden::savings(dir) {
-        Some(savings) => savings,
-        None if task.is_empty() => "ungated".to_string(),
-        None => task.to_string(),
-    };
     let model = match usage {
         Some(u) if u.prompt_tokens > 0 => format!("{model_label} {}", ctx_meter(u.prompt_tokens)),
         _ => model_label.to_string(),
     };
-    let task_gated = !task.is_empty() && task.contains("gated");
     ChromeState {
         model,
-        task: scope,
+        task: scope.to_string(),
         trust: trust.ladder_tag(task_gated).to_string(),
         aden_active,
     }
@@ -1671,6 +1691,7 @@ fn dispatch_menu_pick(
     approvals: &mut HashSet<String>,
     approved_commands: &mut HashSet<String>,
     session: &mut session::Session,
+    scope_cache: &mut Option<String>,
 ) {
     match kind {
         MenuKind::Model => {
@@ -1687,6 +1708,7 @@ fn dispatch_menu_pick(
                 pump.last_usage(),
                 view.aden_active,
                 trust,
+                scope_cache,
             ));
         }
         MenuKind::Session => {
@@ -1712,6 +1734,7 @@ fn dispatch_menu_pick(
                     pump.last_usage(),
                     view.aden_active,
                     trust,
+                    scope_cache,
                 ));
             }
         }
@@ -1822,6 +1845,7 @@ fn dispatch_menu_pick(
                     pump.last_usage(),
                     view.aden_active,
                     trust,
+                    scope_cache,
                 ));
             } else if let Some(slug) = value.strip_prefix("session:") {
                 let messages = session::load(slug);
@@ -1846,6 +1870,7 @@ fn dispatch_menu_pick(
                         pump.last_usage(),
                         view.aden_active,
                         trust,
+                        scope_cache,
                     ));
                 }
             } else if let Some(text) = value.strip_prefix("input:") {
@@ -1888,16 +1913,18 @@ async fn drive(
     trust.seed_approvals(&mut approvals);
     // One-time tip for average users the first time they trigger an ADEN action.
     let mut aden_tip_shown = false;
+    let task_gated = !task.is_empty() && task.contains("gated");
+    let mut scope_cache: Option<String> = None;
     loop {
         // Keep the aden badge on the status line in sync with caps each frame.
         view.aden_active = caps.available;
         view.set_chrome(chrome_state(
-            dir,
             &sel.label(),
-            task,
+            &scope_label(task, &scope_cache),
             pump.last_usage(),
             caps.available,
             &trust,
+            task_gated,
         ));
         if caps.available && !aden_tip_shown {
             append_sys_note(
@@ -1972,6 +1999,7 @@ async fn drive(
                                 &mut approvals,
                                 &mut approved_commands,
                                 &mut session,
+                                &mut scope_cache,
                             );
                         }
                     }
@@ -2175,6 +2203,7 @@ async fn drive(
                             &mut approvals,
                             &mut approved_commands,
                             &mut session,
+                            &mut scope_cache,
                         );
                     }
                 }
@@ -2473,6 +2502,7 @@ async fn drive(
                         pump.last_usage(),
                         view.aden_active,
                         &trust,
+                        &mut scope_cache,
                     ));
                 }
                 ExCmd::Tools => {
@@ -2500,6 +2530,7 @@ async fn drive(
                         pump.last_usage(),
                         view.aden_active,
                         &trust,
+                        &mut scope_cache,
                     ));
                 }
                 ExCmd::Understand(sym) => {
@@ -2893,6 +2924,7 @@ async fn drive(
                                         pump.last_usage(),
                                         view.aden_active,
                                         &trust,
+                                        &mut scope_cache,
                                     ));
                                 }
                                 Err(msg) => {
@@ -2993,6 +3025,7 @@ async fn drive(
                                             pump.last_usage(),
                                             view.aden_active,
                                             &trust,
+                                            &mut scope_cache,
                                         ));
                                         String::new()
                                     }
@@ -3026,6 +3059,7 @@ async fn drive(
                                 pump.last_usage(),
                                 view.aden_active,
                                 &trust,
+                                &mut scope_cache,
                             ));
                         }
                         Command::Scope => {
@@ -3046,6 +3080,7 @@ async fn drive(
                                 pump.last_usage(),
                                 view.aden_active,
                                 &trust,
+                                &mut scope_cache,
                             ));
                         }
                         Command::Copy => {
@@ -3141,6 +3176,7 @@ async fn drive(
                                 pump.last_usage(),
                                 view.aden_active,
                                 &trust,
+                                &mut scope_cache,
                             ));
                         }
                         Command::Unknown(c) => show_slash_output(
@@ -3240,6 +3276,7 @@ async fn drive(
                             pump.last_usage(),
                             view.aden_active,
                             &trust,
+                            &mut scope_cache,
                         );
                         view.set_status(if cancelled {
                             format!("{status}  (cancelled)")
