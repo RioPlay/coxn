@@ -177,3 +177,12 @@
 - `discover::selection_is_text_only` + tests
 
 **Tests:** 342 pass
+
+### Pass 13 — 2026-07-03 (ship prep)
+
+**Shipped:**
+- `execute_route_guard_blocks_text_only_role_route` test (scout → grok-cli)
+- Health stack green; `demo-scope-escape.sh` wedge green with grok auto-detect
+- Branch pushed; PR opened for `feat/cli-piggybacks-grok-claude` → main
+
+**Loop closed:** N6/N10b/N11 + onboarding + loose ends complete. Live partition/Ollama smoke remain host-dependent open items in PLAN.

@@ -1146,6 +1146,58 @@ mod tests {
     }
 
     #[test]
+    fn execute_route_guard_blocks_text_only_role_route() {
+        let dir = std::env::temp_dir().join(format!("coxn-exec-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".aden")).unwrap();
+        std::fs::write(
+            dir.join(".aden/config.toml"),
+            r#"
+[provider.local]
+driver = "openai_compat"
+base_url = "http://localhost:11434/v1"
+enabled = true
+
+[provider.grok]
+driver = "grok_cli"
+binary = "grok"
+enabled = true
+
+[route]
+active = "local:llama3"
+scout = "grok:grok-model"
+"#,
+        )
+        .unwrap();
+        let caps = aden::AdenCaps {
+            available: false,
+            model_base_url: None,
+            model_name: None,
+        };
+        let sel = ModelSel {
+            name: "llama3".into(),
+            endpoint: Some(crate::app::Endpoint {
+                instance_id: "local".into(),
+                base_url: "http://localhost:11434/v1".into(),
+                key: None,
+                source: "test".into(),
+            }),
+        };
+        let scope = agents::SubScope {
+            id: "t-0".into(),
+            role: "scout".into(),
+            manifest: "manifest.json".into(),
+            depends_on: vec![],
+        };
+        let ordered: Vec<&agents::SubScope> = vec![&scope];
+        let msg =
+            execute_route_guard(&dir, &caps, &sel, &ordered).expect("should block scout route");
+        assert!(msg.contains("scout"));
+        assert!(msg.contains("grok:grok-model"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn execute_partition_resolves_distinct_role_routes_without_aden() {
         let dir = std::env::temp_dir().join(format!("coxn-exec-role-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
