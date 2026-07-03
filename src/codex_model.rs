@@ -6,9 +6,7 @@
 use std::path::Path;
 
 use crate::codex_app_server::{CodexAppServerConfig, CodexAppServerSession};
-use crate::model::{
-    Message, Model, ModelError, ModelRequest, ModelResponse, Role, ThinkingLevel,
-};
+use crate::model::{Message, Model, ModelError, ModelRequest, ModelResponse, Role, ThinkingLevel};
 
 pub const CODEX_ENDPOINT_SCHEME: &str = "codex-cli://";
 
