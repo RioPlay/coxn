@@ -152,11 +152,11 @@ impl CodexAppServerSession {
         model: &str,
         cwd: &str,
         prompt: &str,
-        on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<TurnCompletion, String> {
         self.initialize()?;
         let thread_id = self.start_ephemeral_thread(model, cwd)?;
-        self.run_turn(&thread_id, prompt, on_delta)
+        self.run_turn(&thread_id, prompt, io)
     }
 
     fn start_ephemeral_thread(&mut self, model: &str, cwd: &str) -> Result<String, String> {
@@ -180,7 +180,7 @@ impl CodexAppServerSession {
         &mut self,
         thread_id: &str,
         prompt: &str,
-        mut on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<TurnCompletion, String> {
         let id = self.next_id();
         let params = serde_json::json!({
@@ -214,9 +214,7 @@ impl CodexAppServerSession {
                                     value.pointer("/params/delta").and_then(|v| v.as_str())
                                 {
                                     text.push_str(delta);
-                                    if let Some(cb) = on_delta.as_deref_mut()
-                                        && !cb(delta)
-                                    {
+                                    if !io.on_delta(delta) {
                                         let _ = self.child.kill();
                                         break;
                                     }
@@ -255,6 +253,10 @@ impl CodexAppServerSession {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !io.on_idle() {
+                        let _ = self.child.kill();
+                        break;
+                    }
                     if self
                         .child
                         .try_wait()
@@ -492,14 +494,17 @@ pub mod test_support {
 
     pub fn write_fake_codex(dir: &Path, mode: FakeCodexMode) -> PathBuf {
         let path = dir.join("fake-codex");
+        let tmp = dir.join(".fake-codex.part");
         let script = match mode {
             FakeCodexMode::AuthOnly => AUTH_ONLY_SCRIPT,
             FakeCodexMode::TextTurn => TEXT_TURN_SCRIPT,
         };
-        fs::write(&path, script).unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
+        fs::write(&tmp, script).unwrap();
+        let mut perms = fs::metadata(&tmp).unwrap().permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
+        fs::set_permissions(&tmp, perms).unwrap();
+        let _ = fs::remove_file(&path);
+        fs::rename(&tmp, &path).unwrap();
         path
     }
 
@@ -556,9 +561,8 @@ mod tests {
 
     #[test]
     fn account_read_from_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("coxn-codex-app-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = crate::cli_ndjson::test_support::fake_cli_test_lock();
+        let dir = crate::cli_ndjson::test_support::unique_temp_dir("coxn-codex-app");
         let fake = write_fake_codex(&dir, FakeCodexMode::AuthOnly);
         let config =
             CodexAppServerConfig::for_probe(fake.to_string_lossy().to_string(), None, vec![]);
@@ -570,15 +574,19 @@ mod tests {
 
     #[test]
     fn complete_text_turn_from_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("coxn-codex-turn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = crate::cli_ndjson::test_support::fake_cli_test_lock();
+        let dir = crate::cli_ndjson::test_support::unique_temp_dir("coxn-codex-turn");
         let fake = write_fake_codex(&dir, FakeCodexMode::TextTurn);
         let config =
             CodexAppServerConfig::for_turn(fake.to_string_lossy().to_string(), None, vec![], &dir);
         let mut session = CodexAppServerSession::spawn(&config).expect("spawn");
         let result = session
-            .complete_text_turn("test-model", &dir.display().to_string(), "ping", None)
+            .complete_text_turn(
+                "test-model",
+                &dir.display().to_string(),
+                "ping",
+                &mut crate::pump::SilentIo,
+            )
             .expect("turn");
         assert_eq!(result.text, "PONG");
         let _ = std::fs::remove_dir_all(&dir);

@@ -29,15 +29,22 @@ Exit `0` = ready, `1` = blocking (no model), `2` = warnings (no bwrap, etc.).
 
 ## Provider profiles
 
-For local-first use, coxn auto-detects Ollama and LM Studio. For external
-providers, use the setup wizard or hand-edit `.aden/config.toml`:
+For local-first use, coxn auto-detects logged-in CLIs (grok/claude/codex), native
+Ollama, then LM Studio. For external providers, use the setup wizard or hand-edit
+`.aden/config.toml`:
 
 ```sh
-coxn auth setup                  # list presets (Claude/GPT/Gemini/Grok via OpenRouter, OpenAI direct, local)
+coxn                           # TUI — Ctrl-Space → setup grok-cli / ollama-native / openrouter-claude
+coxn auth setup                # list presets (CLI piggybacks, OpenRouter, OpenAI, local)
 coxn auth setup openrouter-claude
-coxn auth set-key openrouter < key.txt
+coxn auth set-key openrouter   # paste key in TUI, or: coxn auth set-key openrouter < key.txt
 coxn auth status
+coxn doctor
 ```
+
+CLI piggyback presets (`codex`, `claude-cli`, `grok-cli`) are **text-only** in coxn
+(chat turns). Route `scout`/`synth`/`orchestrate` to `ollama-native` or OpenRouter
+for `/execute` partitions that need gated edits and `run_command`.
 
 Or add profiles manually:
 

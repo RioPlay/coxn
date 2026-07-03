@@ -530,9 +530,8 @@ fn snippet(body: &str) -> String {
 
 impl Model for OpenAiCompatModel {
     async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
-        // ureq is blocking; the pump already blocks on a turn, so this is fine
-        // for the single-threaded loop. (Revisit with an async client if the TUI
-        // needs to stay live during a call.)
+        // ureq is blocking; the turn path is single-threaded. Non-streaming calls
+        // still block the event loop until the reply arrives.
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = to_wire(&self.model, &request, false);
 
@@ -568,12 +567,12 @@ impl Model for OpenAiCompatModel {
     // Streaming turn: same request with `stream: true`, then read the SSE body
     // line by line, emitting text fragments through `on_delta` as they arrive and
     // assembling the full response (text + tool calls) to return. ureq is
-    // blocking, and coxn's loop is single-threaded, so the read loop drives the
-    // sink directly; the TUI repaints per fragment from within it.
+    // blocking HTTP body; a background thread reads SSE lines while `on_idle`
+    // polls the keyboard (~50ms) so the input box stays live between chunks.
     async fn stream(
         &self,
         request: ModelRequest,
-        on_delta: &mut dyn FnMut(&str) -> bool,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<ModelResponse, ModelError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = to_wire(&self.model, &request, true);
@@ -598,14 +597,34 @@ impl Model for OpenAiCompatModel {
         }
 
         let mut state = StreamState::default();
-        let reader = std::io::BufReader::new(response.body_mut().as_reader());
-        for line in reader.lines() {
-            let line =
-                line.map_err(|e| ModelError::Backend(format!("reading stream failed: {e}")))?;
-            if fold_sse_line(&line, &mut state, on_delta) {
-                break;
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+            scope.spawn(move || {
+                let reader = std::io::BufReader::new(response.body_mut().as_reader());
+                for line in reader.lines() {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            loop {
+                let line = {
+                    let mut idle_cb = || io.on_idle();
+                    let mut idle_opt = Some(&mut idle_cb as &mut dyn FnMut() -> bool);
+                    match crate::stream_idle::recv_line_with_idle(&rx, &mut idle_opt) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(e) => {
+                            return Err(ModelError::Backend(format!("reading stream failed: {e}")));
+                        }
+                    }
+                };
+                if fold_sse_line(&line, &mut state, &mut |d| io.on_delta(d)) {
+                    break;
+                }
             }
-        }
+            Ok(())
+        })?;
 
         let response = state.finish();
         if response.message.content.is_empty() && response.tool_calls.is_empty() {

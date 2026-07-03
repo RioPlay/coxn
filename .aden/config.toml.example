@@ -21,6 +21,16 @@ driver = "codex"
 binary = "codex"
 enabled = false
 
+[provider.claude]
+driver = "claude_cli"
+binary = "claude"
+enabled = false
+
+[provider.grok]
+driver = "grok_cli"
+binary = "grok"
+enabled = false
+
 [route]
 active = "local:qwen2.5-coder"
 scout = "local:qwen2.5-coder"
@@ -29,4 +39,8 @@ orchestrate = "local:llama3"
 
 # Presets (coxn auth setup <id>):
 #   local-ollama, ollama-native, lmstudio
-#   openai, openrouter-claude, openrouter-gpt, openrouter-gemini, openrouter-grok, codex
+#   openai, openrouter-claude, openrouter-gpt, openrouter-gemini, openrouter-grok
+#   codex, claude-cli, grok-cli
+#
+# CLI piggybacks (codex, claude-cli, grok-cli) are text-only in coxn — chat turns
+# only. Use openai_compat or ollama for /execute scout/synth/orchestrate routes.

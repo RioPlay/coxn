@@ -5,6 +5,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.1.0] - 2026-07-03
+
+### Added
+
+- **Grok + Claude CLI piggybacks** (`GrokCliPiggyback`, `ClaudeCliPiggyback`): text-only
+  turns via `grok -p` / `claude -p` + NDJSON streaming; shared `cli_ndjson` + `stream_idle`.
+- **Boot auto-detect** (`discover.rs`): logged-in CLIs (grok → claude → codex), then native
+  Ollama, then HTTP; `coxn doctor` matches boot resolution.
+- **Onboarding**: Ctrl-Space setup presets, `/auth setup` hot-reload, in-TUI `/auth set-key`
+  modal, chrome `[text-only]` tag for CLI backends.
+- **`resolve_role`** reads `[route]` from `.aden/config.toml` without requiring aden on PATH.
+
+### Changed
+
+- Ollama auto-detect prefers native `/api/chat` (streaming + tools) over OpenAI-compat `/v1`.
+- `/agents` listing marks `[text-only]` routes; `/execute` refuses text-only active model or role routes.
+
+### Fixed
+
+- Ctrl-C during CLI piggyback streams kills child and keeps partial text.
+- Claude CLI `result`/`assistant` usage feeds the context meter.
+
 ## [0.5.0.0] - 2026-07-02
 
 ### Added

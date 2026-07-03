@@ -14,6 +14,7 @@ pub enum ProviderDriver {
     Stub,
     Codex,
     ClaudeCli,
+    GrokCli,
     Unknown(String),
 }
 
@@ -25,6 +26,7 @@ impl ProviderDriver {
             "stub" => Self::Stub,
             "codex" => Self::Codex,
             "claude" | "claude_cli" | "claude-cli" => Self::ClaudeCli,
+            "grok" | "grok_cli" | "grok-cli" | "grok_build" | "grok-build" => Self::GrokCli,
             _ => Self::Unknown(value.trim().to_string()),
         }
     }
@@ -45,6 +47,18 @@ pub struct ProviderInstance {
 }
 
 impl ProviderInstance {
+    /// Minimal instance for auth/discovery probes (binary + driver only).
+    pub fn for_probe(
+        id: impl Into<String>,
+        driver: ProviderDriver,
+        binary: impl Into<String>,
+    ) -> Self {
+        let mut instance = Self::new(id.into());
+        instance.driver = driver;
+        instance.binary = Some(binary.into());
+        instance
+    }
+
     fn new(id: String) -> Self {
         Self {
             id,
@@ -188,6 +202,24 @@ pub fn presets() -> &'static [ProviderPreset] {
             driver: "codex",
             base_url: "",
             model: "gpt-5.4-mini",
+            needs_key: false,
+        },
+        ProviderPreset {
+            id: "claude-cli",
+            label: "Claude Code CLI (piggyback)",
+            instance_id: "claude",
+            driver: "claude_cli",
+            base_url: "",
+            model: "claude-sonnet-4-6",
+            needs_key: false,
+        },
+        ProviderPreset {
+            id: "grok-cli",
+            label: "Grok Build CLI (piggyback)",
+            instance_id: "grok",
+            driver: "grok_cli",
+            base_url: "",
+            model: "grok-composer-2.5-fast",
             needs_key: false,
         },
     ]
@@ -341,6 +373,47 @@ pub fn secret_for_instance(id: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
+
+/// Persist an API key to `~/.config/coxn/secrets/<id>.key` (mode 0600).
+pub fn write_secret(id: &str, key: &str) -> Result<String, String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("empty key refused".to_string());
+    }
+    let path = secret_file_path(id).ok_or_else(|| "HOME is not set".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        set_dir_permissions(parent);
+    }
+    let temp_path = path.with_extension(format!("key.{}.tmp", std::process::id()));
+    std::fs::write(&temp_path, format!("{key}\n"))
+        .map_err(|e| format!("write {}: {e}", temp_path.display()))?;
+    set_secret_permissions(&temp_path);
+    std::fs::rename(&temp_path, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        format!("persist {}: {e}", path.display())
+    })?;
+    set_secret_permissions(&path);
+    Ok(path.display().to_string())
+}
+
+#[cfg(unix)]
+fn set_secret_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn set_secret_permissions(_path: &std::path::Path) {}
+
+#[cfg(unix)]
+fn set_dir_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn set_dir_permissions(_path: &std::path::Path) {}
 
 pub fn secret_env_name(id: &str) -> String {
     format!(

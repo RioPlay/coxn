@@ -181,6 +181,7 @@ fn modal_action_at(hit: &ModalHit, view: &View, col: u16, row: u16) -> Option<Mo
             };
             Some(MouseEffect::ToolApproval(choice))
         }
+        ModalKind::SecretInput => None,
     }
 }
 

@@ -176,6 +176,8 @@ pub enum ModalKind {
     Gate,
     /// Per-tool approval before apply (o/s/d/x).
     ToolApproval,
+    /// Paste an API key for `/auth set-key` (Enter save, Esc cancel).
+    SecretInput,
 }
 
 /// User choice while a tool-approval modal is up.
@@ -216,6 +218,12 @@ pub struct View {
     /// Expand/collapse state for the modal diff body when it overflows the
     /// default preview window.
     pub modal_diff_expanded: bool,
+    /// Provider instance id while [`ModalKind::SecretInput`] is active.
+    pub modal_secret_id: Option<String>,
+    /// Buffered secret text (kept separate from the chat input line).
+    pub modal_input: String,
+    /// Byte cursor within `modal_input`.
+    pub modal_cursor: usize,
     /// Scroll position as distance-from-bottom in visual lines: `0` pins to the
     /// bottom (auto-scroll, the default); a larger value scrolls back that many
     /// lines. Render clamps it to the available scrollback, so it never needs a
@@ -464,6 +472,39 @@ impl View {
         self.modal_kind = ModalKind::Gate;
         self.modal_diff = None;
         self.modal_diff_expanded = false;
+        self.modal_secret_id = None;
+        self.modal_input.clear();
+        self.modal_cursor = 0;
+    }
+
+    /// Open an in-TUI API key entry modal for `/auth set-key <id>`.
+    pub fn open_secret_modal(&mut self, instance_id: impl Into<String>, prompt: impl Into<String>) {
+        self.modal_kind = ModalKind::SecretInput;
+        self.modal_secret_id = Some(instance_id.into());
+        self.modal = Some(prompt.into());
+        self.modal_diff = None;
+        self.modal_diff_expanded = false;
+        self.modal_input.clear();
+        self.modal_cursor = 0;
+    }
+
+    pub fn modal_input_push(&mut self, c: char) {
+        let pos = self.modal_cursor.min(self.modal_input.len());
+        self.modal_input.insert(pos, c);
+        self.modal_cursor = pos + c.len_utf8();
+    }
+
+    pub fn modal_input_backspace(&mut self) {
+        if self.modal_cursor == 0 {
+            return;
+        }
+        let start = self.modal_input[..self.modal_cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.modal_input.replace_range(start..self.modal_cursor, "");
+        self.modal_cursor = start;
     }
 
     /// Open a picker overlay (non-empty menus only).
@@ -1417,6 +1458,7 @@ pub(crate) fn modal_hint_plain(view: &View) -> &'static str {
             "[o] once   [s] session   [d] decline   [x] cancel   [e] expand   [c] collapse"
         }
         ModalKind::ToolApproval => "[o] once   [s] session   [d] decline   [x] cancel",
+        ModalKind::SecretInput => "[Enter] save   [Esc] cancel",
     }
 }
 
@@ -1438,6 +1480,10 @@ fn modal_hint_spans(view: &View) -> Vec<Span<'static>> {
             push_key(&mut spans, "s", " session   ");
             push_key(&mut spans, "d", " decline   ");
             push_key(&mut spans, "x", " cancel");
+        }
+        ModalKind::SecretInput => {
+            push_key(&mut spans, "Enter", " save   ");
+            push_key(&mut spans, "Esc", " cancel");
         }
     }
     if view.modal_diff.is_some() {
@@ -1696,6 +1742,7 @@ fn modal_title(view: &View) -> &'static str {
     match view.modal_kind {
         ModalKind::Gate => " gate ",
         ModalKind::ToolApproval => " approve ",
+        ModalKind::SecretInput => " api key ",
     }
 }
 
@@ -2026,6 +2073,22 @@ pub fn render(frame: &mut Frame, view: &View) {
             prompt.clone(),
             Style::default().fg(PRIMARY),
         )));
+        if view.modal_kind == ModalKind::SecretInput {
+            let masked: String = view.modal_input.chars().map(|_| '•').collect();
+            let display = if masked.is_empty() {
+                "(paste key here)".to_string()
+            } else {
+                format!("{masked} ")
+            };
+            body_lines.push(Line::from(Span::styled(
+                display,
+                Style::default().fg(if view.modal_input.is_empty() {
+                    DIM
+                } else {
+                    PRIMARY
+                }),
+            )));
+        }
         if !diff_lines.is_empty() {
             body_lines.push(Line::from(""));
             body_lines.extend(diff_lines);
@@ -2183,6 +2246,15 @@ pub fn render(frame: &mut Frame, view: &View) {
                 "? / g? / /help",
                 Some("help overlay (? when input empty in chat mode)"),
             ),
+            (
+                "/auth setup",
+                Some("provider wizard; /auth set-key <id> paste key in TUI"),
+            ),
+            (
+                "Ctrl-Space",
+                Some("palette — setup grok-cli / ollama-native / openrouter"),
+            ),
+            ("Ctrl-C mid-reply", Some("cancel turn (keeps partial text)")),
             ("mouse wheel", Some("scrolls transcript")),
             ("", None),
             ("PICKER (open menu)", None),
@@ -2255,7 +2327,7 @@ pub fn render(frame: &mut Frame, view: &View) {
                 ("STRUCTURED SHELL", None),
                 (
                     "chrome bar",
-                    Some("model · scope · trust · aden always visible"),
+                    Some("model · scope · trust · aden ([text-only] = CLI piggyback)"),
                 ),
                 (
                     "conversation",

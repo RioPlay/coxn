@@ -58,7 +58,7 @@ impl CodexPiggybackModel {
     fn run_turn(
         &self,
         request: &ModelRequest,
-        on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<ModelResponse, ModelError> {
         let prompt = flatten_request(request);
         let config = CodexAppServerConfig::for_turn(
@@ -70,7 +70,7 @@ impl CodexPiggybackModel {
         let mut session = CodexAppServerSession::spawn(&config)
             .map_err(|e| ModelError::Backend(format!("codex app-server spawn failed: {e}")))?;
         let completion = session
-            .complete_text_turn(&self.model, &self.cwd, &prompt, on_delta)
+            .complete_text_turn(&self.model, &self.cwd, &prompt, io)
             .map_err(|e| ModelError::Backend(format!("codex turn failed: {e}")))?;
         Ok(ModelResponse {
             message: Message::new(Role::Assistant, completion.text),
@@ -86,15 +86,15 @@ impl Model for CodexPiggybackModel {
     }
 
     async fn call(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
-        self.run_turn(&request, None)
+        self.run_turn(&request, &mut crate::pump::SilentIo)
     }
 
     async fn stream(
         &self,
         request: ModelRequest,
-        on_delta: &mut dyn FnMut(&str) -> bool,
+        io: &mut dyn crate::pump::TurnIo,
     ) -> Result<ModelResponse, ModelError> {
-        self.run_turn(&request, Some(on_delta))
+        self.run_turn(&request, io)
     }
 }
 
@@ -163,9 +163,8 @@ mod tests {
 
     #[tokio::test]
     async fn piggyback_turn_from_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("coxn-codex-model-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = crate::cli_ndjson::test_support::fake_cli_test_lock();
+        let dir = crate::cli_ndjson::test_support::unique_temp_dir("coxn-codex-model");
         let fake = write_fake_codex(&dir, FakeCodexMode::TextTurn);
         let model =
             CodexPiggybackModel::new(fake.to_string_lossy(), "test-model", None, vec![], &dir);

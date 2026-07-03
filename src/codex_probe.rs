@@ -80,6 +80,7 @@ pub fn format_status_line(
     }
 }
 
+#[allow(dead_code)]
 pub fn binary_installed(bin: &str) -> bool {
     codex_app_server::binary_installed(bin)
 }
@@ -117,9 +118,8 @@ mod tests {
 
     #[test]
     fn probe_parses_account_read_from_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("coxn-codex-probe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = crate::cli_ndjson::test_support::fake_cli_test_lock();
+        let dir = crate::cli_ndjson::test_support::unique_temp_dir("coxn-codex-probe");
         let fake = write_fake_codex(&dir, FakeCodexMode::AuthOnly);
         let config =
             CodexAppServerConfig::for_probe(fake.to_string_lossy().to_string(), None, vec![]);

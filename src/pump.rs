@@ -77,17 +77,63 @@ pub trait TurnIo {
     fn on_tool_result(&mut self, _call: &ToolCall, _result: &str) {}
     /// Observe token usage when the provider reports it.
     fn on_usage(&mut self, _usage: Usage) {}
+    /// Called periodically while a backend blocks waiting for the next stream
+    /// chunk. Return `false` to cancel the turn. Default: no-op.
+    fn on_idle(&mut self) -> bool {
+        true
+    }
+    /// Whether the user cancelled during the most recent stream/read phase.
+    #[allow(dead_code)]
+    fn stream_cancelled(&self) -> bool {
+        false
+    }
 }
 
-/// A silent [`TurnIo`]: stream nothing, allow every mutation. Test-only -- it
-/// bypasses the approval prompt, so it must never reach production (the live
-/// loop always drives a real [`TurnIo`]).
-#[cfg(test)]
-struct SilentIo;
-#[cfg(test)]
+/// A silent [`TurnIo`]: stream nothing, allow every mutation. Used for
+/// non-interactive model calls (e.g. codex `call()`); never for the live TUI.
+pub(crate) struct SilentIo;
 impl TurnIo for SilentIo {
     fn on_delta(&mut self, _delta: &str) -> bool {
         true
+    }
+}
+
+/// Tracks whether `on_delta` / `on_idle` / `on_run_output` returned false.
+struct CancelTrack<'a> {
+    inner: &'a mut dyn TurnIo,
+    cancelled: bool,
+}
+
+impl TurnIo for CancelTrack<'_> {
+    fn on_delta(&mut self, delta: &str) -> bool {
+        let ok = self.inner.on_delta(delta);
+        self.cancelled |= !ok;
+        ok
+    }
+    fn on_idle(&mut self) -> bool {
+        let ok = self.inner.on_idle();
+        self.cancelled |= !ok;
+        ok
+    }
+    fn approve(&mut self, call: &ToolCall) -> Approval {
+        self.inner.approve(call)
+    }
+    fn on_run_output(&mut self, line: &str) -> bool {
+        let ok = self.inner.on_run_output(line);
+        self.cancelled |= !ok;
+        ok
+    }
+    fn on_tool_call(&mut self, call: &ToolCall) {
+        self.inner.on_tool_call(call);
+    }
+    fn on_tool_result(&mut self, call: &ToolCall, result: &str) {
+        self.inner.on_tool_result(call, result);
+    }
+    fn on_usage(&mut self, usage: Usage) {
+        self.inner.on_usage(usage);
+    }
+    fn stream_cancelled(&self) -> bool {
+        self.cancelled || self.inner.stream_cancelled()
     }
 }
 
@@ -306,16 +352,13 @@ impl<M: Model> Pump<M> {
         let max_turns = self.effective_max_turns();
         for _ in 0..max_turns {
             let request = self.request();
-            // Wrap the sink to notice a cancellation request mid-stream.
-            let mut cancelled = false;
-            let response = {
-                let mut sink = |delta: &str| {
-                    let keep_going = io.on_delta(delta);
-                    cancelled |= !keep_going;
-                    keep_going
-                };
-                self.model.stream(request, &mut sink).await?
+            let mut track = CancelTrack {
+                inner: io,
+                cancelled: false,
             };
+            let response = self.model.stream(request, &mut track).await?;
+            let cancelled = track.cancelled;
+            let io = track.inner;
             // Track context size: the latest hop that reports usage wins.
             if response.usage.is_some() {
                 self.last_usage = response.usage;

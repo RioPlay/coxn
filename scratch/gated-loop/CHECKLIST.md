@@ -24,6 +24,7 @@ Run after each meaningful diff batch, before continuing feature work.
 - [ ] Live progress does not destroy transcript
 - [ ] Empty input: Up recalls prior prompt; Down returns through history (typing scrolls chat)
 - [ ] Shell ergonomics spot-check: history, submit, scroll — no surprise rebinding
+- [ ] Typing works during Codex / Claude / Grok / OpenAI / Ollama stream (`on_idle` + `drain_input_edits`)
 
 ## Telemetry / cross-repo cosmetics
 

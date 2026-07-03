@@ -41,12 +41,40 @@ pub fn run(dir: &Path) -> i32 {
             warnings = true;
             println!("  warn: cloud endpoint without COXN_MODEL_KEY may 401");
         }
+    } else if let Some((_, sel)) = crate::discover::detect_cli(dir) {
+        println!("✓ model: {} (auto-detect CLI)", sel.label());
+    } else if let Some((_, sel)) = crate::discover::detect_ollama_native() {
+        println!("✓ model: {} (auto-detect ollama native)", sel.label());
     } else if let Some((base, model)) = detected {
-        println!("✓ model: {model} @ {base} (auto-detect)");
+        println!("✓ model: {model} @ {base} (auto-detect HTTP)");
     } else {
-        blocking = true;
-        println!("✗ model: OFFLINE STUB — no endpoint reachable");
-        println!("  fix: start Ollama/LM Studio, or set COXN_MODEL_BASE_URL");
+        let provider_cfg = provider::load_config(dir);
+        if let Some(selection) = provider_cfg.route("active") {
+            let instance_ok = provider_cfg
+                .instance(&selection.instance_id)
+                .is_some_and(|i| {
+                    i.enabled && crate::discover::cli_instance_ready(i)
+                        || matches!(
+                            i.driver,
+                            provider::ProviderDriver::OpenAiCompat
+                                | provider::ProviderDriver::Ollama
+                        )
+                });
+            if instance_ok {
+                println!(
+                    "✓ model: {}:{} (config route.active — run coxn to connect)",
+                    selection.instance_id, selection.model
+                );
+            } else {
+                blocking = true;
+                println!("✗ model: route.active points at unavailable provider");
+                println!("  fix: coxn auth status · /auth setup <preset>");
+            }
+        } else {
+            blocking = true;
+            println!("✗ model: OFFLINE STUB — no endpoint reachable");
+            println!("  fix: Ctrl-Space → setup preset, or start Ollama/LM Studio");
+        }
     }
 
     let provider_cfg = provider::load_config(dir);
@@ -103,11 +131,40 @@ pub fn run(dir: &Path) -> i32 {
                 }
                 provider::ProviderDriver::ClaudeCli => {
                     let bin = instance.binary.as_deref().unwrap_or("claude");
-                    if codex_probe::binary_installed(bin) {
-                        println!("○ {}: {bin} installed (auth probe deferred)", instance.id);
-                    } else {
+                    let home = instance.home_path.as_deref();
+                    if !crate::cli_ndjson::binary_installed(bin) {
                         blocking = true;
                         println!("✗ {}: {bin} not installed or not runnable", instance.id);
+                    } else if crate::claude_cli::probe_logged_in(bin, home, &instance.env) {
+                        println!(
+                            "✓ {}: {bin} authenticated (claude CLI piggyback — text-only turns)",
+                            instance.id
+                        );
+                    } else {
+                        blocking = true;
+                        println!(
+                            "✗ {}: {bin} installed but not logged in (`{bin} login`)",
+                            instance.id
+                        );
+                    }
+                }
+                provider::ProviderDriver::GrokCli => {
+                    let bin = instance.binary.as_deref().unwrap_or("grok");
+                    let home = instance.home_path.as_deref();
+                    if !crate::cli_ndjson::binary_installed(bin) {
+                        blocking = true;
+                        println!("✗ {}: {bin} not installed or not runnable", instance.id);
+                    } else if crate::grok_cli::probe_logged_in(bin, home, &instance.env) {
+                        println!(
+                            "✓ {}: {bin} authenticated (grok CLI piggyback — text-only turns)",
+                            instance.id
+                        );
+                    } else {
+                        blocking = true;
+                        println!(
+                            "✗ {}: {bin} installed but not logged in (`{bin} login`)",
+                            instance.id
+                        );
                     }
                 }
                 provider::ProviderDriver::Unknown(driver) => {
