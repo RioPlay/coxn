@@ -5,6 +5,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0.0] - 2026-07-02
+
+### Added
+
+- **TUI 3.0 structured shell** (default on): chrome bar, conversation turn cards,
+  activity drawer for `/execute`, `!cmd`, slash listings, and aden feeds.
+  `COXN_TUI3=0` restores legacy single-pane. `Ctrl-T` collapses tool cards;
+  `Ctrl-Shift-R` toggles hidden reasoning blocks.
+- **`src/ui/`** turn model, region render, `export_text()` for `/copy`.
+- **`docs/tui-3.0-structure.adoc`**, gated-loop scratch tracking.
+
+### Changed
+
+- Live `/execute` and `!cmd` stream to activity without wiping conversation.
+- Human gate on `!cmd` (y/n confirm); partition cancel appends to feed.
+- All aden/vim/ex/sys output routes through activity when structured shell is on.
+
+### Fixed
+
+- `/execute` live progress no longer replaces full transcript.
+- `COXN_VIM` / env test races gated with mutex locks.
+
 ## [0.4.0.0] - 2026-07-02
 
 ### Added

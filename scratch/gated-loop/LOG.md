@@ -75,6 +75,14 @@
 **Tests:** 325 pass
 
 **Commit:** `6e9a4f7`
+
+### Pass 6 — 2026-07-02 (repo hygiene)
+
+**Actions:**
+- Health stack green (325 tests, clippy, fmt, secrets)
+- VERSION → 0.5.0.0 + CHANGELOG for TUI 3.0
+- Pruned merged stale branches (local + origin)
+- Pushed `main` to origin
 - Other env vars in tests without locks (lower priority)
 
 **Quick fix after re-review:** `partition cancelled` appends instead of replacing transcript
