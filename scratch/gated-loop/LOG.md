@@ -167,3 +167,13 @@
 - Optional Anthropic-direct API profile (deferred in PLAN)
 - README scope-escape GIF (docs asset)
 - Ship: merge `feat/cli-piggybacks-grok-claude` → main via PR
+
+### Pass 12 — 2026-07-03 (loose ends)
+
+**Shipped:**
+- CHANGELOG/VERSION 0.5.1.0; config example + README/INSTALL/PLAN sync
+- `/execute` `execute_route_guard` blocks text-only active model or role routes
+- `/agents` marks `[text-only]` routes; footer updated
+- `discover::selection_is_text_only` + tests
+
+**Tests:** 342 pass

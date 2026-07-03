@@ -68,6 +68,23 @@ pub fn detect_ollama_native() -> Option<(AnyModel, ModelSel)> {
     ))
 }
 
+/// True when a provider instance uses a text-only CLI piggyback driver.
+pub fn instance_is_text_only(driver: &ProviderDriver) -> bool {
+    matches!(
+        driver,
+        ProviderDriver::Codex | ProviderDriver::ClaudeCli | ProviderDriver::GrokCli
+    )
+}
+
+/// True when a configured `instance:model` selection resolves to a text-only backend.
+pub fn selection_is_text_only(
+    cfg: &provider::ProviderConfig,
+    selection: &provider::ModelSelection,
+) -> bool {
+    cfg.instance(&selection.instance_id)
+        .is_some_and(|i| i.enabled && instance_is_text_only(&i.driver))
+}
+
 /// Whether a configured CLI instance is installed and authenticated.
 pub fn cli_instance_ready(instance: &ProviderInstance) -> bool {
     match instance.driver {
@@ -192,5 +209,20 @@ mod tests {
             }),
         };
         assert!(!is_text_only_piggyback(&openai));
+    }
+
+    #[test]
+    fn selection_is_text_only_for_cli_drivers() {
+        let mut cfg = provider::ProviderConfig::default();
+        cfg.instances.push(ProviderInstance::for_probe(
+            "grok",
+            ProviderDriver::GrokCli,
+            "grok",
+        ));
+        let sel = provider::ModelSelection {
+            instance_id: "grok".into(),
+            model: "m".into(),
+        };
+        assert!(selection_is_text_only(&cfg, &sel));
     }
 }

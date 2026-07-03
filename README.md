@@ -134,6 +134,14 @@ At runtime, `/model` lists every model the provider advertises and `/model
 <instance>/<name>` switches instance, and `/model @<role>` uses the `[route]`
 mapping. Tab-completion and arrow-navigation are available in the picker.
 
+### CLI piggyback backends (Codex, Claude Code, Grok Build)
+
+Presets `codex`, `claude-cli`, and `grok-cli` run chat turns through the local
+CLI (`codex app-server`, `claude -p`, `grok -p`). coxn does **not** forward its
+tool schemas to the CLI — these backends are **text-only** in the harness (chrome
+shows `[text-only]`). Use them for subscription-auth chat; use OpenAI-compat or
+`ollama-native` for gated edits, `run_command`, and `/execute` partitions.
+
 ## Tools and the safety model
 
 Every mutating tool call opens an **approval modal with a diff preview** before it runs:

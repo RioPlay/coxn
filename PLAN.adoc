@@ -237,8 +237,8 @@ Spec: `docs/next-generation-harness-plan.adoc` (KISS execution plan).
       usage from `prompt_eval_count`/`eval_count`, tool-call dedup) behind
       `ProviderDriver::Ollama`, with `ollama_model`, `/auth` + `/doctor`
       reachability probes. Live Ollama smoke test pending (no `ollama` binary on
-      this host); the wire format is unit-tested. Codex probe + CLI piggyback
-      backend remain open (Phase N9-N11).
+      this host); the wire format is unit-tested. Codex + Claude + Grok CLI
+      piggybacks shipped (N9–N11); `/execute` refuses text-only role routes.
 
 == Notes / decisions
 

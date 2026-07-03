@@ -234,6 +234,36 @@ fn execute_jobs() -> usize {
         .min(8)
 }
 
+/// Refuse `/execute` when the active model or a role route is text-only CLI piggyback.
+fn execute_route_guard(
+    dir: &Path,
+    caps: &aden::AdenCaps,
+    sel: &ModelSel,
+    ordered: &[&agents::SubScope],
+) -> Option<String> {
+    if crate::discover::is_text_only_piggyback(sel) {
+        return Some(
+            "active model is text-only (CLI piggyback) — /execute needs tools.\n\
+             fix: route scout/synth to openai_compat or ollama in .aden/config.toml, \
+             or Ctrl-Space → setup ollama-native / openrouter-claude"
+                .to_string(),
+        );
+    }
+    let cfg = provider::load_config(dir);
+    for scope in ordered {
+        if let Some(selection) = resolve_role(dir, caps, &scope.role)
+            && crate::discover::selection_is_text_only(&cfg, &selection)
+        {
+            return Some(format!(
+                "role '{}' routes to text-only CLI piggyback ({}:{}).\n\
+                 /execute needs tool-capable backends for scout/synth/orchestrate.",
+                scope.role, selection.instance_id, selection.model
+            ));
+        }
+    }
+    None
+}
+
 /// Run the aden task partition sequentially: one pump per sub-scope, dense merge.
 async fn execute_partition_sequential(
     dir: &Path,
@@ -260,6 +290,9 @@ async fn execute_partition_sequential(
     let ordered = agents::dependency_order(&scopes);
     if ordered.is_empty() {
         return "aden returned no sub-scopes".to_string();
+    }
+    if let Some(msg) = execute_route_guard(dir, caps, sel, &ordered) {
+        return msg;
     }
     let resume_slug = resume.then(|| run_ledger::latest_for_task(&name)).flatten();
     let prior_statuses = resume_slug
@@ -801,6 +834,9 @@ async fn execute_partition_parallel(
     if ordered.is_empty() {
         return "aden returned no sub-scopes".to_string();
     }
+    if let Some(msg) = execute_route_guard(dir, caps, sel, &ordered) {
+        return msg;
+    }
     let mut ledger = run_ledger::RunLedger::create(&name);
     // Record whether every read-only scope wave can run disjoint by mandate.
     // Read-only scopes never mutate, so this is informational, not a gate.
@@ -1087,6 +1123,26 @@ mod tests {
         unsafe {
             std::env::remove_var("COXN_EXECUTE_JOBS");
         }
+    }
+
+    #[test]
+    fn execute_route_guard_blocks_text_only_active_model() {
+        let caps = aden::AdenCaps {
+            available: false,
+            model_base_url: None,
+            model_name: None,
+        };
+        let sel = ModelSel {
+            name: "m".into(),
+            endpoint: Some(crate::app::Endpoint {
+                instance_id: "grok".into(),
+                base_url: format!("{}grok", crate::grok_cli::GROK_CLI_SCHEME),
+                key: None,
+                source: "test".into(),
+            }),
+        };
+        let msg = execute_route_guard(Path::new("."), &caps, &sel, &[]).expect("should block");
+        assert!(msg.contains("text-only"));
     }
 
     #[test]

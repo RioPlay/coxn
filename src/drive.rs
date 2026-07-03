@@ -1177,9 +1177,17 @@ fn agents_listing(dir: &Path, caps: &aden::AdenCaps) -> String {
         return "aden returned no sub-scopes".to_string();
     }
     let mut out = format!("partition of '{name}' (dependency order):\n");
+    let cfg = provider::load_config(dir);
     for s in agents::dependency_order(&scopes) {
         let model = resolve_role(dir, caps, &s.role)
-            .map(|s| format!("{}:{}", s.instance_id, s.model))
+            .map(|sel| {
+                let tag = if crate::discover::selection_is_text_only(&cfg, &sel) {
+                    " [text-only]"
+                } else {
+                    ""
+                };
+                format!("{}:{}{tag}", sel.instance_id, sel.model)
+            })
             .unwrap_or_else(|| "(default model)".to_string());
         let after = if s.depends_on.is_empty() {
             String::new()
@@ -1194,9 +1202,7 @@ fn agents_listing(dir: &Path, caps: &aden::AdenCaps) -> String {
             policy.label()
         ));
     }
-    out.push_str(
-        "(partition ready; BatchIo + per-Pump execution substrate added; runner wiring next)",
-    );
+    out.push_str("\nRun /execute to run the partition (tool-capable routes required; [text-only] CLI piggybacks cannot edit/run).");
     out
 }
 

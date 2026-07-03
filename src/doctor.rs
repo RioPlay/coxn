@@ -52,11 +52,14 @@ pub fn run(dir: &Path) -> i32 {
         if let Some(selection) = provider_cfg.route("active") {
             let instance_ok = provider_cfg
                 .instance(&selection.instance_id)
-                .is_some_and(|i| i.enabled && crate::discover::cli_instance_ready(i)
-                    || matches!(
-                        i.driver,
-                        provider::ProviderDriver::OpenAiCompat | provider::ProviderDriver::Ollama
-                    ));
+                .is_some_and(|i| {
+                    i.enabled && crate::discover::cli_instance_ready(i)
+                        || matches!(
+                            i.driver,
+                            provider::ProviderDriver::OpenAiCompat
+                                | provider::ProviderDriver::Ollama
+                        )
+                });
             if instance_ok {
                 println!(
                     "✓ model: {}:{} (config route.active — run coxn to connect)",
