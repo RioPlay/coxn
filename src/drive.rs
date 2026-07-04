@@ -689,96 +689,169 @@ fn resolve_model(dir: &Path, caps: &aden::AdenCaps) -> (AnyModel, ModelSel) {
     )
 }
 
+/// Remember the active `instance:model` selection in `.aden/config.toml`.
+fn persist_active_route(dir: &Path, sel: &ModelSel) {
+    let Some(e) = sel.endpoint.as_ref() else {
+        return;
+    };
+    let route = format!("{}:{}", e.instance_id, sel.name);
+    if let Err(err) = provider::set_active_route(dir, &route) {
+        eprintln!("warn: could not persist route.active: {err}");
+    }
+    if let Err(err) = provider::set_route_entry(dir, &e.instance_id, &route) {
+        eprintln!("warn: could not persist route.{}: {err}", e.instance_id);
+    }
+}
+
+/// Hot-swap to another signed-in backend (persists `route.active`).
+fn switch_backend(
+    dir: &Path,
+    pump: &mut Pump<AnyModel>,
+    sel: &mut ModelSel,
+    instance_id: &str,
+) -> String {
+    let backends = crate::discover::list_ready_backends(dir);
+    let Some(backend) = backends.iter().find(|b| b.instance_id == instance_id) else {
+        return format!("backend '{instance_id}' not ready — run /auth status or /auth setup");
+    };
+    let cfg = provider::load_config(dir);
+    let model = cfg
+        .route(instance_id)
+        .map(|r| r.model)
+        .unwrap_or_else(|| backend.model.clone());
+    let selection = provider::ModelSelection {
+        instance_id: instance_id.to_string(),
+        model,
+    };
+    let Some((model, new_sel)) = crate::discover::resolve_backend_selection(dir, selection) else {
+        return format!("backend '{instance_id}' unavailable");
+    };
+    pump.set_model(model);
+    *sel = new_sel;
+    persist_active_route(dir, sel);
+    format!("switched to {}", sel.label())
+}
+
+/// Render backends + models for `/model` and `/providers`.
+fn backends_listing(dir: &Path, sel: &ModelSel) -> String {
+    let backends = crate::discover::list_ready_backends(dir);
+    let active_id = sel.endpoint.as_ref().map(|e| e.instance_id.as_str());
+    if backends.is_empty() {
+        return "no backends ready — Ctrl-Space → setup, or /auth setup\n".to_string();
+    }
+    let mut out = String::from("backends (/model <instance> or picker — * = active):\n");
+    for b in &backends {
+        let mark = if active_id == Some(b.instance_id.as_str()) {
+            '*'
+        } else {
+            ' '
+        };
+        let tag = if b.text_only { " [text-only]" } else { "" };
+        out.push_str(&format!("  {mark} {} · {}{tag}\n", b.display_name, b.model));
+    }
+    out.push('\n');
+    out
+}
+
 /// Render the `/model` listing: every model the provider advertises (loaded or
 /// not), the active one marked. Falls back to the label when there is no
 /// provider or the listing cannot be fetched.
 fn model_listing(dir: &Path, sel: &ModelSel) -> String {
+    let mut out = backends_listing(dir, sel);
     let Some(e) = &sel.endpoint else {
-        return format!("model: {}", sel.label());
+        out.push_str(&format!("model: {}", sel.label()));
+        return out;
     };
     if let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) {
         let cfg = provider::load_config(dir);
         let instance = cfg.instance(&e.instance_id);
         let codex_home = instance.and_then(|i| i.shadow_home.as_deref().or(i.home_path.as_deref()));
         let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
-        return match codex_model::list_models(binary, codex_home, env) {
+        match codex_model::list_models(binary, codex_home, env) {
             Some(models) if !models.is_empty() => {
-                let mut out = format!("models on {binary} (/model <name|#> to switch):\n");
+                out.push_str(&format!(
+                    "models on {binary} (/model <name|#> to switch):\n"
+                ));
                 for (i, m) in models.iter().enumerate() {
                     let mark = if *m == sel.name { '*' } else { ' ' };
                     out.push_str(&format!("  {mark} {:>2}. {m}\n", i + 1));
                 }
                 out.push_str("(* = active; codex CLI piggyback — text-only turns)");
-                out
             }
-            _ => format!(
+            _ => out.push_str(&format!(
                 "model: {}  (could not list models from {binary})",
                 sel.label()
-            ),
-        };
+            )),
+        }
+        return out;
     }
     if let Some(binary) = claude_cli::binary_from_endpoint(&e.base_url) {
         let cfg = provider::load_config(dir);
         let instance = cfg.instance(&e.instance_id);
         let home = instance.and_then(|i| i.home_path.as_deref());
         let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
-        return match claude_cli::list_models(binary, home, env) {
+        match claude_cli::list_models(binary, home, env) {
             Some(models) if !models.is_empty() => {
-                let mut out = format!("models on {binary} (/model <name|#> to switch):\n");
+                out.push_str(&format!(
+                    "models on {binary} (/model <name|#> to switch):\n"
+                ));
                 for (i, m) in models.iter().enumerate() {
                     let mark = if *m == sel.name { '*' } else { ' ' };
                     out.push_str(&format!("  {mark} {:>2}. {m}\n", i + 1));
                 }
                 out.push_str("(* = active; claude CLI piggyback — text-only turns)");
-                out
             }
-            _ => format!(
+            _ => out.push_str(&format!(
                 "model: {}  (could not list models from {binary})",
                 sel.label()
-            ),
-        };
+            )),
+        }
+        return out;
     }
     if let Some(binary) = grok_cli::binary_from_endpoint(&e.base_url) {
         let cfg = provider::load_config(dir);
         let instance = cfg.instance(&e.instance_id);
         let home = instance.and_then(|i| i.home_path.as_deref());
         let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
-        return match grok_cli::list_models(binary, home, env) {
+        match grok_cli::list_models(binary, home, env) {
             Some(models) if !models.is_empty() => {
-                let mut out = format!("models on {binary} (/model <name|#> to switch):\n");
+                out.push_str(&format!(
+                    "models on {binary} (/model <name|#> to switch):\n"
+                ));
                 for (i, m) in models.iter().enumerate() {
                     let mark = if *m == sel.name { '*' } else { ' ' };
                     out.push_str(&format!("  {mark} {:>2}. {m}\n", i + 1));
                 }
                 out.push_str("(* = active; grok CLI piggyback — text-only turns)");
-                out
             }
-            _ => format!(
+            _ => out.push_str(&format!(
                 "model: {}  (could not list models from {binary})",
                 sel.label()
-            ),
-        };
+            )),
+        }
+        return out;
     }
     match openai::list_models(&e.base_url, e.key.as_deref()) {
         Some(models) if !models.is_empty() => {
-            // Best-effort load state, so the user can pick a hot model and skip a
-            // slow cold load. Empty (no annotations) on servers that do not report it.
             let loaded = openai::loaded_models(&e.base_url, e.key.as_deref()).unwrap_or_default();
-            let mut out = format!("models on {} (/model <name|#> to switch):\n", e.base_url);
+            out.push_str(&format!(
+                "models on {} (/model <name|#> to switch):\n",
+                e.base_url
+            ));
             for (i, m) in models.iter().enumerate() {
                 let mark = if *m == sel.name { '*' } else { ' ' };
                 let hot = if loaded.contains(m) { "  [loaded]" } else { "" };
                 out.push_str(&format!("  {mark} {:>2}. {m}{hot}\n", i + 1));
             }
             out.push_str("(* = active, [loaded] = hot in memory)");
-            out
         }
-        _ => format!(
+        _ => out.push_str(&format!(
             "model: {}  (could not list models from {})",
             sel.label(),
             e.base_url
-        ),
+        )),
     }
+    out
 }
 
 /// Switch the active model to `target` (a 1-based index into the listing or a
@@ -786,21 +859,30 @@ fn model_listing(dir: &Path, sel: &ModelSel) -> String {
 /// can be selected (the backend JIT-loads it on first call). Returns the status
 /// message to show.
 fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, target: &str) -> String {
+    let target = target.trim();
     if let Some((instance_id, model_name)) = target.split_once('/') {
-        let cfg = provider::load_config(dir);
         let selection = provider::ModelSelection {
             instance_id: instance_id.trim().to_string(),
             model: model_name.trim().to_string(),
         };
         if selection.instance_id.is_empty() || selection.model.is_empty() {
-            return "usage: /model <name|#|instance/name>".to_string();
+            return "usage: /model <name|#|instance/model|instance>".to_string();
         }
-        let Some((model, new_sel)) = resolve_instance_from_config(&cfg, selection, "manual") else {
+        let Some((model, new_sel)) = crate::discover::resolve_backend_selection(dir, selection)
+        else {
             return format!("provider instance '{instance_id}' is unavailable");
         };
         pump.set_model(model);
         *sel = new_sel;
+        persist_active_route(dir, sel);
         return format!("switched to {}", sel.label());
+    }
+    if target.parse::<usize>().is_err()
+        && crate::discover::list_ready_backends(dir)
+            .iter()
+            .any(|b| b.instance_id == target)
+    {
+        return switch_backend(dir, pump, sel, target);
     }
     let Some(e) = &sel.endpoint else {
         return "no provider to switch on (offline stub)".to_string();
@@ -823,6 +905,7 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
         };
         pump.set_model(model);
         sel.name = chosen;
+        persist_active_route(dir, sel);
         return format!("switched to {}", sel.label());
     }
     if let Some(binary) = claude_cli::binary_from_endpoint(&e.base_url) {
@@ -843,6 +926,7 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
         };
         pump.set_model(model);
         sel.name = chosen;
+        persist_active_route(dir, sel);
         return format!("switched to {}", sel.label());
     }
     if let Some(binary) = grok_cli::binary_from_endpoint(&e.base_url) {
@@ -863,6 +947,7 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
         };
         pump.set_model(model);
         sel.name = chosen;
+        persist_active_route(dir, sel);
         return format!("switched to {}", sel.label());
     }
     let listed = openai::list_models(&e.base_url, e.key.as_deref()).unwrap_or_default();
@@ -879,57 +964,88 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
         e.key.clone(),
     )));
     sel.name = chosen;
+    persist_active_route(dir, sel);
     format!("switched to {}", sel.label())
 }
-/// Build the `/model` picker (every advertised model, hot ones marked, the
-/// active one starred). `None` for the offline stub or an unreachable endpoint.
+
+/// Build the `/model` picker: ready backends first, then models on the active one.
 fn model_menu(dir: &Path, sel: &ModelSel) -> Option<Menu> {
-    let e = sel.endpoint.as_ref()?;
-    let cfg = provider::load_config(dir);
-    let instance = cfg.instance(&e.instance_id);
-    let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
-    let models = if let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) {
-        let codex_home = instance.and_then(|i| i.shadow_home.as_deref().or(i.home_path.as_deref()));
-        codex_model::list_models(binary, codex_home, env)?
-    } else if let Some(binary) = claude_cli::binary_from_endpoint(&e.base_url) {
-        let home = instance.and_then(|i| i.home_path.as_deref());
-        claude_cli::list_models(binary, home, env)?
-    } else if let Some(binary) = grok_cli::binary_from_endpoint(&e.base_url) {
-        let home = instance.and_then(|i| i.home_path.as_deref());
-        grok_cli::list_models(binary, home, env)?
-    } else {
-        openai::list_models(&e.base_url, e.key.as_deref())?
-    };
-    if models.is_empty() {
+    let backends = crate::discover::list_ready_backends(dir);
+    if backends.is_empty() && sel.endpoint.is_none() {
         return None;
     }
-    let loaded = if codex_model::codex_binary_from_endpoint(&e.base_url).is_some()
-        || claude_cli::binary_from_endpoint(&e.base_url).is_some()
-        || grok_cli::binary_from_endpoint(&e.base_url).is_some()
-    {
-        Vec::new()
-    } else {
-        openai::loaded_models(&e.base_url, e.key.as_deref()).unwrap_or_default()
-    };
-    let selected = models.iter().position(|m| *m == sel.name).unwrap_or(0);
-    let items = models
-        .into_iter()
-        .map(|m| {
-            let hot = if loaded.contains(&m) {
-                "  [loaded]"
+    let active_id = sel.endpoint.as_ref().map(|e| e.instance_id.as_str());
+    let mut items: Vec<MenuItem> = Vec::new();
+    let mut selected = 0usize;
+
+    for (i, b) in backends.iter().enumerate() {
+        let mark = if active_id == Some(b.instance_id.as_str()) {
+            selected = i;
+            '*'
+        } else {
+            ' '
+        };
+        let tag = if b.text_only { " [text-only]" } else { "" };
+        items.push(MenuItem {
+            label: format!("{mark} → {} · {}{tag}", b.display_name, b.model),
+            value: format!("backend:{}", b.instance_id),
+        });
+    }
+
+    if let Some(e) = sel.endpoint.as_ref() {
+        let cfg = provider::load_config(dir);
+        let instance = cfg.instance(&e.instance_id);
+        let env = instance.map(|i| i.env.as_slice()).unwrap_or(&[]);
+        let models = if let Some(binary) = codex_model::codex_binary_from_endpoint(&e.base_url) {
+            let codex_home =
+                instance.and_then(|i| i.shadow_home.as_deref().or(i.home_path.as_deref()));
+            codex_model::list_models(binary, codex_home, env)
+        } else if let Some(binary) = claude_cli::binary_from_endpoint(&e.base_url) {
+            let home = instance.and_then(|i| i.home_path.as_deref());
+            claude_cli::list_models(binary, home, env)
+        } else if let Some(binary) = grok_cli::binary_from_endpoint(&e.base_url) {
+            let home = instance.and_then(|i| i.home_path.as_deref());
+            grok_cli::list_models(binary, home, env)
+        } else {
+            openai::list_models(&e.base_url, e.key.as_deref())
+        };
+        if let Some(models) = models.filter(|m| !m.is_empty()) {
+            let loaded = if codex_model::codex_binary_from_endpoint(&e.base_url).is_some()
+                || claude_cli::binary_from_endpoint(&e.base_url).is_some()
+                || grok_cli::binary_from_endpoint(&e.base_url).is_some()
+            {
+                Vec::new()
             } else {
-                ""
+                openai::loaded_models(&e.base_url, e.key.as_deref()).unwrap_or_default()
             };
-            let active = if m == sel.name { "  *" } else { "" };
-            MenuItem {
-                label: format!("{m}{hot}{active}"),
-                value: m,
+            items.push(MenuItem {
+                label: "— models on active backend —".to_string(),
+                value: String::new(),
+            });
+            for m in models {
+                let hot = if loaded.contains(&m) {
+                    "  [loaded]"
+                } else {
+                    ""
+                };
+                let active = if m == sel.name { "  *" } else { "" };
+                if m == sel.name {
+                    selected = items.len();
+                }
+                items.push(MenuItem {
+                    label: format!("  {m}{hot}{active}"),
+                    value: m,
+                });
             }
-        })
-        .collect();
+        }
+    }
+
+    if items.is_empty() {
+        return None;
+    }
     Some(Menu {
         kind: MenuKind::Model,
-        title: "models".to_string(),
+        title: "backends + models".to_string(),
         items,
         selected,
         scroll: 0,
@@ -975,7 +1091,26 @@ fn session_menu() -> Option<Menu> {
 fn palette_menu(dir: &Path, sel: &ModelSel, history: &[String]) -> Menu {
     let mut catalog: Vec<MenuItem> = Vec::new();
 
-    for preset in ["grok-cli", "ollama-native", "openrouter-claude"] {
+    let active_id = sel.endpoint.as_ref().map(|e| e.instance_id.as_str());
+    for b in crate::discover::list_ready_backends(dir) {
+        let mark = if active_id == Some(b.instance_id.as_str()) {
+            "✓"
+        } else {
+            " "
+        };
+        let tag = if b.text_only { " [text-only]" } else { "" };
+        catalog.push(MenuItem {
+            label: format!("{mark} → {} · {}{tag}", b.display_name, b.model),
+            value: format!("backend:{}", b.instance_id),
+        });
+    }
+
+    for preset in [
+        "grok-cli",
+        "claude-cli",
+        "ollama-native",
+        "openrouter-claude",
+    ] {
         if let Some(p) = provider::preset_by_id(preset) {
             catalog.push(MenuItem {
                 label: format!("setup  {preset} — {}", p.label),
@@ -1098,7 +1233,11 @@ fn commands_menu() -> Option<Menu> {
         value: "/auth status".to_string(),
     });
     items.push(MenuItem {
-        label: "/model - list/switch models".to_string(),
+        label: "/providers - hot-swap signed-in backends".to_string(),
+        value: "/providers ".to_string(),
+    });
+    items.push(MenuItem {
+        label: "/model - backends + models picker".to_string(),
         value: "/model ".to_string(),
     });
     items.push(MenuItem {
@@ -2019,12 +2158,16 @@ fn dispatch_menu_pick(
 ) {
     match kind {
         MenuKind::Model => {
-            show_slash_output(
-                view,
-                "/model",
-                switch_model(dir, pump, sel, &value),
-                pump.messages(),
-            );
+            if value.is_empty() {
+                return;
+            }
+            let msg = if let Some(id) = value.strip_prefix("backend:") {
+                switch_backend(dir, pump, sel, id)
+            } else {
+                switch_model(dir, pump, sel, &value)
+            };
+            show_slash_output(view, "/model", msg, pump.messages());
+            let task_gated = !task.is_empty() && task.contains("gated");
             view.set_status(status_line(
                 dir,
                 &sel.label(),
@@ -2033,6 +2176,14 @@ fn dispatch_menu_pick(
                 view.aden_active,
                 trust,
                 scope_cache,
+            ));
+            view.set_chrome(chrome_state(
+                sel,
+                &scope_cache.chrome_label(task),
+                pump.last_usage(),
+                view.aden_active,
+                trust,
+                task_gated,
             ));
         }
         MenuKind::Session => {
@@ -2155,13 +2306,10 @@ fn dispatch_menu_pick(
             }
         }
         MenuKind::Palette => {
-            if let Some(name) = value.strip_prefix("model:") {
-                show_slash_output(
-                    view,
-                    "/model",
-                    switch_model(dir, pump, sel, name),
-                    pump.messages(),
-                );
+            if let Some(id) = value.strip_prefix("backend:") {
+                let msg = switch_backend(dir, pump, sel, id);
+                show_slash_output(view, "/model", msg, pump.messages());
+                let task_gated = !task.is_empty() && task.contains("gated");
                 view.set_status(status_line(
                     dir,
                     &sel.label(),
@@ -2170,6 +2318,39 @@ fn dispatch_menu_pick(
                     view.aden_active,
                     trust,
                     scope_cache,
+                ));
+                view.set_chrome(chrome_state(
+                    sel,
+                    &scope_cache.chrome_label(task),
+                    pump.last_usage(),
+                    view.aden_active,
+                    trust,
+                    task_gated,
+                ));
+            } else if let Some(name) = value.strip_prefix("model:") {
+                show_slash_output(
+                    view,
+                    "/model",
+                    switch_model(dir, pump, sel, name),
+                    pump.messages(),
+                );
+                let task_gated = !task.is_empty() && task.contains("gated");
+                view.set_status(status_line(
+                    dir,
+                    &sel.label(),
+                    task,
+                    pump.last_usage(),
+                    view.aden_active,
+                    trust,
+                    scope_cache,
+                ));
+                view.set_chrome(chrome_state(
+                    sel,
+                    &scope_cache.chrome_label(task),
+                    pump.last_usage(),
+                    view.aden_active,
+                    trust,
+                    task_gated,
                 ));
             } else if let Some(slug) = value.strip_prefix("session:") {
                 let messages = session::load(slug);
@@ -3304,9 +3485,19 @@ async fn drive(
                             view.toggle_help();
                             view.show_mode_tip();
                         }
+                        Command::Providers => {
+                            refresh_discovery(dir, pump, sel, true);
+                            match model_menu(dir, sel) {
+                                Some(menu) => view.open_menu(menu),
+                                None => show_slash_output(
+                                    view,
+                                    "/providers",
+                                    model_listing(dir, sel),
+                                    pump.messages(),
+                                ),
+                            }
+                        }
                         Command::Model(None) => {
-                            // Re-discover first: a backend started after boot is
-                            // selectable now, no reboot.
                             refresh_discovery(dir, pump, sel, true);
                             match model_menu(dir, sel) {
                                 Some(menu) => view.open_menu(menu),

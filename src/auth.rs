@@ -85,16 +85,38 @@ fn setup(dir: &Path, preset_id: Option<&str>) -> AuthReport {
 }
 
 fn status(dir: &Path) -> AuthReport {
-    let cfg = provider::load_config(dir);
-    if cfg.instances.is_empty() {
-        return AuthReport {
-            code: 0,
-            output: "no provider profiles configured\n".to_string(),
-        };
-    }
-
     let mut blocking = false;
     let mut output = String::new();
+
+    let ready = crate::discover::list_ready_backends(dir);
+    if !ready.is_empty() {
+        output.push_str("ready backends (hot-swap via /model or Ctrl-Space):\n");
+        let active = provider::load_config(dir).route("active");
+        for b in &ready {
+            let mark = if active
+                .as_ref()
+                .is_some_and(|a| a.instance_id == b.instance_id)
+            {
+                "✓"
+            } else {
+                " "
+            };
+            let tag = if b.text_only { " [text-only]" } else { "" };
+            output.push_str(&format!("  {mark} {} · {}{tag}\n", b.display_name, b.model));
+        }
+        output.push('\n');
+    }
+
+    let cfg = provider::load_config(dir);
+    if cfg.instances.is_empty() && ready.is_empty() {
+        return AuthReport {
+            code: 0,
+            output: "no provider profiles configured — try: coxn auth setup grok-cli\n".to_string(),
+        };
+    }
+    if !cfg.instances.is_empty() {
+        output.push_str("configured providers:\n");
+    }
     for instance in &cfg.instances {
         if !instance.enabled {
             output.push_str(&format!("○ {}: disabled\n", instance.id));

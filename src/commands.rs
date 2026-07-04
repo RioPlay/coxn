@@ -8,6 +8,8 @@ pub(crate) enum Command {
     Clear,
     /// `/model` lists; `/model <name|#>` switches.
     Model(Option<String>),
+    /// `/providers` lists ready backends and opens the hot-swap picker.
+    Providers,
     Tools,
     /// `/session` lists saved sessions.
     Session,
@@ -51,6 +53,7 @@ pub(crate) fn parse_command(input: &str) -> Command {
         "quit" | "q" | "exit" => Command::Quit,
         "clear" => Command::Clear,
         "model" => Command::Model(arg),
+        "providers" | "provider" | "backends" => Command::Providers,
         "tools" => Command::Tools,
         "session" | "sessions" => Command::Session,
         "resume" => Command::Resume(arg),
@@ -73,8 +76,25 @@ pub(crate) fn parse_command(input: &str) -> Command {
 
 /// Slash command verbs, for Tab completion and the fuzzy palette (M4).
 pub(crate) const COMMANDS: &[&str] = &[
-    "help", "model", "auth", "think", "tools", "agents", "execute", "scope", "trust", "copy",
-    "undo", "export", "session", "resume", "runs", "edit", "clear", "quit",
+    "help",
+    "model",
+    "providers",
+    "auth",
+    "think",
+    "tools",
+    "agents",
+    "execute",
+    "scope",
+    "trust",
+    "copy",
+    "undo",
+    "export",
+    "session",
+    "resume",
+    "runs",
+    "edit",
+    "clear",
+    "quit",
 ];
 
 /// The longest common prefix of `items` (empty if they share none).
@@ -171,6 +191,8 @@ mod tests {
             Command::Auth(vec!["setup".to_string(), "openrouter-claude".to_string()])
         );
         assert_eq!(parse_command("/model"), Command::Model(None));
+        assert_eq!(parse_command("/providers"), Command::Providers);
+        assert_eq!(parse_command("/backends"), Command::Providers);
         assert_eq!(
             parse_command("/model gpt"),
             Command::Model(Some("gpt".to_string()))

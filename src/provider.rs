@@ -305,12 +305,34 @@ fn remove_section(text: &str, section_name: &str) -> String {
     out.trim_end().to_string()
 }
 
-fn set_route_active(text: &str, selection: &str) -> String {
-    let active_line = format!("active = \"{selection}\"");
+/// Persist `route.active` so hot-swaps survive restart.
+pub fn set_active_route(dir: &Path, selection: &str) -> Result<(), String> {
+    set_route_entry(dir, "active", selection)
+}
+
+/// Persist any `[route]` key (`active`, per-instance memory, role routes).
+pub fn set_route_entry(dir: &Path, key: &str, selection: &str) -> Result<(), String> {
+    if split_selection(selection).is_none() {
+        return Err(format!("invalid route selection '{selection}'"));
+    }
+    if key.trim().is_empty() {
+        return Err("empty route key".to_string());
+    }
+    let path = config_path(dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let merged = merge_route_key(&existing, key, selection);
+    write_config_atomic(&path, &merged)
+}
+
+fn merge_route_key(text: &str, key: &str, selection: &str) -> String {
+    let route_line = format!("{key} = \"{selection}\"");
     if text.contains("[route]") {
         let mut out = String::new();
         let mut in_route = false;
-        let mut wrote_active = false;
+        let mut wrote_key = false;
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed == "[route]" {
@@ -320,24 +342,24 @@ fn set_route_active(text: &str, selection: &str) -> String {
                 continue;
             }
             if in_route && trimmed.starts_with('[') {
-                if !wrote_active {
-                    out.push_str(&active_line);
+                if !wrote_key {
+                    out.push_str(&route_line);
                     out.push('\n');
-                    wrote_active = true;
+                    wrote_key = true;
                 }
                 in_route = false;
             }
-            if in_route && trimmed.starts_with("active") {
-                out.push_str(&active_line);
+            if in_route && trimmed.starts_with(key) {
+                out.push_str(&route_line);
                 out.push('\n');
-                wrote_active = true;
+                wrote_key = true;
                 continue;
             }
             out.push_str(line);
             out.push('\n');
         }
-        if in_route && !wrote_active {
-            out.push_str(&active_line);
+        if in_route && !wrote_key {
+            out.push_str(&route_line);
             out.push('\n');
         }
         out.trim_end().to_string()
@@ -347,10 +369,14 @@ fn set_route_active(text: &str, selection: &str) -> String {
             out.push_str("\n\n");
         }
         out.push_str("[route]\n");
-        out.push_str(&active_line);
+        out.push_str(&route_line);
         out.push('\n');
         out
     }
+}
+
+fn set_route_active(text: &str, selection: &str) -> String {
+    merge_route_key(text, "active", selection)
 }
 
 pub fn split_selection(value: &str) -> Option<ModelSelection> {
@@ -682,6 +708,17 @@ mod tests {
         let text = std::fs::read_to_string(config_path(&dir)).unwrap();
         assert!(text.contains("http://localhost:1234/v1"));
         assert!(text.contains("active = \"local:local\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_active_route_writes_route_section() {
+        let dir = std::env::temp_dir().join(format!("coxn-route-active-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".aden")).unwrap();
+        set_active_route(&dir, "grok:grok-model").expect("set route");
+        let text = std::fs::read_to_string(config_path(&dir)).unwrap();
+        assert!(text.contains("active = \"grok:grok-model\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
