@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
+use serde_json::json;
 
 use crate::app::{
     AGENT_PREAMBLE_ADEN, AGENT_PREAMBLE_BASE, ModelSel, openai_model, rebuild_claude_cli_model,
@@ -2683,6 +2684,21 @@ async fn drive(
     // Append-only session persistence: every message not yet written is flushed
     // after each turn. `persisted` tracks how many of pump.messages() are on disk.
     let mut session = session::Session::create();
+    let ledger_name = std::env::var("COXN_TASK_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("chat-{}", session.slug()));
+    let mut chat_ledger = run_ledger::RunLedger::create(&ledger_name);
+    chat_ledger.append(
+        "run_started",
+        None,
+        None,
+        json!({
+            "task": ledger_name,
+            "mode": "chat",
+            "session": session.slug(),
+        }),
+    );
     let mut persisted = 0usize;
     // Tool names approved "for the session" -- they skip the approval prompt.
     let mut approvals: HashSet<String> = HashSet::new();
@@ -3696,7 +3712,15 @@ async fn drive(
                 // A leading slash is a local command, not a model turn.
                 if text.trim_start().starts_with('/') {
                     match parse_command(text.trim()) {
-                        Command::Quit => return Ok(()),
+                        Command::Quit => {
+                            chat_ledger.append(
+                                "run_finished",
+                                None,
+                                None,
+                                json!({ "status": "quit" }),
+                            );
+                            return Ok(());
+                        }
                         Command::Help => {
                             view.toggle_help();
                             view.show_mode_tip();
@@ -4065,13 +4089,25 @@ async fn drive(
                 // fragments cancels the turn (kept partial) rather than quitting.
                 let prior = transcript(pump.messages());
                 view.pending_since = Some(Instant::now());
+                chat_ledger.append(
+                    "model_selected",
+                    Some("chat"),
+                    Some("main"),
+                    json!({ "model": sel.label() }),
+                );
+                chat_ledger.append(
+                    "turn_started",
+                    Some("chat"),
+                    Some("main"),
+                    json!({ "prompt_chars": text.chars().count() }),
+                );
                 // Run the turn (streaming + per-tool approval via DriveIo),
                 // retrying transient backend errors with a cancellable countdown.
                 let mut attempt = 0u32;
                 let result;
                 let mut cancelled;
                 loop {
-                    let mut io = DriveIo {
+                    let mut drive_io = DriveIo {
                         dir,
                         tui,
                         view,
@@ -4084,8 +4120,14 @@ async fn drive(
                         approved_commands: &mut approved_commands,
                         bwrap,
                     };
+                    let mut io = run_ledger::LedgerTurnIo::new(
+                        &mut drive_io,
+                        &mut chat_ledger,
+                        "chat",
+                        "main",
+                    );
                     let r = pump.run_turn_streaming(&mut io).await;
-                    cancelled = io.cancelled || io.cancel_turn;
+                    cancelled = drive_io.cancelled || drive_io.cancel_turn;
                     if let Err(e) = &r
                         && e.is_transient()
                         && attempt < MAX_RETRIES
@@ -4107,6 +4149,13 @@ async fn drive(
                 let turn_elapsed = view.pending_since.take().map(|s| s.elapsed());
                 match result {
                     Ok(_) => {
+                        let turn_status = if cancelled { "cancelled" } else { "success" };
+                        chat_ledger.append(
+                            "turn_finished",
+                            Some("chat"),
+                            Some("main"),
+                            json!({ "status": turn_status }),
+                        );
                         refresh_conversation(view, pump.messages());
                         // A quiet per-turn timing footer in the transcript -- the
                         // record keeps it after the live status bar moves on.
@@ -4133,6 +4182,12 @@ async fn drive(
                         });
                     }
                     Err(err) => {
+                        chat_ledger.append(
+                            "turn_finished",
+                            Some("chat"),
+                            Some("main"),
+                            json!({ "status": "error", "error": err.to_string() }),
+                        );
                         // Keep the error visible (don't let the savings refresh
                         // clobber it); the partial transcript still renders.
                         refresh_conversation(view, pump.messages());

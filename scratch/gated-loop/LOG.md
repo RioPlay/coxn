@@ -200,3 +200,17 @@
 **Validated:** `smoke-gate.sh` pass (aden + demo-scope-escape wedge)
 
 **Next:** embed scope-escape visual in README; WS2 run ledger pump wiring
+
+### Pass 15 — 2026-07-05 (WS2 observability)
+
+**Shipped:**
+- `LedgerTurnIo` in `run_ledger.rs` — shared pump-boundary recorder
+- Chat session ledger: `run_started` at boot, per-turn `model_selected` +
+  `turn_started`/`turn_finished`, quit → `run_finished`
+- Enhanced `/runs <slug>` summary (models, approvals, gate blocks, usage)
+- Run ledger event schema in `docs/contract.adoc`
+- README `/runs` docs; auth list/setup test hardened against flaky daemon probes
+
+**Tests:** 347 pass
+
+**Next:** WS1 visual embed; WS2d parallel ledger; WS3 grok usage + stream cancel

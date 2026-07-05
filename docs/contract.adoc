@@ -172,6 +172,58 @@ coxn pins *aden >= 0.2.0* for the gate and `scope`/`config` surface. The merge
 of `feat/coxn-directional-prereqs` into aden mainline is owned by the aden
 maintainer; coxn does not require it to run, only to amplify.
 
+[[run-ledger]]
+
+== Run ledger (coxn-side)
+
+Append-only JSONL under `$XDG_DATA_HOME/coxn/runs/` (override: `COXN_RUNS_DIR`).
+One object per line; sensitive fields are redacted before write. Ledger write
+failure never breaks the TUI run.
+
+.Event kinds
+[cols="1,3a"]
+|===
+| Kind | Meaning
+
+| `run_started`
+| Run opened (`task`, `mode` = `chat` or partition, optional `session`).
+
+| `scope_started` / `scope_finished`
+| Sub-scope lifecycle for `/execute` partitions.
+
+| `turn_started` / `turn_finished`
+| One interactive chat turn (`chat` scope).
+
+| `model_selected`
+| Active model label for a turn or scope.
+
+| `assistant_delta`
+| Streamed assistant text fragment (char count only).
+
+| `tool_call` / `tool_result`
+| Tool dispatch and result (char counts; no full payloads by default).
+
+| `approval`
+| Human gate decision: `allow`, `decline`, or `cancel_turn`.
+
+| `file_edit`
+| Accepted `edit` / `write_file` result.
+
+| `command_output`
+| Live `run_command` line (char count).
+
+| `gate_verdict`
+| Blast-radius block (`verdict: blocked`).
+
+| `usage`
+| Provider token usage when reported.
+
+| `run_finished`
+| Run closed (`status`: `success`, `error`, `quit`, `cancelled`, …).
+|===
+
+Inspect with `/runs` (list) and `/runs <slug>` (compact summary).
+
 == Provenance
 
 Grounded in aden research, `topics/aden-roadmap/aden-as-directional-harness.adoc`

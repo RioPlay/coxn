@@ -5,6 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use crate::model::{ToolCall, Usage};
+use crate::pump::{Approval, TurnIo};
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -138,6 +141,141 @@ impl RunLedger {
     }
 }
 
+fn approval_label(decision: Approval) -> &'static str {
+    match decision {
+        Approval::Allow => "allow",
+        Approval::Decline => "decline",
+        Approval::CancelTurn => "cancel_turn",
+    }
+}
+
+fn record_tool_result(
+    ledger: &mut RunLedger,
+    scope: &str,
+    role: &str,
+    call: &ToolCall,
+    result: &str,
+) {
+    ledger.append(
+        "tool_result",
+        Some(scope),
+        Some(role),
+        json!({ "tool": call.name, "chars": result.chars().count() }),
+    );
+    if result.contains("EDIT BLOCKED") || result.contains("COMMAND BLOCKED") {
+        ledger.append(
+            "gate_verdict",
+            Some(scope),
+            Some(role),
+            json!({ "tool": call.name, "verdict": "blocked" }),
+        );
+    } else if matches!(call.name.as_str(), "edit" | "write_file")
+        && !result.contains("declined")
+        && !result.contains("cancelled")
+    {
+        ledger.append(
+            "file_edit",
+            Some(scope),
+            Some(role),
+            json!({ "tool": call.name, "chars": result.chars().count() }),
+        );
+    }
+}
+
+/// Wrap any [`TurnIo`] and append pump-boundary facts to a run ledger.
+pub(crate) struct LedgerTurnIo<'a, I: ?Sized> {
+    inner: &'a mut I,
+    ledger: &'a mut RunLedger,
+    scope: &'a str,
+    role: &'a str,
+}
+
+impl<'a, I: ?Sized> LedgerTurnIo<'a, I> {
+    pub(crate) fn new(
+        inner: &'a mut I,
+        ledger: &'a mut RunLedger,
+        scope: &'a str,
+        role: &'a str,
+    ) -> Self {
+        Self {
+            inner,
+            ledger,
+            scope,
+            role,
+        }
+    }
+}
+
+impl<I: TurnIo + ?Sized> TurnIo for LedgerTurnIo<'_, I> {
+    fn on_delta(&mut self, delta: &str) -> bool {
+        self.ledger.append(
+            "assistant_delta",
+            Some(self.scope),
+            Some(self.role),
+            json!({ "chars": delta.chars().count() }),
+        );
+        self.inner.on_delta(delta)
+    }
+
+    fn approve(&mut self, call: &ToolCall) -> Approval {
+        let decision = self.inner.approve(call);
+        self.ledger.append(
+            "approval",
+            Some(self.scope),
+            Some(self.role),
+            json!({ "tool": call.name, "decision": approval_label(decision) }),
+        );
+        decision
+    }
+
+    fn on_run_output(&mut self, line: &str) -> bool {
+        self.ledger.append(
+            "command_output",
+            Some(self.scope),
+            Some(self.role),
+            json!({ "chars": line.chars().count() }),
+        );
+        self.inner.on_run_output(line)
+    }
+
+    fn on_tool_call(&mut self, call: &ToolCall) {
+        self.ledger.append(
+            "tool_call",
+            Some(self.scope),
+            Some(self.role),
+            json!({ "tool": call.name }),
+        );
+        self.inner.on_tool_call(call);
+    }
+
+    fn on_tool_result(&mut self, call: &ToolCall, result: &str) {
+        record_tool_result(self.ledger, self.scope, self.role, call, result);
+        self.inner.on_tool_result(call, result);
+    }
+
+    fn on_usage(&mut self, usage: Usage) {
+        self.ledger.append(
+            "usage",
+            Some(self.scope),
+            Some(self.role),
+            json!({
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            }),
+        );
+        self.inner.on_usage(usage);
+    }
+
+    fn on_idle(&mut self) -> bool {
+        self.inner.on_idle()
+    }
+
+    fn stream_cancelled(&self) -> bool {
+        self.inner.stream_cancelled()
+    }
+}
+
 pub(crate) fn list() -> Vec<String> {
     let Some(dir) = runs_dir() else {
         return Vec::new();
@@ -245,19 +383,53 @@ pub(crate) fn summarize(slug: &str) -> Result<String, String> {
     let mut kinds = std::collections::BTreeMap::<String, usize>::new();
     let mut scopes = std::collections::BTreeSet::<String>::new();
     let mut final_status = "unknown".to_string();
+    let mut task = String::new();
+    let mut mode = String::new();
+    let mut models = std::collections::BTreeSet::<String>::new();
+    let mut approvals_allow = 0usize;
+    let mut approvals_decline = 0usize;
+    let mut gate_blocks = 0usize;
+    let mut file_edits = 0usize;
+    let mut usage_total = 0u64;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        let data = v.get("data").unwrap_or(&Value::Null);
         if let Some(kind) = v.get("kind").and_then(Value::as_str) {
             *kinds.entry(kind.to_string()).or_default() += 1;
-            if kind == "run_finished"
-                && let Some(status) = v
-                    .get("data")
-                    .and_then(|d| d.get("status"))
-                    .and_then(Value::as_str)
-            {
-                final_status = status.to_string();
+            match kind {
+                "run_started" => {
+                    if let Some(t) = data.get("task").and_then(Value::as_str) {
+                        task = t.to_string();
+                    }
+                    if let Some(m) = data.get("mode").and_then(Value::as_str) {
+                        mode = m.to_string();
+                    }
+                }
+                "run_finished" => {
+                    if let Some(status) = data.get("status").and_then(Value::as_str) {
+                        final_status = status.to_string();
+                    }
+                }
+                "model_selected" => {
+                    if let Some(m) = data.get("model").and_then(Value::as_str) {
+                        models.insert(m.to_string());
+                    }
+                }
+                "approval" => match data.get("decision").and_then(Value::as_str) {
+                    Some("allow") => approvals_allow += 1,
+                    Some("decline") => approvals_decline += 1,
+                    _ => {}
+                },
+                "gate_verdict" => gate_blocks += 1,
+                "file_edit" => file_edits += 1,
+                "usage" => {
+                    if let Some(t) = data.get("total_tokens").and_then(Value::as_u64) {
+                        usage_total += t;
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(scope) = v.get("scope").and_then(Value::as_str) {
@@ -269,11 +441,31 @@ pub(crate) fn summarize(slug: &str) -> Result<String, String> {
         .map(|(k, v)| format!("{k}:{v}"))
         .collect::<Vec<_>>()
         .join(", ");
-    Ok(format!(
-        "run: {slug}\nstatus: {final_status}\nscopes: {}\nevents: {}",
-        scopes.into_iter().collect::<Vec<_>>().join(", "),
-        counts
-    ))
+    let mut out = format!("run: {slug}\nstatus: {final_status}");
+    if !task.is_empty() {
+        out.push_str(&format!("\ntask: {task}"));
+    }
+    if !mode.is_empty() {
+        out.push_str(&format!("\nmode: {mode}"));
+    }
+    out.push_str(&format!(
+        "\nscopes: {}",
+        scopes.into_iter().collect::<Vec<_>>().join(", ")
+    ));
+    if !models.is_empty() {
+        out.push_str(&format!(
+            "\nmodels: {}",
+            models.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out.push_str(&format!(
+        "\napprovals: allow={approvals_allow} decline={approvals_decline}  gate_blocks={gate_blocks}  file_edits={file_edits}"
+    ));
+    if usage_total > 0 {
+        out.push_str(&format!("\nusage_total_tokens: {usage_total}"));
+    }
+    out.push_str(&format!("\nevents: {counts}"));
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -304,10 +496,55 @@ mod tests {
         let summary = summarize(&slug).expect("summary");
         assert!(summary.contains("status: success"));
         assert!(summary.contains("s1"));
+        assert!(summary.contains("gate_blocks="));
         let path = runs_dir().unwrap().join(format!("{slug}.jsonl"));
         let raw = std::fs::read_to_string(path).unwrap();
         assert!(raw.contains("[redacted]"));
         assert!(!raw.contains("sk-test"));
+        unsafe { std::env::remove_var("COXN_RUNS_DIR") };
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    struct FakeIo {
+        deltas: usize,
+    }
+
+    impl TurnIo for FakeIo {
+        fn on_delta(&mut self, _delta: &str) -> bool {
+            self.deltas += 1;
+            true
+        }
+        fn approve(&mut self, _call: &ToolCall) -> Approval {
+            Approval::Decline
+        }
+    }
+
+    #[test]
+    fn ledger_turn_io_records_approval_and_gate_block() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("coxn-ledger-io-{}", std::process::id()));
+        unsafe { std::env::set_var("COXN_RUNS_DIR", &tmp) };
+        let mut ledger = RunLedger::create("ledger-io-test");
+        let slug = ledger.run().to_string();
+        let mut inner = FakeIo { deltas: 0 };
+        let call = ToolCall {
+            id: "t1".into(),
+            name: "edit".into(),
+            arguments: "{}".into(),
+        };
+        {
+            let mut io = LedgerTurnIo::new(&mut inner, &mut ledger, "chat", "main");
+            assert!(io.on_delta("hi"));
+            assert_eq!(io.approve(&call), Approval::Decline);
+            io.on_tool_result(
+                &call,
+                "EDIT BLOCKED by aden gate: scope-escape. The change was reverted.",
+            );
+        }
+        drop(ledger);
+        let summary = summarize(&slug).expect("summary");
+        assert!(summary.contains("approvals: allow=0 decline=1"));
+        assert!(summary.contains("gate_blocks=1"));
         unsafe { std::env::remove_var("COXN_RUNS_DIR") };
         let _ = std::fs::remove_dir_all(tmp);
     }

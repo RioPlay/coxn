@@ -7,8 +7,7 @@ use crate::app::{
     AGENT_PREAMBLE_ADEN, AGENT_PREAMBLE_BASE, ModelSel, openai_model, resolve_instance_from_config,
     resolve_role, task_config,
 };
-use crate::model::{AnyModel, ToolCall, Usage};
-use crate::pump::{Approval, TurnIo};
+use crate::model::{AnyModel, Usage};
 use crate::pump::{BatchIo, Pump};
 use crate::tools::register_aden_tools;
 use crate::tools::{EditTool, GlobTool, GrepTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
@@ -70,99 +69,6 @@ fn registry_for_policy(
         }
     }
     tools
-}
-
-struct LedgerBatchIo<'a> {
-    inner: BatchIo,
-    ledger: &'a mut run_ledger::RunLedger,
-    scope: &'a str,
-    role: &'a str,
-}
-
-impl<'a> LedgerBatchIo<'a> {
-    fn new(ledger: &'a mut run_ledger::RunLedger, scope: &'a str, role: &'a str) -> Self {
-        Self {
-            inner: BatchIo::new(),
-            ledger,
-            scope,
-            role,
-        }
-    }
-
-    fn result(&self) -> String {
-        self.inner.result()
-    }
-}
-
-impl TurnIo for LedgerBatchIo<'_> {
-    fn on_delta(&mut self, delta: &str) -> bool {
-        self.ledger.append(
-            "assistant_delta",
-            Some(self.scope),
-            Some(self.role),
-            json!({ "chars": delta.chars().count() }),
-        );
-        self.inner.on_delta(delta)
-    }
-
-    fn approve(&mut self, call: &ToolCall) -> Approval {
-        self.ledger.append(
-            "approval",
-            Some(self.scope),
-            Some(self.role),
-            json!({ "tool": call.name, "decision": "allow" }),
-        );
-        self.inner.approve(call)
-    }
-
-    fn on_run_output(&mut self, line: &str) -> bool {
-        self.ledger.append(
-            "command_output",
-            Some(self.scope),
-            Some(self.role),
-            json!({ "chars": line.chars().count() }),
-        );
-        self.inner.on_run_output(line)
-    }
-
-    fn on_tool_call(&mut self, call: &ToolCall) {
-        self.ledger.append(
-            "tool_call",
-            Some(self.scope),
-            Some(self.role),
-            json!({ "tool": call.name }),
-        );
-    }
-
-    fn on_tool_result(&mut self, call: &ToolCall, result: &str) {
-        self.ledger.append(
-            "tool_result",
-            Some(self.scope),
-            Some(self.role),
-            json!({ "tool": call.name, "chars": result.chars().count() }),
-        );
-        if result.contains("EDIT BLOCKED") || result.contains("COMMAND BLOCKED") {
-            self.ledger.append(
-                "gate_verdict",
-                Some(self.scope),
-                Some(self.role),
-                json!({ "tool": call.name, "verdict": "blocked" }),
-            );
-        }
-    }
-
-    fn on_usage(&mut self, usage: Usage) {
-        self.ledger.append(
-            "usage",
-            Some(self.scope),
-            Some(self.role),
-            json!({
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "total_tokens": usage.total_tokens,
-            }),
-        );
-    }
 }
 
 /// Optional sink for live `/execute` progress (full report snapshot per update).
@@ -447,10 +353,11 @@ async fn execute_partition_sequential(
              Return a dense summary of actions and findings.",
             scope.id, scope.role
         ));
-        let mut io = LedgerBatchIo::new(&mut ledger, &scope.id, &scope.role);
+        let mut batch = BatchIo::new();
+        let mut io = run_ledger::LedgerTurnIo::new(&mut batch, &mut ledger, &scope.id, &scope.role);
         match pump.run_turn_streaming(&mut io).await {
             Ok(_) => {
-                let result = io.result();
+                let result = batch.result();
                 let usage = pump
                     .last_usage()
                     .map(|u| {

@@ -36,26 +36,24 @@ dirty-tree failure is actionable.
 
 ### 2a — Event schema
 
-- [ ] Lock event kinds in docs (`docs/contract.adoc` or run-ledger section)
-- [ ] Kinds: `run_started`, `scope_started`, `model_selected`, `assistant_delta`,
-      `tool_call`, `approval`, `tool_result`, `file_edit`, `command_output`,
-      `gate_verdict`, `usage`, `scope_finished`, `run_finished`
+- [x] Lock event kinds in docs (`docs/contract.adoc` run-ledger section)
+- [x] Kinds documented: `run_started`, `scope_started`, `model_selected`,
+      `assistant_delta`, `tool_call`, `approval`, `tool_result`, `file_edit`,
+      `command_output`, `gate_verdict`, `usage`, `turn_started`, `turn_finished`,
+      `scope_finished`, `run_finished`
 
 ### 2b — Wire ledger into pump (`TurnIo`)
 
-- [ ] Record approval result (once / session / decline / cancel)
-- [ ] Record tool call + tool result
-- [ ] Record gate verdict on mutating tools
-- [ ] Record usage after each turn
-- [ ] Record streamed assistant deltas (throttled ok)
-- [ ] Record streamed command output for `run_command`
-- [ ] Ledger write failure never breaks TUI run
+- [x] `LedgerTurnIo` wrapper records approval, tool call/result, gate, usage, deltas
+- [x] Chat drive loop wraps `DriveIo` with `LedgerTurnIo`
+- [x] `/execute` sequential path uses shared `LedgerTurnIo` (replaces `LedgerBatchIo`)
+- [x] Ledger write failure never breaks TUI run (append no-ops when dir missing)
 
 ### 2c — User-facing inspection
 
-- [ ] `/runs` — list recent run slugs
-- [ ] `/runs <slug>` — compact summary (scopes, models, approvals, blocks, usage)
-- [ ] Normal chat turns create/append ledger (not only `/execute`)
+- [x] `/runs` — list recent run slugs
+- [x] `/runs <slug>` — enhanced summary (models, approvals, gate blocks, usage)
+- [x] Normal chat turns create/append ledger (`chat` scope per session)
 
 ### 2d — Parallel path parity
 

@@ -269,6 +269,8 @@ status line is honest about which mode is active.
 /auth list       list provider presets
 /auth login <id> print native login or key setup command
 /execute         run aden task partition (live progress; transcript preserved)
+/runs            list execution run ledgers (JSONL under ~/.local/share/coxn/runs/)
+/runs <slug>     summarize a run (approvals, gate blocks, usage)
 ```
 
 CLI:
