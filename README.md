@@ -42,6 +42,19 @@ bash scripts/demo-scope-escape.sh
 It builds a throwaway repo, shows an in-scope edit allowed, an out-of-scope edit
 blocked and reverted, and the sandbox state. No cloud keys required.
 
+Record for docs (requires [asciinema](https://asciinema.org/) or [vhs](https://github.com/charmbracelet/vhs)):
+
+```sh
+bash scripts/record-scope-escape.sh
+```
+
+### Scoped edits and a dirty git tree
+
+When `COXN_TASK_NAME` is set, aden's gate compares the **entire working tree**
+against `HEAD`, not just the file being edited. Uncommitted changes outside the
+task's file mandate can block every scoped edit until you commit or stash them.
+`coxn doctor` and `/scope` warn when a scope is active on a dirty tree.
+
 ## Prerequisites
 
 1. **A model** — Ollama/LM Studio running locally, or `COXN_MODEL_BASE_URL` + `COXN_MODEL_KEY`

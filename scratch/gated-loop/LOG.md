@@ -186,3 +186,17 @@
 - Branch pushed; PR #3 opened for `feat/cli-piggybacks-grok-claude` → main
 
 **Loop closed:** N6/N10b/N11 + onboarding + loose ends complete. Live partition/Ollama smoke remain host-dependent open items in PLAN.
+
+### Pass 14 — 2026-07-05 (production plan + WS1 start)
+
+**Shipped:**
+- `scratch/gated-loop/PRODUCTION-CHECKLIST.md` — full task backlog to production gate
+- Smoke scripts: `smoke-gate.sh`, `smoke-ollama.sh`, `smoke-execute-partition.sh`
+- `record-scope-escape.sh` (asciinema/vhs/manual)
+- README dirty-tree caveat + record instructions
+- `/scope` dirty-tree warning; `coxn doctor` setup preset readiness badges
+- CI: `smoke-gate.sh` after `cargo test`
+
+**Validated:** `smoke-gate.sh` pass (aden + demo-scope-escape wedge)
+
+**Next:** embed scope-escape visual in README; WS2 run ledger pump wiring

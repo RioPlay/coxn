@@ -1772,9 +1772,16 @@ fn scope_listing() -> String {
     }
     let seeds = std::env::var("COXN_TASK_SEEDS").unwrap_or_default();
     let budget = std::env::var("COXN_TASK_BUDGET").unwrap_or_else(|_| "8192".into());
-    format!(
+    let mut out = format!(
         "task: {name}\nseeds: {seeds}\nbudget: {budget}\n(gate active when aden produced a manifest at boot)"
-    )
+    );
+    if doctor::git_dirty(std::env::current_dir().unwrap_or_default().as_path()) {
+        out.push_str(
+            "\n\nwarn: dirty git tree — impact-diff judges the whole working tree vs HEAD.\n\
+             Unrelated local edits can block scoped file edits until you commit or stash them.",
+        );
+    }
+    out
 }
 
 fn copy_transcript(view: &View) -> String {

@@ -216,8 +216,27 @@ pub fn run(dir: &Path) -> i32 {
         println!("○ task: none (ungated — human approval only)");
     }
 
+    // --- Setup presets (readiness at a glance) ---
+    println!();
+    println!("setup presets:");
+    for (category, group) in provider::presets_by_category() {
+        println!("  {}", category.title());
+        for p in *group {
+            let readiness = crate::discover::probe_preset(p);
+            let star = if p.recommended { " ★" } else { "" };
+            println!(
+                "  {} {:<18}{star} {} — {}",
+                readiness.badge(),
+                p.id,
+                p.label,
+                readiness.hint()
+            );
+        }
+    }
+
     // --- Sessions dir ---
     let sessions = session_dir();
+    println!();
     println!("○ sessions: {}", sessions.display());
 
     println!();
