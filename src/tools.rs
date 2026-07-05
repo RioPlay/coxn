@@ -1183,6 +1183,23 @@ mod tests {
     }
 
     #[test]
+    fn mid_session_aden_registration_enables_grep_discovery() {
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(ReadFileTool::new(PathBuf::from("."))));
+        assert!(
+            r.discover("grep").contains("no aden tools"),
+            "before hot-plug: {}",
+            r.discover("grep")
+        );
+        register_aden_tools(&mut r, Path::new("."), true);
+        let hits = r.discover("grep");
+        assert!(
+            hits.contains("aden_grep"),
+            "after hot-plug aden_grep should be discoverable: {hits}"
+        );
+    }
+
+    #[test]
     fn discover_finds_active_aden_tools() {
         // Once aden is detected, its tools are registered active (not latent).
         // The discovery seam must still find them, not false-negative.

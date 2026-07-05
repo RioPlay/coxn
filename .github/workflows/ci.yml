@@ -19,6 +19,7 @@ jobs:
       - run: cargo test
       - run: bash scripts/smoke-gate.sh
       - run: bash scripts/smoke-execute-partition.sh
+      - run: bash scripts/smoke-ollama.sh
       - run: bash scripts/pty-smoke.sh
 
   release:

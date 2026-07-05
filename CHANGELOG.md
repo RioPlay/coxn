@@ -5,6 +5,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.2.0] - 2026-07-05
+
+### Added
+
+- **`coxn doctor` one-screen default**: `ready now` preset summary, grouped `setup`
+  hints; `COXN_DOCTOR_VERBOSE=1` restores the full preset table.
+- **Partition smoke in CI**: `smoke-execute-partition.sh` uses the repo aden store;
+  README static scope-escape demo transcript.
+- **Aden preamble nudge** when aden is on PATH but no task scope is active.
+- **`drive/ex.rs`**: vim `:command` parser extracted from the drive loop (WS4 start).
+
+### Changed
+
+- Non-active provider misconfig (e.g. openrouter without key) warns instead of
+  blocking when auto-detect already found a working model.
+
+### Fixed
+
+- Stream cancel preserves partial text before buffered emit (`Model::stream` default).
+- Grok CLI parses `usage` from `end` / `usage` NDJSON events.
+
 ## [0.5.1.0] - 2026-07-03
 
 ### Added

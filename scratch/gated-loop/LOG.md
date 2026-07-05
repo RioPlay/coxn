@@ -307,3 +307,16 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 
 **Shipped:** README wedge section — static demo transcript under
 `demo-scope-escape.sh` (interim until asciinema/vhs on host)
+
+### Pass 23 — 2026-07-05 (WS4 start + 0.5.2.0)
+
+**Shipped:**
+- `drive/ex.rs` — vim `:command` parser extracted from drive loop
+- Aden preamble nudge when aden on PATH (ungated sessions)
+- `mid_session_aden_registration_enables_grep_discovery` unit test
+- VERSION/CHANGELOG 0.5.2.0 (passes 19–22 rollup)
+
+**Host smokes:**
+- `smoke-ollama.sh` skip: ollama not reachable at :11434 (accepted)
+
+**Validated:** 355 tests; fmt/clippy/secrets/smoke-gate green

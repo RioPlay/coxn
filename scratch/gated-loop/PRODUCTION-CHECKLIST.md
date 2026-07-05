@@ -25,7 +25,7 @@ distribution real; limits honest.
 - [x] Add `scripts/smoke-execute-partition.sh`
 - [x] Add `scripts/smoke-gate.sh` (CI-friendly wrapper)
 - [x] `smoke-gate.sh` passed locally (aden present)
-- [ ] Run `smoke-ollama.sh` on host with ollama; record in `LOG.md`
+- [~] Run `smoke-ollama.sh` on host with ollama; record in `LOG.md` (skip logged — no daemon on host)
 
 **Done when:** README shows wedge visually; smokes scripted and pass locally;
 dirty-tree failure is actionable.
@@ -83,15 +83,15 @@ devex-review clear.
 
 ## Workstream 4 — Architecture & laws
 
-- [ ] Split `drive.rs` → `drive/{mod,input,streaming,slash,boot}.rs`
+- [~] Split `drive.rs` → `drive/{mod,input,streaming,slash,boot}.rs` (`drive/ex.rs` landed)
 - [ ] Move `tui.rs` render into `ui/render.rs`
 - [ ] No module > ~1.5k LOC
 - [ ] Deferred tool discovery: search → append schemas next turn
-- [ ] Unit test mid-session `aden_grep` discovery
-- [ ] Optional aden preamble nudge when aden on PATH
+- [x] Unit test mid-session `aden_grep` discovery
+- [x] Optional aden preamble nudge when aden on PATH
 - [x] Sync `PLAN.adoc` (close stale items — Phase 5, O3, aden branch note)
 - [x] Sync README "Not yet" section
-- [ ] Bump `VERSION` + `CHANGELOG` per workstream ship
+- [x] Bump `VERSION` + `CHANGELOG` per workstream ship (0.5.2.0)
 
 **Done when:** Small modules; deferred discovery works; docs match code.
 
@@ -149,8 +149,8 @@ devex-review clear.
 
 - [ ] Linux seccomp filter (`sandbox.rs`)
 - [ ] Non-Linux sandbox doc or `scripts/run-in-docker.sh`
-- [ ] Anthropic-direct profile — or mark "won't do"
-- [ ] CLI piggyback hybrid bridge — or mark "won't do" (text-only permanent)
+- [x] Anthropic-direct profile — won't do (OpenRouter covers cloud; optional later per DESIGN)
+- [x] CLI piggyback hybrid bridge — won't do (text-only permanent; tools stay on pump)
 
 ---
 
