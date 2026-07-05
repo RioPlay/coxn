@@ -191,6 +191,106 @@ pub fn instance_is_text_only(driver: &ProviderDriver) -> bool {
     )
 }
 
+/// Readiness hint for a built-in preset (used by setup/model pickers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetReadiness {
+    Ready,
+    NeedsKey,
+    NeedsLogin(&'static str),
+    NeedsInstall(&'static str),
+    NeedsDaemon(&'static str),
+}
+
+impl PresetReadiness {
+    pub fn hint(self) -> String {
+        match self {
+            Self::Ready => "ready now".to_string(),
+            Self::NeedsKey => "needs API key after setup".to_string(),
+            Self::NeedsLogin(bin) => format!("run `{bin} login` first"),
+            Self::NeedsInstall(bin) => format!("install `{bin}` first"),
+            Self::NeedsDaemon("ollama") => "start Ollama (`ollama serve`)".to_string(),
+            Self::NeedsDaemon("lmstudio") => "start LM Studio local server".to_string(),
+            Self::NeedsDaemon(_) => "start local server first".to_string(),
+        }
+    }
+
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Ready => "✓",
+            Self::NeedsKey => "🔑",
+            Self::NeedsLogin(_) => "◎",
+            Self::NeedsInstall(_) => "○",
+            Self::NeedsDaemon(_) => "▷",
+        }
+    }
+}
+
+/// Probe whether a preset can be used immediately after `apply_preset`.
+pub fn probe_preset(preset: &provider::ProviderPreset) -> PresetReadiness {
+    if preset.needs_key {
+        return if provider::secret_for_instance(preset.instance_id).is_some() {
+            PresetReadiness::Ready
+        } else {
+            PresetReadiness::NeedsKey
+        };
+    }
+    match preset.driver {
+        "grok_cli" => {
+            if !cli_ndjson::binary_installed("grok") {
+                PresetReadiness::NeedsInstall("grok")
+            } else if grok_cli::probe_logged_in("grok", None, &[]) {
+                PresetReadiness::Ready
+            } else {
+                PresetReadiness::NeedsLogin("grok")
+            }
+        }
+        "claude_cli" => {
+            if !cli_ndjson::binary_installed("claude") {
+                PresetReadiness::NeedsInstall("claude")
+            } else if claude_cli::probe_logged_in("claude", None, &[]) {
+                PresetReadiness::Ready
+            } else {
+                PresetReadiness::NeedsLogin("claude")
+            }
+        }
+        "codex" => {
+            let bin = "codex";
+            if !cli_ndjson::binary_installed(bin) {
+                PresetReadiness::NeedsInstall(bin)
+            } else {
+                let instance =
+                    provider::ProviderInstance::for_probe("codex", ProviderDriver::Codex, bin);
+                match codex_probe::probe_instance(&instance) {
+                    CodexProbeOutcome::Authenticated(_) => PresetReadiness::Ready,
+                    _ => PresetReadiness::NeedsLogin(bin),
+                }
+            }
+        }
+        "ollama" => {
+            if ollama::reachable(preset.base_url) {
+                PresetReadiness::Ready
+            } else {
+                PresetReadiness::NeedsDaemon("ollama")
+            }
+        }
+        "openai_compat" if preset.base_url.contains(":11434") => {
+            if ollama::reachable("http://localhost:11434") {
+                PresetReadiness::Ready
+            } else {
+                PresetReadiness::NeedsDaemon("ollama")
+            }
+        }
+        "openai_compat" if preset.base_url.contains(":1234") => {
+            if openai::list_models(preset.base_url, None).is_some() {
+                PresetReadiness::Ready
+            } else {
+                PresetReadiness::NeedsDaemon("lmstudio")
+            }
+        }
+        _ => PresetReadiness::Ready,
+    }
+}
+
 /// True when a configured `instance:model` selection resolves to a text-only backend.
 pub fn selection_is_text_only(
     cfg: &provider::ProviderConfig,
@@ -464,6 +564,16 @@ mod tests {
         // Without config or live CLIs this may be empty or contain auto-detect only.
         let _backends = list_ready_backends(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_preset_cloud_needs_key_without_secret() {
+        let preset = provider::preset_by_id("openrouter-claude").unwrap();
+        // Without a configured key this should not be Ready (unless env has one).
+        let readiness = probe_preset(preset);
+        if provider::secret_for_instance(preset.instance_id).is_none() {
+            assert_eq!(readiness, PresetReadiness::NeedsKey);
+        }
     }
 
     #[test]

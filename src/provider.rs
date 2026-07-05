@@ -108,6 +108,27 @@ pub fn load_config(dir: &Path) -> ProviderConfig {
     parse_config(&text)
 }
 
+/// How a preset is grouped in the setup picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetCategory {
+    /// Local daemons (Ollama, LM Studio).
+    Local,
+    /// Cloud HTTP APIs (OpenAI, OpenRouter).
+    Cloud,
+    /// Installed CLI piggybacks (grok, claude, codex).
+    Cli,
+}
+
+impl PresetCategory {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Local => "local — free, runs on your machine",
+            Self::Cloud => "cloud API — needs an API key",
+            Self::Cli => "CLI piggyback — uses your terminal login",
+        }
+    }
+}
+
 /// A built-in provider profile users can apply with `coxn auth setup <id>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderPreset {
@@ -118,111 +139,160 @@ pub struct ProviderPreset {
     pub base_url: &'static str,
     pub model: &'static str,
     pub needs_key: bool,
+    pub category: PresetCategory,
+    /// Surfaced first in guided pickers.
+    pub recommended: bool,
 }
+
+/// Presets grouped for menus and CLI listings.
+pub fn presets_by_category() -> &'static [(PresetCategory, &'static [ProviderPreset])] {
+    &[
+        (PresetCategory::Cli, CLI_PRESETS),
+        (PresetCategory::Local, LOCAL_PRESETS),
+        (PresetCategory::Cloud, CLOUD_PRESETS),
+    ]
+}
+
+const LOCAL_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "ollama-native",
+        label: "Ollama (native /api/chat)",
+        instance_id: "local",
+        driver: "ollama",
+        base_url: "http://localhost:11434",
+        model: "qwen2.5-coder",
+        needs_key: false,
+        category: PresetCategory::Local,
+        recommended: true,
+    },
+    ProviderPreset {
+        id: "local-ollama",
+        label: "Ollama (OpenAI-compat /v1)",
+        instance_id: "local",
+        driver: "openai_compat",
+        base_url: "http://localhost:11434/v1",
+        model: "qwen2.5-coder",
+        needs_key: false,
+        category: PresetCategory::Local,
+        recommended: false,
+    },
+    ProviderPreset {
+        id: "lmstudio",
+        label: "LM Studio (:1234)",
+        instance_id: "local",
+        driver: "openai_compat",
+        base_url: "http://localhost:1234/v1",
+        model: "local",
+        needs_key: false,
+        category: PresetCategory::Local,
+        recommended: false,
+    },
+];
+
+const CLOUD_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "openrouter-claude",
+        label: "Claude via OpenRouter",
+        instance_id: "openrouter",
+        driver: "openai_compat",
+        base_url: "https://openrouter.ai/api/v1",
+        model: "anthropic/claude-sonnet-4",
+        needs_key: true,
+        category: PresetCategory::Cloud,
+        recommended: true,
+    },
+    ProviderPreset {
+        id: "openrouter-gpt",
+        label: "GPT via OpenRouter",
+        instance_id: "openrouter",
+        driver: "openai_compat",
+        base_url: "https://openrouter.ai/api/v1",
+        model: "openai/gpt-4o",
+        needs_key: true,
+        category: PresetCategory::Cloud,
+        recommended: false,
+    },
+    ProviderPreset {
+        id: "openrouter-gemini",
+        label: "Gemini via OpenRouter",
+        instance_id: "openrouter",
+        driver: "openai_compat",
+        base_url: "https://openrouter.ai/api/v1",
+        model: "google/gemini-2.0-flash-001",
+        needs_key: true,
+        category: PresetCategory::Cloud,
+        recommended: false,
+    },
+    ProviderPreset {
+        id: "openrouter-grok",
+        label: "Grok via OpenRouter",
+        instance_id: "openrouter",
+        driver: "openai_compat",
+        base_url: "https://openrouter.ai/api/v1",
+        model: "x-ai/grok-2-1212",
+        needs_key: true,
+        category: PresetCategory::Cloud,
+        recommended: false,
+    },
+    ProviderPreset {
+        id: "openai",
+        label: "OpenAI API",
+        instance_id: "openai",
+        driver: "openai_compat",
+        base_url: "https://api.openai.com/v1",
+        model: "gpt-4o",
+        needs_key: true,
+        category: PresetCategory::Cloud,
+        recommended: false,
+    },
+];
+
+const CLI_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "grok-cli",
+        label: "Grok Build CLI (piggyback)",
+        instance_id: "grok",
+        driver: "grok_cli",
+        base_url: "",
+        model: "grok-composer-2.5-fast",
+        needs_key: false,
+        category: PresetCategory::Cli,
+        recommended: true,
+    },
+    ProviderPreset {
+        id: "claude-cli",
+        label: "Claude Code CLI (piggyback)",
+        instance_id: "claude",
+        driver: "claude_cli",
+        base_url: "",
+        model: "claude-sonnet-4-6",
+        needs_key: false,
+        category: PresetCategory::Cli,
+        recommended: false,
+    },
+    ProviderPreset {
+        id: "codex",
+        label: "Codex CLI (app-server piggyback)",
+        instance_id: "codex",
+        driver: "codex",
+        base_url: "",
+        model: "gpt-5.4-mini",
+        needs_key: false,
+        category: PresetCategory::Cli,
+        recommended: false,
+    },
+];
 
 /// Named presets for common local and cloud backends (OpenAI-compat unless noted).
 pub fn presets() -> &'static [ProviderPreset] {
-    &[
-        ProviderPreset {
-            id: "local-ollama",
-            label: "Ollama (OpenAI-compat /v1)",
-            instance_id: "local",
-            driver: "openai_compat",
-            base_url: "http://localhost:11434/v1",
-            model: "qwen2.5-coder",
-            needs_key: false,
-        },
-        ProviderPreset {
-            id: "ollama-native",
-            label: "Ollama (native /api/chat)",
-            instance_id: "local",
-            driver: "ollama",
-            base_url: "http://localhost:11434",
-            model: "qwen2.5-coder",
-            needs_key: false,
-        },
-        ProviderPreset {
-            id: "lmstudio",
-            label: "LM Studio (:1234)",
-            instance_id: "local",
-            driver: "openai_compat",
-            base_url: "http://localhost:1234/v1",
-            model: "local",
-            needs_key: false,
-        },
-        ProviderPreset {
-            id: "openai",
-            label: "OpenAI API",
-            instance_id: "openai",
-            driver: "openai_compat",
-            base_url: "https://api.openai.com/v1",
-            model: "gpt-4o",
-            needs_key: true,
-        },
-        ProviderPreset {
-            id: "openrouter-claude",
-            label: "Claude via OpenRouter",
-            instance_id: "openrouter",
-            driver: "openai_compat",
-            base_url: "https://openrouter.ai/api/v1",
-            model: "anthropic/claude-sonnet-4",
-            needs_key: true,
-        },
-        ProviderPreset {
-            id: "openrouter-gpt",
-            label: "GPT via OpenRouter",
-            instance_id: "openrouter",
-            driver: "openai_compat",
-            base_url: "https://openrouter.ai/api/v1",
-            model: "openai/gpt-4o",
-            needs_key: true,
-        },
-        ProviderPreset {
-            id: "openrouter-gemini",
-            label: "Gemini via OpenRouter",
-            instance_id: "openrouter",
-            driver: "openai_compat",
-            base_url: "https://openrouter.ai/api/v1",
-            model: "google/gemini-2.0-flash-001",
-            needs_key: true,
-        },
-        ProviderPreset {
-            id: "openrouter-grok",
-            label: "Grok via OpenRouter",
-            instance_id: "openrouter",
-            driver: "openai_compat",
-            base_url: "https://openrouter.ai/api/v1",
-            model: "x-ai/grok-2-1212",
-            needs_key: true,
-        },
-        ProviderPreset {
-            id: "codex",
-            label: "Codex CLI (app-server piggyback)",
-            instance_id: "codex",
-            driver: "codex",
-            base_url: "",
-            model: "gpt-5.4-mini",
-            needs_key: false,
-        },
-        ProviderPreset {
-            id: "claude-cli",
-            label: "Claude Code CLI (piggyback)",
-            instance_id: "claude",
-            driver: "claude_cli",
-            base_url: "",
-            model: "claude-sonnet-4-6",
-            needs_key: false,
-        },
-        ProviderPreset {
-            id: "grok-cli",
-            label: "Grok Build CLI (piggyback)",
-            instance_id: "grok",
-            driver: "grok_cli",
-            base_url: "",
-            model: "grok-composer-2.5-fast",
-            needs_key: false,
-        },
-    ]
+    static ALL: std::sync::OnceLock<Vec<ProviderPreset>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        presets_by_category()
+            .iter()
+            .flat_map(|(_, group)| group.iter().copied())
+            .collect()
+    })
+    .as_slice()
 }
 
 pub fn preset_by_id(id: &str) -> Option<&'static ProviderPreset> {

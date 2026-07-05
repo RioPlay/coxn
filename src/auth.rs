@@ -55,18 +55,30 @@ pub fn report(dir: &Path, args: &[String]) -> AuthReport {
 
 fn setup(dir: &Path, preset_id: Option<&str>) -> AuthReport {
     let Some(id) = preset_id else {
-        let mut out = String::from(
-            "provider presets (coxn auth list | coxn auth setup <id> or /auth list | /auth setup <id>):\n\n",
-        );
-        for p in provider::presets() {
-            let key = if p.needs_key {
-                format!("needs {}", provider::secret_env_name(p.instance_id))
-            } else {
-                "no key".to_string()
-            };
-            out.push_str(&format!("  {:<18} {} — {key}\n", p.id, p.label));
+        let mut out =
+            String::from("provider setup wizard — pick one (TUI: /auth setup opens a picker):\n\n");
+        for (category, group) in provider::presets_by_category() {
+            out.push_str(&format!("{}\n", category.title()));
+            for p in *group {
+                let readiness = crate::discover::probe_preset(p);
+                let star = if p.recommended { " ★" } else { "" };
+                let key = if p.needs_key {
+                    format!("needs {}", provider::secret_env_name(p.instance_id))
+                } else {
+                    "no key".to_string()
+                };
+                out.push_str(&format!(
+                    "  {} {:<20}{star} {} — {key} ({})\n",
+                    readiness.badge(),
+                    p.id,
+                    p.label,
+                    readiness.hint()
+                ));
+            }
+            out.push('\n');
         }
-        out.push_str("\nexample: coxn auth list\nexample: coxn auth setup openrouter-claude\n");
+        out.push_str("example: coxn auth setup grok-cli\n");
+        out.push_str("example: coxn auth setup ollama-native\n");
         return AuthReport {
             code: 0,
             output: out,
@@ -338,5 +350,7 @@ mod tests {
         let setup = report(dir, &["setup".to_string()]);
         assert_eq!(list.code, 0);
         assert_eq!(list.output, setup.output);
+        assert!(setup.output.contains("CLI piggyback"));
+        assert!(setup.output.contains("grok-cli"));
     }
 }

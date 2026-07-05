@@ -431,11 +431,13 @@ pub(crate) async fn run_tui(dir: &Path) -> io::Result<()> {
         append_sys_note(
             &mut view,
             "\n\nsys: ⚠ offline — no model reachable yet\n\
-             sys: fix: Ctrl-Space → setup grok-cli / ollama-native / openrouter-claude\n\
-             sys: or /auth setup · start Ollama/LM Studio · set COXN_MODEL_BASE_URL\n\
+             sys: fix: type /auth setup (opens guided picker) or Ctrl-Space → setup\n\
+             sys: recommended: grok-cli · ollama-native · openrouter-claude\n\
              sys: [r] retry  [q] quit  (slash commands still work)",
         );
-        view.set_status("OFFLINE STUB  |  /auth setup  /model  [r] retry  [q] quit".to_string());
+        view.set_status(
+            "OFFLINE STUB  |  /auth setup (picker)  /model  [r] retry  [q] quit".to_string(),
+        );
     }
     if std::env::var("COXN_TASK_NAME")
         .ok()
@@ -737,7 +739,8 @@ fn backends_listing(dir: &Path, sel: &ModelSel) -> String {
     let backends = crate::discover::list_ready_backends(dir);
     let active_id = sel.endpoint.as_ref().map(|e| e.instance_id.as_str());
     if backends.is_empty() {
-        return "no backends ready — Ctrl-Space → setup, or /auth setup\n".to_string();
+        return "no backends ready — /auth setup (guided picker) or Ctrl-Space → setup\n"
+            .to_string();
     }
     let mut out = String::from("backends (/model <instance> or picker — * = active):\n");
     for b in &backends {
@@ -968,6 +971,98 @@ fn switch_model(dir: &Path, pump: &mut Pump<AnyModel>, sel: &mut ModelSel, targe
     format!("switched to {}", sel.label())
 }
 
+fn push_preset_menu_items(items: &mut Vec<MenuItem>, selected: &mut usize, mut select_first: bool) {
+    for (category, group) in provider::presets_by_category() {
+        items.push(MenuItem {
+            label: format!("— {} —", category.title()),
+            value: String::new(),
+        });
+        for preset in *group {
+            let readiness = crate::discover::probe_preset(preset);
+            let star = if preset.recommended { " ★" } else { "" };
+            items.push(MenuItem {
+                label: format!(
+                    "  {} {}{star} — {}  ({})",
+                    readiness.badge(),
+                    preset.id,
+                    preset.label,
+                    readiness.hint()
+                ),
+                value: format!("auth:setup:{}", preset.id),
+            });
+            if select_first && readiness == crate::discover::PresetReadiness::Ready {
+                *selected = items.len() - 1;
+                select_first = false;
+            }
+        }
+    }
+}
+
+fn push_key_setup_items(dir: &Path, items: &mut Vec<MenuItem>) {
+    let cfg = provider::load_config(dir);
+    let mut seen = std::collections::HashSet::new();
+    for instance in &cfg.instances {
+        if !instance.enabled {
+            continue;
+        }
+        if !matches!(instance.driver, provider::ProviderDriver::OpenAiCompat) {
+            continue;
+        }
+        let base = instance.base_url.as_deref().unwrap_or("");
+        let needs_key = !provider::is_local_base_url(base)
+            && provider::secret_for_instance(&instance.id).is_none();
+        if needs_key && seen.insert(instance.id.clone()) {
+            items.push(MenuItem {
+                label: format!(
+                    "  🔑 paste API key — {} ({})",
+                    instance.display_name.as_deref().unwrap_or(&instance.id),
+                    provider::secret_env_name(&instance.id)
+                ),
+                value: format!("auth:set-key:{}", instance.id),
+            });
+        }
+    }
+}
+
+/// Guided provider setup picker (`/auth setup`, offline bootstrap).
+fn auth_setup_menu(dir: &Path) -> Menu {
+    let mut items: Vec<MenuItem> = Vec::new();
+    let mut selected = 0usize;
+
+    let ready = !crate::discover::list_ready_backends(dir).is_empty();
+    if ready {
+        items.push(MenuItem {
+            label: "switch model — /model".to_string(),
+            value: "auth:model".to_string(),
+        });
+        selected = 1;
+    }
+
+    push_preset_menu_items(&mut items, &mut selected, !ready);
+    push_key_setup_items(dir, &mut items);
+
+    items.push(MenuItem {
+        label: "— actions —".to_string(),
+        value: String::new(),
+    });
+    items.push(MenuItem {
+        label: "  check status — probe all providers".to_string(),
+        value: "auth:status".to_string(),
+    });
+
+    Menu {
+        kind: MenuKind::Auth,
+        title: "setup provider — ↑↓ navigate, Enter select".to_string(),
+        items,
+        selected,
+        scroll: 0,
+        count: None,
+        pending_g: false,
+        filter: String::new(),
+        catalog: Vec::new(),
+    }
+}
+
 /// Build the `/model` picker: ready backends first, then models on the active one.
 fn model_menu(dir: &Path, sel: &ModelSel) -> Option<Menu> {
     let backends = crate::discover::list_ready_backends(dir);
@@ -978,18 +1073,28 @@ fn model_menu(dir: &Path, sel: &ModelSel) -> Option<Menu> {
     let mut items: Vec<MenuItem> = Vec::new();
     let mut selected = 0usize;
 
-    for (i, b) in backends.iter().enumerate() {
-        let mark = if active_id == Some(b.instance_id.as_str()) {
-            selected = i;
-            '*'
-        } else {
-            ' '
-        };
-        let tag = if b.text_only { " [text-only]" } else { "" };
+    if !backends.is_empty() {
         items.push(MenuItem {
-            label: format!("{mark} → {} · {}{tag}", b.display_name, b.model),
-            value: format!("backend:{}", b.instance_id),
+            label: "— backends (switch provider) —".to_string(),
+            value: String::new(),
         });
+        for b in &backends {
+            let mark = if active_id == Some(b.instance_id.as_str()) {
+                selected = items.len();
+                '●'
+            } else {
+                '○'
+            };
+            let tag = if b.text_only {
+                "  [text-only — chat ok, no tools]"
+            } else {
+                "  [tools ok]"
+            };
+            items.push(MenuItem {
+                label: format!("{mark} {} · {}{tag}", b.display_name, b.model),
+                value: format!("backend:{}", b.instance_id),
+            });
+        }
     }
 
     if let Some(e) = sel.endpoint.as_ref() {
@@ -1028,16 +1133,26 @@ fn model_menu(dir: &Path, sel: &ModelSel) -> Option<Menu> {
                 } else {
                     ""
                 };
-                let active = if m == sel.name { "  *" } else { "" };
-                if m == sel.name {
+                let mark = if m == sel.name {
                     selected = items.len();
-                }
+                    "●"
+                } else {
+                    "○"
+                };
                 items.push(MenuItem {
-                    label: format!("  {m}{hot}{active}"),
+                    label: format!("{mark} {m}{hot}"),
                     value: m,
                 });
             }
         }
+    }
+
+    if backends.is_empty() {
+        items.push(MenuItem {
+            label: "— setup a provider first —".to_string(),
+            value: String::new(),
+        });
+        push_preset_menu_items(&mut items, &mut selected, true);
     }
 
     if items.is_empty() {
@@ -1045,7 +1160,7 @@ fn model_menu(dir: &Path, sel: &ModelSel) -> Option<Menu> {
     }
     Some(Menu {
         kind: MenuKind::Model,
-        title: "backends + models".to_string(),
+        title: "model picker — ↑↓ navigate, Enter select".to_string(),
         items,
         selected,
         scroll: 0,
@@ -1105,18 +1220,27 @@ fn palette_menu(dir: &Path, sel: &ModelSel, history: &[String]) -> Menu {
         });
     }
 
-    for preset in [
-        "grok-cli",
-        "claude-cli",
-        "ollama-native",
-        "openrouter-claude",
-    ] {
-        if let Some(p) = provider::preset_by_id(preset) {
+    catalog.push(MenuItem {
+        label: "setup provider — guided wizard".to_string(),
+        value: "auth:wizard".to_string(),
+    });
+    for (category, group) in provider::presets_by_category() {
+        for preset in *group {
+            if !preset.recommended {
+                continue;
+            }
+            let readiness = crate::discover::probe_preset(preset);
             catalog.push(MenuItem {
-                label: format!("setup  {preset} — {}", p.label),
-                value: format!("auth:setup:{preset}"),
+                label: format!(
+                    "setup  {} — {}  ({})",
+                    preset.id,
+                    preset.label,
+                    readiness.hint()
+                ),
+                value: format!("auth:setup:{}", preset.id),
             });
         }
+        let _ = category;
     }
 
     for cmd in crate::commands::COMMANDS {
@@ -1225,8 +1349,8 @@ fn commands_menu() -> Option<Menu> {
         value: "/help ".to_string(),
     });
     items.push(MenuItem {
-        label: "/auth setup - provider wizard".to_string(),
-        value: "/auth setup ".to_string(),
+        label: "/auth setup - guided provider picker".to_string(),
+        value: "/auth setup".to_string(),
     });
     items.push(MenuItem {
         label: "/auth status - check providers".to_string(),
@@ -2139,6 +2263,59 @@ pub(crate) async fn run_once(dir: &Path, args: &[String]) -> io::Result<()> {
         }
     }
 }
+/// Handle `auth:*` picker values from model, auth, and palette menus.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_auth_pick(
+    view: &mut View,
+    pump: &mut Pump<AnyModel>,
+    dir: &Path,
+    sel: &mut ModelSel,
+    task: &str,
+    trust: &Trust,
+    scope_cache: &mut ScopeCaches,
+    rest: &str,
+) {
+    let caps = aden::probe(dir);
+    if rest == "wizard" {
+        view.open_menu(auth_setup_menu(dir));
+        return;
+    }
+    if rest == "model" {
+        if let Some(menu) = model_menu(dir, sel) {
+            view.open_menu(menu);
+        } else {
+            view.open_menu(auth_setup_menu(dir));
+        }
+        return;
+    }
+    if rest == "status" {
+        let result = auth::report(dir, &["status".to_string()]);
+        show_slash_output(view, "/auth status", result.output, pump.messages());
+        return;
+    }
+    if let Some(id) = rest.strip_prefix("set-key:") {
+        view.open_secret_modal(
+            id,
+            format!("Paste API key for {id} (stored in ~/.config/coxn/secrets/)"),
+        );
+        return;
+    }
+    if let Some(preset) = rest.strip_prefix("setup:") {
+        let body = finish_auth_setup(
+            dir,
+            &caps,
+            pump,
+            sel,
+            view,
+            task,
+            trust,
+            scope_cache,
+            preset,
+        );
+        show_slash_output(view, "/auth setup", body, pump.messages());
+    }
+}
+
 /// Apply a picker choice (keyboard Enter or mouse row click).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_menu_pick(
@@ -2157,8 +2334,12 @@ fn dispatch_menu_pick(
     scope_cache: &mut ScopeCaches,
 ) {
     match kind {
-        MenuKind::Model => {
+        MenuKind::Model | MenuKind::Auth => {
             if value.is_empty() {
+                return;
+            }
+            if let Some(rest) = value.strip_prefix("auth:") {
+                dispatch_auth_pick(view, pump, dir, sel, task, trust, scope_cache, rest);
                 return;
             }
             let msg = if let Some(id) = value.strip_prefix("backend:") {
@@ -2378,22 +2559,10 @@ fn dispatch_menu_pick(
                         scope_cache,
                     ));
                 }
-            } else if let Some(preset) = value.strip_prefix("auth:setup:") {
-                let body = match provider::apply_preset(dir, preset) {
-                    Ok(msg) => {
-                        let mut out = msg;
-                        let caps = aden::probe(dir);
-                        if let Some(note) =
-                            hot_reload_model(dir, &caps, pump, sel, view, task, trust, scope_cache)
-                        {
-                            out.push_str(&format!("\n{note}\n"));
-                            append_sys_note(view, &format!("\nsys: {note}"));
-                        }
-                        out
-                    }
-                    Err(e) => format!("{e}\n"),
-                };
-                show_slash_output(view, "/auth setup", body, pump.messages());
+            } else if value == "auth:wizard" {
+                view.open_menu(auth_setup_menu(dir));
+            } else if let Some(rest) = value.strip_prefix("auth:") {
+                dispatch_auth_pick(view, pump, dir, sel, task, trust, scope_cache, rest);
             } else if let Some(text) = value.strip_prefix("input:") {
                 view.input = text.to_string();
                 view.cursor_end();
@@ -2406,6 +2575,46 @@ fn dispatch_menu_pick(
             view.cursor = cursor;
             view.refresh_suggestion();
         }
+    }
+}
+
+/// Apply a preset, hot-reload, and open the next guided step (API key modal, etc.).
+#[allow(clippy::too_many_arguments)]
+fn finish_auth_setup(
+    dir: &Path,
+    caps: &aden::AdenCaps,
+    pump: &mut Pump<AnyModel>,
+    sel: &mut ModelSel,
+    view: &mut View,
+    task: &str,
+    trust: &Trust,
+    scope_cache: &mut ScopeCaches,
+    preset_id: &str,
+) -> String {
+    match provider::apply_preset(dir, preset_id) {
+        Ok(mut msg) => {
+            if let Some(note) =
+                hot_reload_model(dir, caps, pump, sel, view, task, trust, scope_cache)
+            {
+                msg.push_str(&format!("\n{note}\n"));
+                append_sys_note(view, &format!("\nsys: {note}"));
+            }
+            if let Some(preset) = provider::preset_by_id(preset_id) {
+                let readiness = crate::discover::probe_preset(preset);
+                msg.push_str(&format!("status: {}\n", readiness.hint()));
+                if preset.needs_key && provider::secret_for_instance(preset.instance_id).is_none() {
+                    msg.push_str("next: paste your API key below (Enter saves, Esc skips)\n");
+                    view.open_secret_modal(
+                        preset.instance_id,
+                        format!("API key for {} — {}", preset.instance_id, preset.label),
+                    );
+                } else if readiness != crate::discover::PresetReadiness::Ready {
+                    msg.push_str("next: fix the status above, then press [r] to retry\n");
+                }
+            }
+            msg
+        }
+        Err(e) => format!("{e}\n"),
     }
 }
 
@@ -3487,26 +3696,18 @@ async fn drive(
                         }
                         Command::Providers => {
                             refresh_discovery(dir, pump, sel, true);
-                            match model_menu(dir, sel) {
-                                Some(menu) => view.open_menu(menu),
-                                None => show_slash_output(
-                                    view,
-                                    "/providers",
-                                    model_listing(dir, sel),
-                                    pump.messages(),
-                                ),
+                            if let Some(menu) = model_menu(dir, sel) {
+                                view.open_menu(menu);
+                            } else {
+                                view.open_menu(auth_setup_menu(dir));
                             }
                         }
                         Command::Model(None) => {
                             refresh_discovery(dir, pump, sel, true);
-                            match model_menu(dir, sel) {
-                                Some(menu) => view.open_menu(menu),
-                                None => show_slash_output(
-                                    view,
-                                    "/model",
-                                    model_listing(dir, sel),
-                                    pump.messages(),
-                                ),
+                            if let Some(menu) = model_menu(dir, sel) {
+                                view.open_menu(menu);
+                            } else {
+                                view.open_menu(auth_setup_menu(dir));
                             }
                         }
                         Command::Model(Some(target)) => {
@@ -3723,28 +3924,30 @@ async fn drive(
                                         "Paste API key for {id} (stored in ~/.config/coxn/secrets/)"
                                     ),
                                 );
+                            } else if args.first().is_some_and(|a| a == "setup" || a == "list")
+                                && args.len() == 1
+                            {
+                                view.open_menu(auth_setup_menu(dir));
+                            } else if args.first().is_some_and(|a| a == "setup") && args.len() == 2
+                            {
+                                let preset = &args[1];
+                                let body = finish_auth_setup(
+                                    dir,
+                                    caps,
+                                    pump,
+                                    sel,
+                                    view,
+                                    task,
+                                    &trust,
+                                    &mut scope_cache,
+                                    preset,
+                                );
+                                show_slash_output(view, "/auth setup", body, pump.messages());
                             } else {
                                 let result = auth::report(dir, &args);
                                 let mut out = result.output;
                                 if result.code != 0 {
                                     out.push_str(&format!("status: auth exited {}\n", result.code));
-                                }
-                                if args.first().is_some_and(|a| a == "setup")
-                                    && args.len() >= 2
-                                    && result.code == 0
-                                    && let Some(note) = hot_reload_model(
-                                        dir,
-                                        caps,
-                                        pump,
-                                        sel,
-                                        view,
-                                        task,
-                                        &trust,
-                                        &mut scope_cache,
-                                    )
-                                {
-                                    out.push_str(&format!("\n{note}\n"));
-                                    append_sys_note(view, &format!("\nsys: {note}"));
                                 }
                                 show_slash_output(view, "/auth", out, pump.messages());
                             }
@@ -3837,12 +4040,13 @@ async fn drive(
                     show_slash_output(
                         view,
                         "offline",
-                        "no model reachable — use /auth setup, /auth status, /model, or [r] retry"
+                        "no model reachable — type /auth setup for guided picker, or [r] retry"
                             .to_string(),
                         pump.messages(),
                     );
                     view.set_status(
-                        "OFFLINE STUB  |  /auth setup  /model  [r] retry  [q] quit".to_string(),
+                        "OFFLINE STUB  |  /auth setup (picker)  /model  [r] retry  [q] quit"
+                            .to_string(),
                     );
                     continue;
                 }

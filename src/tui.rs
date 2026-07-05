@@ -52,6 +52,8 @@ pub const MODE_TIP_IDLE: Duration = Duration::from_secs(5);
 pub enum MenuKind {
     /// Switch the active model to the selected id.
     Model,
+    /// Guided provider setup (`/auth setup`).
+    Auth,
     /// Resume the selected session slug.
     Session,
     /// Command palette / slash commands (sets the input line).
