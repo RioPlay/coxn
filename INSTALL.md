@@ -4,6 +4,8 @@
 
 - A model server **or** cloud API key:
   - Local: [Ollama](https://ollama.com) or LM Studio on `:11434` / `:1234`
+    - Arch: `sudo pacman -S ollama-cuda` + `systemctl enable --now ollama`
+    - No sudo: `bash scripts/setup-ollama-user.sh` then `ollama serve` in a terminal
   - Cloud: configure a provider profile and set a per-instance key
 - Optional: `bwrap` (bubblewrap) for filesystem/network sandbox
 - Optional: [aden](https://github.com/RioPlay/aden) ≥ 0.2.0 for blast-radius scope gate

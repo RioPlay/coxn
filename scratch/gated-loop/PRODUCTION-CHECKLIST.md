@@ -25,7 +25,7 @@ distribution real; limits honest.
 - [x] Add `scripts/smoke-execute-partition.sh`
 - [x] Add `scripts/smoke-gate.sh` (CI-friendly wrapper)
 - [x] `smoke-gate.sh` passed locally (aden present)
-- [~] Run `smoke-ollama.sh` on host with ollama; record in `LOG.md` (skip logged — no daemon on host)
+- [x] Run `smoke-ollama.sh` on host with ollama; record in `LOG.md`
 
 **Done when:** README shows wedge visually; smokes scripted and pass locally;
 dirty-tree failure is actionable.

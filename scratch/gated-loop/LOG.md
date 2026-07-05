@@ -336,3 +336,13 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 
 **Note:** `asciinema upload` needs server config for public asciinema.org URL; GIF
 embed in repo is sufficient for GitHub README.
+
+### Pass 26 — 2026-07-05 (WS1 Ollama live smoke)
+
+**Setup:** user-space Ollama v0.31.1 → `~/.local/bin/ollama` + `~/.local/lib/ollama`
+(CUDA RTX 5080 detected); `ollama serve` + `ollama pull tinyllama`
+
+**Validated:** `COXN_SMOKE_REQUIRE_OLLAMA=1 bash scripts/smoke-ollama.sh` pass (~7s first
+inference)
+
+**Shipped:** `scripts/setup-ollama-user.sh` for no-sudo install path
