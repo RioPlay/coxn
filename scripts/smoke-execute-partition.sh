@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Smoke: aden partition index + run ledger resume helpers (no live model).
-# Proves fixture partition parses and sequential resume state derives correctly.
+# Smoke: aden partition index + agents parse + run ledger (no live model).
+# Uses the coxn repo's aden store when available; skips gracefully otherwise.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ADEN_BIN="${COXN_ADEN_BIN:-aden}"
-
+SMOKE_DIR="${COXN_SMOKE_DIR:-$ROOT}"
+TASK="coxn-smoke-partition-$$"
+SEED="${COXN_SMOKE_SEED:-run}"
 fail() {
     echo "[smoke-execute] $*" >&2
     exit 1
@@ -19,37 +21,29 @@ if ! command -v "$ADEN_BIN" >/dev/null 2>&1; then
     exit 0
 fi
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-cd "$WORK"
+if [[ ! -d "$SMOKE_DIR/.aden" ]]; then
+    if [[ "${COXN_SMOKE_REQUIRE_ADEN:-}" == "1" ]]; then
+        fail "no .aden store in $SMOKE_DIR (run aden gen first)"
+    fi
+    echo "[smoke-execute] skip: no .aden store in $SMOKE_DIR"
+    exit 0
+fi
 
-git init -q
-git config user.email smoke@coxn.local
-git config user.name "coxn smoke"
+cleanup() {
+    rm -f "$SMOKE_DIR/.aden/agents/${TASK}"* 2>/dev/null || true
+}
+trap cleanup EXIT
 
-mkdir -p src
-cat >src/lib.rs <<'EOF'
-pub fn alpha() -> i32 { 1 }
-pub fn beta() -> i32 { alpha() + 1 }
-EOF
-git add -A
-git commit -q -m "baseline"
-
-# Minimal aden store is not required for scope --agents if seeds resolve in-repo.
-# If aden needs gen, the smoke will fail clearly.
-TASK="smoke-partition"
-SEEDS="alpha,beta"
-
-echo "[smoke-execute] aden scope --agents ${TASK}"
+echo "[smoke-execute] aden scope --agents ${TASK} (dir=$SMOKE_DIR seed=$SEED)"
 set +e
-partition="$("$ADEN_BIN" scope --agents "$TASK" --seed "$SEEDS" --json 2>/dev/null)"
+partition="$("$ADEN_BIN" scope --agents "$TASK" --seed "$SEED" --json "$SMOKE_DIR" 2>/dev/null)"
 rc=$?
 set -e
 if [[ $rc -ne 0 || -z "$partition" ]]; then
     if [[ "${COXN_SMOKE_REQUIRE_ADEN:-}" == "1" ]]; then
-        fail "aden scope --agents failed (rc=$rc); run aden gen in a real project first"
+        fail "aden scope --agents failed (rc=$rc); ensure seed '$SEED' resolves in store"
     fi
-    echo "[smoke-execute] skip: aden scope --agents unavailable in fixture (rc=$rc)"
+    echo "[smoke-execute] skip: aden scope --agents unavailable (rc=$rc)"
     exit 0
 fi
 
@@ -58,27 +52,9 @@ lines="$(echo "$partition" | grep -c . || true)"
 if [[ "$lines" -lt 1 ]]; then
     fail "empty partition index"
 fi
-
 echo "[smoke-execute] partition lines: $lines"
 
-# Run ledger round-trip via coxn binary if built.
-COXN_BIN="${COXN_BIN:-}"
-if [[ -z "$COXN_BIN" ]]; then
-    if [[ -x "$ROOT/target/debug/coxn" ]]; then
-        COXN_BIN="$ROOT/target/debug/coxn"
-    elif command -v coxn >/dev/null 2>&1; then
-        COXN_BIN="$(command -v coxn)"
-    else
-        (cd "$ROOT" && cargo build -q)
-        COXN_BIN="$ROOT/target/debug/coxn"
-    fi
-fi
+(cd "$ROOT" && cargo test -q agents && cargo test -q ledger_appends_and_summarizes_events) \
+    || fail "agents/run_ledger unit tests failed"
 
-export COXN_RUNS_DIR="$WORK/runs"
-mkdir -p "$COXN_RUNS_DIR"
-
-# Hermetic: invoke run_ledger paths through coxn once is heavy; use cargo test filter.
-(cd "$ROOT" && cargo test -q run_ledger::tests::ledger_appends_and_summarizes_events) \
-    || fail "run_ledger unit test failed"
-
-echo "[smoke-execute] pass (partition index + ledger unit test)"
+echo "[smoke-execute] pass (partition index + agents + ledger unit tests)"

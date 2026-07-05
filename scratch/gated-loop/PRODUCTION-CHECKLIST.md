@@ -135,7 +135,8 @@ devex-review clear.
 - [x] Adaptive stopping (hop cap, tool-error abort, `COXN_SUBAGENT_MAX_TURNS`)
 - [x] `/execute --resume`
 - [x] Parallel read-only scopes (`COXN_EXECUTE_JOBS`)
-- [ ] Live model partition smoke passes (`smoke-execute-partition.sh`)
+- [x] Partition index smoke passes (`smoke-execute-partition.sh` — hermetic, no live model)
+- [ ] Live model partition smoke passes (scout/synth end-to-end)
 - [ ] Verify dense merge upstream
 - [ ] Confirm text-only routes refused in live smoke
 - [x] Mark Phase 5 complete in `PLAN.adoc`

@@ -293,3 +293,12 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 **Validated:** 353 tests; smoke-gate green; `cargo package` OK
 
 **Next:** WS1 visual (needs recorder); live smokes; WS4 module split (deferred)
+
+### Pass 21 — 2026-07-05 (WS6 partition smoke)
+
+**Shipped:**
+- `smoke-execute-partition.sh` uses coxn repo aden store + seed `run`; runs
+  `agents` + `run_ledger` unit tests; cleans `.aden/agents/coxn-smoke-*` artifacts
+- CI: `smoke-execute-partition.sh` after `smoke-gate.sh`
+
+**Validated:** smoke pass locally (aden + indexed store)
