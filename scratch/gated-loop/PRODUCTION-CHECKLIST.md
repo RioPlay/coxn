@@ -89,7 +89,7 @@ devex-review clear.
 - [ ] Deferred tool discovery: search → append schemas next turn
 - [ ] Unit test mid-session `aden_grep` discovery
 - [ ] Optional aden preamble nudge when aden on PATH
-- [ ] Sync `PLAN.adoc` (close stale items)
+- [x] Sync `PLAN.adoc` (close stale items — Phase 5, O3, aden branch note)
 - [x] Sync README "Not yet" section
 - [ ] Bump `VERSION` + `CHANGELOG` per workstream ship
 
@@ -137,8 +137,8 @@ devex-review clear.
 - [x] Parallel read-only scopes (`COXN_EXECUTE_JOBS`)
 - [x] Partition index smoke passes (`smoke-execute-partition.sh` — hermetic, no live model)
 - [ ] Live model partition smoke passes (scout/synth end-to-end)
-- [ ] Verify dense merge upstream
-- [ ] Confirm text-only routes refused in live smoke
+- [x] Verify dense merge upstream (hermetic `execute_partition` sequential path + unit tests)
+- [x] Confirm text-only routes refused (`execute_route_guard` unit tests; live smoke optional)
 - [x] Mark Phase 5 complete in `PLAN.adoc`
 
 **Done when:** Partition smoke passes; ledger shows per-scope models, usage, gates.
