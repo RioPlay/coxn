@@ -83,7 +83,7 @@ devex-review clear.
 
 ## Workstream 4 — Architecture & laws
 
-- [~] Split `drive.rs` → `drive/{mod,input,streaming,slash,boot}.rs` (`drive/ex.rs` landed)
+- [~] Split `drive.rs` → `drive/{mod,input,streaming,slash,boot}.rs` (`ex.rs`, `input.rs` landed)
 - [ ] Move `tui.rs` render into `ui/render.rs`
 - [ ] No module > ~1.5k LOC
 - [ ] Deferred tool discovery: search → append schemas next turn

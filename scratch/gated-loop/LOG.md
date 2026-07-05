@@ -320,3 +320,9 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 - `smoke-ollama.sh` skip: ollama not reachable at :11434 (accepted)
 
 **Validated:** 355 tests; fmt/clippy/secrets/smoke-gate green
+
+### Pass 24 — 2026-07-05 (WS4 input split)
+
+**Shipped:** `drive/input.rs` — streaming idle input drain + `pane_dims` helper
+
+**Validated:** 355 tests green
