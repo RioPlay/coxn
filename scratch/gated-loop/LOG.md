@@ -326,3 +326,13 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 **Shipped:** `drive/input.rs` — streaming idle input drain + `pane_dims` helper
 
 **Validated:** 355 tests green
+
+### Pass 25 — 2026-07-05 (WS1 animated wedge)
+
+**Shipped:**
+- Recorded `docs/demo-scope-escape.cast` via asciinema 3.2
+- Generated `docs/demo-scope-escape.gif` via agg; embedded in README
+- `record-scope-escape.sh` auto-runs agg when present; Arch install hints
+
+**Note:** `asciinema upload` needs server config for public asciinema.org URL; GIF
+embed in repo is sufficient for GitHub README.

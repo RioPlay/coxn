@@ -42,6 +42,8 @@ bash scripts/demo-scope-escape.sh
 It builds a throwaway repo, shows an in-scope edit allowed, an out-of-scope edit
 blocked and reverted, and the sandbox state. No cloud keys required.
 
+![scope-escape demo](docs/demo-scope-escape.gif)
+
 Sample output (deterministic; your model line may differ):
 
 ```
@@ -58,10 +60,12 @@ Sample output (deterministic; your model line may differ):
   status: READY · sandbox: bwrap
 ```
 
-Record an animated cast (requires [asciinema](https://asciinema.org/) or [vhs](https://github.com/charmbracelet/vhs)):
+Re-record the demo (Arch: `pacman -S asciinema`; GIF via
+[`agg`](https://github.com/asciinema/agg)):
 
 ```sh
 bash scripts/record-scope-escape.sh
+agg docs/demo-scope-escape.cast docs/demo-scope-escape.gif
 ```
 
 ### Scoped edits and a dirty git tree
@@ -418,8 +422,7 @@ session persistence (`/resume`).
 Shipped: aden task partitions via `/execute` (sequential + parallel read-only
 scopes), per-scope role routing, run ledger (`/runs`), and partition resume.
 
-Not yet: live partition smoke on every host (needs aden + model); animated
-scope-escape cast (record with `scripts/record-scope-escape.sh`); grok CLI usage
+Not yet: live partition smoke on every host (needs aden + model); grok CLI usage
 in every build (when the CLI emits tokens); native streaming profile for servers
 whose chat-completions layer drops tool calls under streaming; optional
 direct-provider profile (native caching / exact billing).

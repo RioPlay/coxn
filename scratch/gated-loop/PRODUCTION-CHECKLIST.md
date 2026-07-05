@@ -14,7 +14,7 @@ distribution real; limits honest.
 
 ## Workstream 1 — Trust & proof
 
-- [ ] Record `scripts/demo-scope-escape.sh` as README visual (asciinema or vhs)
+- [x] Record `scripts/demo-scope-escape.sh` as README visual (asciinema + agg GIF)
 - [x] `scripts/record-scope-escape.sh` helper (asciinema/vhs/manual fallback)
 - [x] Embed visual in README "Why coxn is different" (static transcript; animated cast optional)
 - [x] Document dirty-tree + active-scope behavior in README
