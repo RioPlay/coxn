@@ -353,7 +353,11 @@ mod tests {
         // `list` and `setup` render the same wizard. Readiness badges (✓/▷) may
         // differ between back-to-back probes when a local daemon is flapping.
         for preset in provider::presets() {
-            assert!(list.output.contains(preset.id), "list missing {}", preset.id);
+            assert!(
+                list.output.contains(preset.id),
+                "list missing {}",
+                preset.id
+            );
             assert!(
                 setup.output.contains(preset.id),
                 "setup missing {}",

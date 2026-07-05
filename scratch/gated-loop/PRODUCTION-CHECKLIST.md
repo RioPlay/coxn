@@ -184,3 +184,12 @@ devex-review clear.
 - [ ] `bash scripts/check-no-secrets.sh`
 
 See also `CHECKLIST.md` for per-pass trust/TUI gates.
+
+## TUI hot path (perf)
+
+- [x] Run ledger: no per-token/per-line JSONL sync writes during streaming
+- [x] Status line: savings from `.aden/savings.json` (no `aden status` subprocess)
+- [x] Ctrl-Space palette: no `probe_preset` storm, no embedded full model list
+- [x] Tab commands menu: no `aden list` subprocess on every open
+- [x] Backend discovery cache (20s TTL) + invalidate on switch/setup
+- [ ] Throttle TUI repaint during streaming (optional follow-up)

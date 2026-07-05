@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::app::{
     ModelSel, claude_cli_model, codex_model, grok_cli_model, ollama_model, openai_model,
@@ -56,8 +58,52 @@ pub fn model_display_label(sel: &ModelSel, usage: Option<crate::model::Usage>) -
     label
 }
 
+const READY_BACKEND_TTL: Duration = Duration::from_secs(20);
+
+struct ReadyBackendCache {
+    key: String,
+    fetched: Instant,
+    backends: Vec<ReadyBackend>,
+}
+
+static READY_BACKEND_CACHE: Mutex<Option<ReadyBackendCache>> = Mutex::new(None);
+
+fn ready_cache_key(dir: &Path) -> String {
+    dir.canonicalize()
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// Drop cached backend probes (after auth setup or model switch).
+pub fn invalidate_ready_backends() {
+    if let Ok(mut guard) = READY_BACKEND_CACHE.lock() {
+        *guard = None;
+    }
+}
+
 /// Every backend that is authenticated or reachable right now (config + auto-detect).
 pub fn list_ready_backends(dir: &Path) -> Vec<ReadyBackend> {
+    let key = ready_cache_key(dir);
+    if let Ok(guard) = READY_BACKEND_CACHE.lock() {
+        if let Some(cache) = guard.as_ref() {
+            if cache.key == key && cache.fetched.elapsed() < READY_BACKEND_TTL {
+                return cache.backends.clone();
+            }
+        }
+    }
+    let backends = list_ready_backends_uncached(dir);
+    if let Ok(mut guard) = READY_BACKEND_CACHE.lock() {
+        *guard = Some(ReadyBackendCache {
+            key,
+            fetched: Instant::now(),
+            backends: backends.clone(),
+        });
+    }
+    backends
+}
+
+fn list_ready_backends_uncached(dir: &Path) -> Vec<ReadyBackend> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let cfg = provider::load_config(dir);

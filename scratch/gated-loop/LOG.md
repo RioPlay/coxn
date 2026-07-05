@@ -214,3 +214,18 @@
 **Tests:** 347 pass
 
 **Next:** WS1 visual embed; WS2d parallel ledger; WS3 grok usage + stream cancel
+
+### Pass 16 — 2026-07-05 (TUI perf emergency)
+
+**Root cause:** WS2 `LedgerTurnIo` synced JSONL on every stream delta; palette/menus
+spawned multiple provider probes + `aden list` per open; `status_line` spawned
+`aden status` after turns.
+
+**Fixes:**
+- Ledger: batch turn stats in `turn_finished`; `BufWriter` + flush per turn
+- Savings: `savings_detail_from_file` (no subprocess on hot path)
+- Palette: drop live preset probes + full model_menu embed
+- Tab menu: drop `aden list_symbols` on every open
+- `list_ready_backends` 20s cache + invalidate on switch/setup
+
+**Tests:** 347 pass

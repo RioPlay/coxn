@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -84,31 +84,18 @@ fn redact_value(value: Value) -> Value {
 
 pub(crate) struct RunLedger {
     run: String,
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
 }
 
 impl RunLedger {
     pub(crate) fn create(task: &str) -> Self {
         let run = format!("{}-{}", slug_part(task), now_secs());
-        let file = runs_dir().and_then(|dir| {
-            let _ = fs::create_dir_all(&dir);
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(format!("{run}.jsonl")))
-                .ok()
-        });
+        let file = open_ledger_file(&run);
         Self { run, file }
     }
 
     pub(crate) fn open(slug: &str) -> Self {
-        let file = runs_dir().and_then(|dir| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(format!("{slug}.jsonl")))
-                .ok()
-        });
+        let file = open_ledger_file(slug);
         Self {
             run: slug.to_string(),
             file,
@@ -139,6 +126,25 @@ impl RunLedger {
         });
         let _ = writeln!(file, "{event}");
     }
+
+    /// Flush buffered ledger lines (call after a turn, not per stream fragment).
+    pub(crate) fn flush(&mut self) {
+        if let Some(file) = &mut self.file {
+            let _ = file.flush();
+        }
+    }
+}
+
+fn open_ledger_file(slug: &str) -> Option<BufWriter<File>> {
+    runs_dir().and_then(|dir| {
+        let _ = fs::create_dir_all(&dir);
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{slug}.jsonl")))
+            .ok()
+            .map(BufWriter::new)
+    })
 }
 
 fn approval_label(decision: Approval) -> &'static str {
@@ -208,12 +214,8 @@ impl<'a, I: ?Sized> LedgerTurnIo<'a, I> {
 
 impl<I: TurnIo + ?Sized> TurnIo for LedgerTurnIo<'_, I> {
     fn on_delta(&mut self, delta: &str) -> bool {
-        self.ledger.append(
-            "assistant_delta",
-            Some(self.scope),
-            Some(self.role),
-            json!({ "chars": delta.chars().count() }),
-        );
+        // Do not append per fragment — streaming tokens would sync-write JSONL
+        // on every delta and stall the TUI. Turn totals land in turn_finished.
         self.inner.on_delta(delta)
     }
 
@@ -229,12 +231,7 @@ impl<I: TurnIo + ?Sized> TurnIo for LedgerTurnIo<'_, I> {
     }
 
     fn on_run_output(&mut self, line: &str) -> bool {
-        self.ledger.append(
-            "command_output",
-            Some(self.scope),
-            Some(self.role),
-            json!({ "chars": line.chars().count() }),
-        );
+        // Same as on_delta: batch command output chars in turn_finished.
         self.inner.on_run_output(line)
     }
 

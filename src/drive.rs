@@ -529,7 +529,8 @@ struct ScopeCaches {
 
 impl ScopeCaches {
     fn refresh(&mut self, dir: &Path) {
-        self.savings_detail = aden::savings_detail(dir);
+        // File read only — never spawn `aden status` from status_line (stalls the TUI).
+        self.savings_detail = aden::savings_detail_from_file(dir);
     }
 
     fn chrome_label(&self, task: &str) -> String {
@@ -732,6 +733,7 @@ fn switch_backend(
     pump.set_model(model);
     *sel = new_sel;
     persist_active_route(dir, sel);
+    crate::discover::invalidate_ready_backends();
     format!("switched to {}", sel.label())
 }
 
@@ -1225,39 +1227,28 @@ fn palette_menu(dir: &Path, sel: &ModelSel, history: &[String]) -> Menu {
         label: "setup provider — guided wizard".to_string(),
         value: "auth:wizard".to_string(),
     });
-    for (category, group) in provider::presets_by_category() {
+    for (_category, group) in provider::presets_by_category() {
         for preset in *group {
             if !preset.recommended {
                 continue;
             }
-            let readiness = crate::discover::probe_preset(preset);
             catalog.push(MenuItem {
-                label: format!(
-                    "setup  {} — {}  ({})",
-                    preset.id,
-                    preset.label,
-                    readiness.hint()
-                ),
+                label: format!("setup  {} — {}", preset.id, preset.label),
                 value: format!("auth:setup:{}", preset.id),
             });
         }
-        let _ = category;
     }
+
+    catalog.push(MenuItem {
+        label: "models — open /model picker".to_string(),
+        value: "input:/model ".to_string(),
+    });
 
     for cmd in crate::commands::COMMANDS {
         catalog.push(MenuItem {
             label: format!("/{cmd}"),
             value: format!("input:/{cmd} "),
         });
-    }
-
-    if let Some(model_picker) = model_menu(dir, sel) {
-        for item in model_picker.items {
-            catalog.push(MenuItem {
-                label: format!("model  {}", item.label),
-                value: format!("model:{}", item.value),
-            });
-        }
     }
 
     for s in session::list() {
@@ -1304,6 +1295,7 @@ fn palette_menu(dir: &Path, sel: &ModelSel, history: &[String]) -> Menu {
 
 /// Simple command palette for discoverability (average users). Tab on empty input or / opens this.
 /// Selecting sets the input line (user presses Enter to run).
+#[allow(clippy::vec_init_then_push)]
 fn commands_menu() -> Option<Menu> {
     let mut items: Vec<MenuItem> = vec![];
 
@@ -1320,29 +1312,6 @@ fn commands_menu() -> Option<Menu> {
         label: "ADEN: audit".to_string(),
         value: "ADEN_AUDIT".to_string(),
     });
-
-    // Perfect ADEN harness: pull live graph symbols into the palette.
-    // Selecting executes directly (e.g. understand, view, impact) for instant
-    // graph steering. This turns aden symbols into first-class cockpit controls.
-    if let Ok(syms) = aden::list_symbols(std::path::Path::new("."), Some("fn-*|mod-*")) {
-        for sym in syms.lines().take(3).filter(|l| !l.trim().is_empty()) {
-            let s = sym.trim().to_string();
-            // Short label for UI, full for value
-            let short = s.split('/').next_back().unwrap_or(&s).to_string();
-            items.push(MenuItem {
-                label: format!("ADEN: {} understand", short),
-                value: format!("ADEN_UNDERSTAND:{}", s),
-            });
-            items.push(MenuItem {
-                label: format!("ADEN: {} view", short),
-                value: format!("ADEN_VIEW:{}", s),
-            });
-            items.push(MenuItem {
-                label: format!("ADEN: {} impact", short),
-                value: format!("ADEN_IMPACT:{}", s),
-            });
-        }
-    }
 
     // Regular commands and tips.
     items.push(MenuItem {
@@ -2601,6 +2570,7 @@ fn finish_auth_setup(
 ) -> String {
     match provider::apply_preset(dir, preset_id) {
         Ok(mut msg) => {
+            crate::discover::invalidate_ready_backends();
             if let Some(note) =
                 hot_reload_model(dir, caps, pump, sel, view, task, trust, scope_cache)
             {
@@ -4106,28 +4076,35 @@ async fn drive(
                 let mut attempt = 0u32;
                 let result;
                 let mut cancelled;
+                let mut assistant_chars;
+                let mut command_output_chars;
                 loop {
-                    let mut drive_io = DriveIo {
-                        dir,
-                        tui,
-                        view,
-                        prior: &prior,
-                        buf: String::new(),
-                        run_buf: String::new(),
-                        cancelled: false,
-                        cancel_turn: false,
-                        approvals: &mut approvals,
-                        approved_commands: &mut approved_commands,
-                        bwrap,
+                    let r = {
+                        let mut drive_io = DriveIo {
+                            dir,
+                            tui,
+                            view,
+                            prior: &prior,
+                            buf: String::new(),
+                            run_buf: String::new(),
+                            cancelled: false,
+                            cancel_turn: false,
+                            approvals: &mut approvals,
+                            approved_commands: &mut approved_commands,
+                            bwrap,
+                        };
+                        let mut io = run_ledger::LedgerTurnIo::new(
+                            &mut drive_io,
+                            &mut chat_ledger,
+                            "chat",
+                            "main",
+                        );
+                        let r = pump.run_turn_streaming(&mut io).await;
+                        cancelled = drive_io.cancelled || drive_io.cancel_turn;
+                        assistant_chars = drive_io.buf.chars().count();
+                        command_output_chars = drive_io.run_buf.chars().count();
+                        r
                     };
-                    let mut io = run_ledger::LedgerTurnIo::new(
-                        &mut drive_io,
-                        &mut chat_ledger,
-                        "chat",
-                        "main",
-                    );
-                    let r = pump.run_turn_streaming(&mut io).await;
-                    cancelled = drive_io.cancelled || drive_io.cancel_turn;
                     if let Err(e) = &r
                         && e.is_transient()
                         && attempt < MAX_RETRIES
@@ -4154,8 +4131,13 @@ async fn drive(
                             "turn_finished",
                             Some("chat"),
                             Some("main"),
-                            json!({ "status": turn_status }),
+                            json!({
+                                "status": turn_status,
+                                "assistant_chars": assistant_chars,
+                                "command_output_chars": command_output_chars,
+                            }),
                         );
+                        chat_ledger.flush();
                         refresh_conversation(view, pump.messages());
                         // A quiet per-turn timing footer in the transcript -- the
                         // record keeps it after the live status bar moves on.
@@ -4186,8 +4168,14 @@ async fn drive(
                             "turn_finished",
                             Some("chat"),
                             Some("main"),
-                            json!({ "status": "error", "error": err.to_string() }),
+                            json!({
+                                "status": "error",
+                                "error": err.to_string(),
+                                "assistant_chars": assistant_chars,
+                                "command_output_chars": command_output_chars,
+                            }),
                         );
+                        chat_ledger.flush();
                         // Keep the error visible (don't let the savings refresh
                         // clobber it); the partial transcript still renders.
                         refresh_conversation(view, pump.messages());

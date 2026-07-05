@@ -311,15 +311,53 @@ pub fn savings_detail_from_status(status: &str) -> Option<String> {
     (!detail.is_empty()).then(|| detail.to_string())
 }
 
-/// The raw All-time savings detail from `aden status` (no `aden` prefix).
-pub fn savings_detail(dir: &Path) -> Option<String> {
-    let mut cmd = Command::new(aden_bin());
-    read_only_aden_env(&mut cmd);
-    let out = cmd.arg("status").arg(dir).output().ok()?;
-    if !out.status.success() {
+/// Read savings from `.aden/savings.json` (no subprocess). Preferred on the TUI hot path.
+pub fn savings_detail_from_file(dir: &Path) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Ledger {
+        queries: u64,
+        saved_tokens: i64,
+        tool_calls_saved: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct SavingsFile {
+        schema: u32,
+        all_time: Ledger,
+    }
+    let path = dir.join(".aden/savings.json");
+    let json = std::fs::read_to_string(path).ok()?;
+    let file: SavingsFile = serde_json::from_str(&json).ok()?;
+    if file.schema != 2 || file.all_time.queries == 0 {
         return None;
     }
-    savings_detail_from_status(&String::from_utf8_lossy(&out.stdout))
+    let at = &file.all_time;
+    if at.saved_tokens <= 0 && at.tool_calls_saved == 0 {
+        return None;
+    }
+    let tokens = if at.saved_tokens.abs() >= 1000 {
+        format!("~{}k tokens saved", at.saved_tokens.abs() / 1000)
+    } else {
+        format!("~{} tokens saved", at.saved_tokens.abs())
+    };
+    Some(format!(
+        "~{} tool calls + {tokens} vs grep-and-read",
+        at.tool_calls_saved
+    ))
+}
+
+/// The raw All-time savings detail from `aden status` (no `aden` prefix).
+/// Spawns a subprocess — avoid on the idle TUI path; use [`savings_detail_from_file`].
+#[allow(dead_code)] // doctor/CLI fallback seam
+pub fn savings_detail(dir: &Path) -> Option<String> {
+    savings_detail_from_file(dir).or_else(|| {
+        let mut cmd = Command::new(aden_bin());
+        read_only_aden_env(&mut cmd);
+        let out = cmd.arg("status").arg(dir).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        savings_detail_from_status(&String::from_utf8_lossy(&out.stdout))
+    })
 }
 
 /// Status-line scope text for a savings detail (always tagged `[est.]`).
@@ -471,6 +509,7 @@ pub fn audit(dir: &Path) -> Result<String, AdenError> {
 
 /// List graph anchors/symbols (for palette, search). Uses `aden list --json`.
 /// Returns newline separated anchors (filtered if provided).
+#[allow(dead_code)] // on-demand aden seam; not wired in hot-path menus
 pub fn list_symbols(dir: &Path, filter: Option<&str>) -> Result<String, AdenError> {
     let mut cmd = Command::new(aden_bin());
     read_only_aden_env(&mut cmd);
@@ -645,6 +684,15 @@ mod tests {
     }
 
     #[test]
+    fn savings_detail_from_file_reads_repo_ledger() {
+        let dir = Path::new(".");
+        let detail = savings_detail_from_file(dir);
+        if Path::new(".aden/savings.json").exists() {
+            assert!(detail.is_some(), "savings.json present should yield detail");
+            assert!(detail.unwrap().contains("tool calls"));
+        }
+    }
+
     fn validate_repo_savings_json_if_present() {
         let path = Path::new(".aden/savings.json");
         if !path.exists() {
