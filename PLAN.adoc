@@ -115,12 +115,12 @@ commits; 101 tests green, clippy/fmt clean, still six deps):
 * [~] OSC-133 semantic zones -- SKIPPED: raw escape injection does not fit
   ratatui's cell-grid alt-screen rendering.
 
-== Phase 5 (later): multi-model workflows and sub-agents
+== Phase 5 (later): multi-model workflows and sub-agents -- DONE (live partition smoke open)
 
-* [~] Sub-agent = pump instance (model by role + `aden scope` context + tool subset + budget); returns a dense result, not a transcript. PARTITION CONSUMPTION DONE: `agents.rs` parses aden's `scope --agents` index + orders by dependency; `/agents` shows the plan with per-role routed models (live-verified).
-* [x] Sequential runner: `/execute` spawns one `Pump` per sub-scope in dependency order, `BatchIo` auto-approve, dense merge upstream (`execute_partition` in main.rs). Live validation on real partitions still open.
-* [ ] Per-role tool subsets + per-scope token budgets + adaptive stopping.
-* [ ] Parallel execution (sequential first per routing.adoc).
+* [x] Sub-agent = pump instance (model by role + `aden scope` context + tool subset + budget); returns a dense result, not a transcript. `agents.rs` parses aden's `scope --agents` index + orders by dependency; `/agents` shows the plan with per-role routed models.
+* [x] Sequential runner: `/execute` spawns one `Pump` per sub-scope in dependency order, `BatchIo` auto-approve, dense merge upstream (`execute_partition` in main.rs). Hermetic scout/synth tests + run ledger resume; live model partition smoke still host-dependent.
+* [x] Per-role tool subsets (`ToolPolicy::for_role`), per-scope token budgets (`budget_from_manifest`), adaptive stopping (hop cap, tool-error abort, `COXN_SUBAGENT_MAX_TURNS`).
+* [x] Parallel execution: opt-in `COXN_EXECUTE_JOBS` (read-only scopes only); cancel propagates to workers; granular run ledger parity (WS2d).
 
 == Phase G (adoption): distribution and first-run -- DONE
 
@@ -214,8 +214,8 @@ Spec: `docs/next-generation-harness-plan.adoc` (KISS execution plan).
 * [x] O3 Run ledger: append-only JSONL events (`src/run_ledger.rs`) for run
       start/resume, scope start/finish, and run finish; secret redaction;
       `summarize`/`list`/`scope_statuses`/`latest_for_task`; `COXN_RUNS_DIR`
-      override (also a test hook). The opt-in parallel path records coarse
-      events (granular per-tool events are emitted only on the sequential path).
+      override (also a test hook). Sequential and parallel `/execute` paths
+      both emit granular per-tool events via `LedgerTurnIo` / `SharedLedgerTurnIo`.
 * [x] O4 Resume: `run_ledger::latest_for_task` + `scope_statuses` feed
       `RunLedger::open`; `/execute --resume` is parsed, plumbed, and drives
       partition continuation (resume always takes the trusted sequential path).
@@ -246,4 +246,4 @@ Spec: `docs/next-generation-harness-plan.adoc` (KISS execution plan).
 * Added vim-native aden symbol navigation (K / gd for Understand; ga for asm; gi for impact; gv for view; / for grep) + ex commands :view, :viz/:mermaid/:gm, :doctor, :impact. Pull::Impact via `aden query --impact`. Non-blocking spawn for view; full graceful degrade; 234 tests + fmt/clippy green. Directly advances the "vim motions + visual layer + self-audit" items.
 * Gated editing confirmed live on a throwaway repo: model called `edit` with correct JSON, coxn applied + gated in-scope, the change persisted on disk.
 * Known constraint: `impact-diff` judges the WHOLE working-tree diff vs HEAD, so a tree already dirty outside the scope mandate blocks every edit. coxn effectively expects a tree scoped to the task.
-* Open: merge the aden `feat/coxn-directional-prereqs` branch (PoC gate now satisfied) -- outward-facing, awaiting the user. Streaming/Ollama-native and sub-agents remain.
+* Resolved: aden 0.2.0 gate contract on PATH; `demo-scope-escape.sh` proves wedge. Live Ollama + live model partition smokes remain host-dependent.

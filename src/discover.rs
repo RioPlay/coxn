@@ -271,6 +271,61 @@ impl PresetReadiness {
     }
 }
 
+/// Compact preset readiness for `coxn doctor` (default one-screen view).
+#[derive(Debug, Default)]
+pub struct PresetSummary {
+    pub ready: Vec<&'static str>,
+    pub needs_key: u32,
+    pub needs_login: Vec<&'static str>,
+    pub needs_install: Vec<&'static str>,
+    pub needs_daemon: Vec<&'static str>,
+}
+
+impl PresetSummary {
+    /// One-line "setup" hint for presets that are not ready now.
+    pub fn setup_hint(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        for id in &self.needs_login {
+            parts.push(format!("{id} login"));
+        }
+        for id in &self.needs_install {
+            parts.push(format!("install {id}"));
+        }
+        let mut daemons = self.needs_daemon.clone();
+        daemons.sort_unstable();
+        daemons.dedup();
+        for id in daemons {
+            parts.push(format!("start {id}"));
+        }
+        if self.needs_key > 0 {
+            let n = self.needs_key;
+            parts.push(format!("{n} cloud key{}", if n == 1 { "" } else { "s" }));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
+    }
+}
+
+/// Probe all built-in presets and bucket readiness for doctor / onboarding.
+pub fn summarize_presets() -> PresetSummary {
+    let mut summary = PresetSummary::default();
+    for (_category, group) in provider::presets_by_category() {
+        for preset in *group {
+            match probe_preset(preset) {
+                PresetReadiness::Ready => summary.ready.push(preset.id),
+                PresetReadiness::NeedsKey => summary.needs_key += 1,
+                PresetReadiness::NeedsLogin(bin) => summary.needs_login.push(bin),
+                PresetReadiness::NeedsInstall(bin) => summary.needs_install.push(bin),
+                PresetReadiness::NeedsDaemon(bin) => summary.needs_daemon.push(bin),
+            }
+        }
+    }
+    summary
+}
+
 /// Probe whether a preset can be used immediately after `apply_preset`.
 pub fn probe_preset(preset: &provider::ProviderPreset) -> PresetReadiness {
     if preset.needs_key {

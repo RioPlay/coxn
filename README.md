@@ -72,7 +72,7 @@ when `COXN_TASK_NAME` is set and aden is on PATH.
 3. **Optional:** `aden` ≥ 0.2.0 for blast-radius scope gate
 
 ```sh
-coxn doctor   # one-screen health check
+coxn doctor   # one-screen health check (COXN_DOCTOR_VERBOSE=1 for full preset table)
 ```
 
 Install: see [INSTALL.md](INSTALL.md). `cargo install --path .` from this repo.

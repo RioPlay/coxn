@@ -74,7 +74,7 @@ after restart; `/execute` fully reconstructable.
 - [x] Cancel in-flight parallel workers on partition cancel
 - [x] Consolidate env test locking → shared `ENV_TEST_LOCK`
 - [x] Idle perf: zero `aden` spawns in `drive()` idle loop
-- [ ] Run `devex-review`; fix or accept P1/P2 in `LOG.md`
+- [x] Run `devex-review`; fix or accept P1/P2 in `LOG.md`
 
 **Done when:** Streaming cancellable; usage honest; idle dogfood clean;
 devex-review clear.
@@ -105,12 +105,12 @@ devex-review clear.
 - [x] Preset readiness probes + categorized pickers
 - [x] Preset readiness badges in `coxn doctor`
 - [x] `probe_preset` tests per driver (fake binaries)
-- [ ] `coxn doctor` answers "what can I use right now?" in one screen
+- [x] `coxn doctor` answers "what can I use right now?" in one screen
 
 ### 5b — Distribution
 
 - [x] Verify `cargo install --path .` on clean walkthrough
-- [ ] Verify crates.io release workflow
+- [x] Verify crates.io release workflow (`cargo package` + tag GH release; publish manual with `CRATES_IO_TOKEN`)
 - [x] `check-no-secrets.sh` in CI
 - [x] `smoke-gate.sh` in CI (skips without aden)
 - [x] `pty-smoke.sh` in CI
@@ -138,7 +138,7 @@ devex-review clear.
 - [ ] Live model partition smoke passes (`smoke-execute-partition.sh`)
 - [ ] Verify dense merge upstream
 - [ ] Confirm text-only routes refused in live smoke
-- [ ] Mark Phase 5 complete in `PLAN.adoc`
+- [x] Mark Phase 5 complete in `PLAN.adoc`
 
 **Done when:** Partition smoke passes; ledger shows per-scope models, usage, gates.
 
@@ -156,7 +156,7 @@ devex-review clear.
 ## Workstream 8 — aden cross-repo
 
 - [x] aden 0.2.0 gate contract on PATH
-- [ ] Remove stale PLAN note re `feat/coxn-directional-prereqs`
+- [x] Remove stale PLAN note re `feat/coxn-directional-prereqs`
 - [ ] Track `feat/vocab-mismatch-evals` on aden repo
 - [ ] Re-run gate demo on OO fixture when aden recall improves
 - [ ] `aden view --watch` bridge — optional post-launch
@@ -178,10 +178,10 @@ devex-review clear.
 
 ## Health stack (run every pass)
 
-- [ ] `cargo fmt --check`
-- [ ] `cargo clippy -- -D warnings`
-- [ ] `cargo test`
-- [ ] `bash scripts/check-no-secrets.sh`
+- [x] `cargo fmt --check`
+- [x] `cargo clippy -- -D warnings`
+- [x] `cargo test`
+- [x] `bash scripts/check-no-secrets.sh`
 
 See also `CHECKLIST.md` for per-pass trust/TUI gates.
 

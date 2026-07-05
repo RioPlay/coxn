@@ -4,20 +4,36 @@ use std::path::Path;
 
 use crate::aden;
 use crate::codex_probe;
+use crate::discover;
 use crate::openai;
 use crate::provider;
 use crate::sandbox;
 use crate::trust;
+
+fn doctor_verbose() -> bool {
+    std::env::var("COXN_DOCTOR_VERBOSE")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+}
+
+fn instance_is_routed(cfg: &provider::ProviderConfig, id: &str) -> bool {
+    cfg.routes.values().any(|sel| sel.instance_id == id)
+        || cfg.route("active").is_some_and(|sel| sel.instance_id == id)
+}
 
 /// Run all checks, print a human-readable report to stdout, return exit code
 /// (0 = ready to code, 1 = blocking issue, 2 = warnings only).
 pub fn run(dir: &Path) -> i32 {
     let mut blocking = false;
     let mut warnings = false;
+    let verbose = doctor_verbose();
 
     println!("coxn doctor");
     println!("project: {}", dir.display());
     println!();
+
+    let provider_cfg = provider::load_config(dir);
+    let mut model_ok = false;
 
     // --- Model ---
     let has_env = std::env::var("COXN_MODEL_BASE_URL")
@@ -37,34 +53,39 @@ pub fn run(dir: &Path) -> i32 {
             "✓ model: {name} @ {base} (env){}",
             if key { "" } else { " — no COXN_MODEL_KEY" }
         );
+        model_ok = true;
         if !key && !base.contains("localhost") && !base.contains("127.0.0.1") {
             warnings = true;
             println!("  warn: cloud endpoint without COXN_MODEL_KEY may 401");
         }
-    } else if let Some((_, sel)) = crate::discover::detect_cli(dir) {
+    } else if let Some((_, sel)) = discover::detect_cli(dir) {
         println!("✓ model: {} (auto-detect CLI)", sel.label());
-    } else if let Some((_, sel)) = crate::discover::detect_ollama_native() {
+        model_ok = true;
+    } else if let Some((_, sel)) = discover::detect_ollama_native() {
         println!("✓ model: {} (auto-detect ollama native)", sel.label());
+        model_ok = true;
     } else if let Some((base, model)) = detected {
         println!("✓ model: {model} @ {base} (auto-detect HTTP)");
+        model_ok = true;
     } else {
-        let provider_cfg = provider::load_config(dir);
         if let Some(selection) = provider_cfg.route("active") {
             let instance_ok = provider_cfg
                 .instance(&selection.instance_id)
                 .is_some_and(|i| {
-                    i.enabled && crate::discover::cli_instance_ready(i)
-                        || matches!(
-                            i.driver,
-                            provider::ProviderDriver::OpenAiCompat
-                                | provider::ProviderDriver::Ollama
-                        )
+                    i.enabled
+                        && (discover::cli_instance_ready(i)
+                            || matches!(
+                                i.driver,
+                                provider::ProviderDriver::OpenAiCompat
+                                    | provider::ProviderDriver::Ollama
+                            ))
                 });
             if instance_ok {
                 println!(
                     "✓ model: {}:{} (config route.active — run coxn to connect)",
                     selection.instance_id, selection.model
                 );
+                model_ok = true;
             } else {
                 blocking = true;
                 println!("✗ model: route.active points at unavailable provider");
@@ -77,43 +98,62 @@ pub fn run(dir: &Path) -> i32 {
         }
     }
 
-    let provider_cfg = provider::load_config(dir);
+    if trust::auto_approve_enabled() {
+        warnings = true;
+        println!("⚠ auto-approve: COXN_AUTO_APPROVE=1 — human gate disabled");
+        println!("  note: intended for `coxn once` headless runs only");
+    }
+
+    // --- Configured providers (issues only unless verbose) ---
     if !provider_cfg.instances.is_empty() {
-        println!();
-        println!("providers:");
+        let mut issue_lines: Vec<(bool, String)> = Vec::new();
         for instance in &provider_cfg.instances {
             if !instance.enabled {
-                println!("○ {}: disabled", instance.id);
+                if verbose {
+                    issue_lines.push((false, format!("○ {}: disabled", instance.id)));
+                }
                 continue;
             }
+            let routed = instance_is_routed(&provider_cfg, &instance.id);
             match &instance.driver {
                 provider::ProviderDriver::OpenAiCompat => {
                     let base = instance.base_url.as_deref().unwrap_or("(missing base_url)");
                     let key = provider::secret_for_instance(&instance.id);
                     if provider::cloud_blocked(base, key.as_deref()) {
-                        blocking = true;
-                        println!(
+                        let line = format!(
                             "✗ {}: {} requires COXN_KEY_{} or COXN_ALLOW_CLOUD=1",
                             instance.id,
                             base,
                             provider::secret_env_name(&instance.id).trim_start_matches("COXN_KEY_")
                         );
-                    } else {
+                        issue_lines.push((routed || !model_ok, line));
+                    } else if verbose {
                         let auth = if key.is_some() { "key" } else { "no key" };
-                        println!("✓ {}: {} ({auth})", instance.id, base);
+                        issue_lines.push((false, format!("✓ {}: {} ({auth})", instance.id, base)));
                     }
                 }
-                provider::ProviderDriver::Stub => println!("✓ {}: stub", instance.id),
+                provider::ProviderDriver::Stub => {
+                    if verbose {
+                        issue_lines.push((false, format!("✓ {}: stub", instance.id)));
+                    }
+                }
                 provider::ProviderDriver::Ollama => {
                     let base = instance
                         .base_url
                         .as_deref()
                         .unwrap_or("http://localhost:11434");
                     if crate::ollama::reachable(base) {
-                        println!("✓ {}: ollama native @ {base} (no key)", instance.id);
+                        if verbose {
+                            issue_lines.push((
+                                false,
+                                format!("✓ {}: ollama native @ {base} (no key)", instance.id),
+                            ));
+                        }
                     } else {
-                        blocking = true;
-                        println!("✗ {}: ollama not reachable @ {base}", instance.id);
+                        issue_lines.push((
+                            routed || !model_ok,
+                            format!("✗ {}: ollama not reachable @ {base}", instance.id),
+                        ));
                     }
                 }
                 provider::ProviderDriver::Codex => {
@@ -121,64 +161,108 @@ pub fn run(dir: &Path) -> i32 {
                     let outcome = codex_probe::probe_instance(instance);
                     let (is_blocking, line) =
                         codex_probe::format_status_line(&instance.id, bin, &outcome);
-                    if is_blocking {
-                        blocking = true;
+                    if is_blocking || verbose {
+                        issue_lines.push((is_blocking && (routed || !model_ok), line));
                     }
-                    println!("{line}");
-                    if matches!(outcome, codex_probe::CodexProbeOutcome::Authenticated(_)) {
-                        println!("  exec: codex CLI piggyback (text-only turns)");
+                    if verbose
+                        && matches!(outcome, codex_probe::CodexProbeOutcome::Authenticated(_))
+                    {
+                        issue_lines.push((
+                            false,
+                            "  exec: codex CLI piggyback (text-only turns)".to_string(),
+                        ));
                     }
                 }
                 provider::ProviderDriver::ClaudeCli => {
                     let bin = instance.binary.as_deref().unwrap_or("claude");
                     let home = instance.home_path.as_deref();
                     if !crate::cli_ndjson::binary_installed(bin) {
-                        blocking = true;
-                        println!("✗ {}: {bin} not installed or not runnable", instance.id);
+                        issue_lines.push((
+                            routed || !model_ok,
+                            format!("✗ {}: {bin} not installed or not runnable", instance.id),
+                        ));
                     } else if crate::claude_cli::probe_logged_in(bin, home, &instance.env) {
-                        println!(
-                            "✓ {}: {bin} authenticated (claude CLI piggyback — text-only turns)",
-                            instance.id
-                        );
+                        if verbose {
+                            issue_lines.push((
+                                false,
+                                format!(
+                                    "✓ {}: {bin} authenticated (claude CLI piggyback — text-only turns)",
+                                    instance.id
+                                ),
+                            ));
+                        }
                     } else {
-                        blocking = true;
-                        println!(
-                            "✗ {}: {bin} installed but not logged in (`{bin} login`)",
-                            instance.id
-                        );
+                        issue_lines.push((
+                            routed || !model_ok,
+                            format!(
+                                "✗ {}: {bin} installed but not logged in (`{bin} login`)",
+                                instance.id
+                            ),
+                        ));
                     }
                 }
                 provider::ProviderDriver::GrokCli => {
                     let bin = instance.binary.as_deref().unwrap_or("grok");
                     let home = instance.home_path.as_deref();
                     if !crate::cli_ndjson::binary_installed(bin) {
-                        blocking = true;
-                        println!("✗ {}: {bin} not installed or not runnable", instance.id);
+                        issue_lines.push((
+                            routed || !model_ok,
+                            format!("✗ {}: {bin} not installed or not runnable", instance.id),
+                        ));
                     } else if crate::grok_cli::probe_logged_in(bin, home, &instance.env) {
-                        println!(
-                            "✓ {}: {bin} authenticated (grok CLI piggyback — text-only turns)",
-                            instance.id
-                        );
+                        if verbose {
+                            issue_lines.push((
+                                false,
+                                format!(
+                                    "✓ {}: {bin} authenticated (grok CLI piggyback — text-only turns)",
+                                    instance.id
+                                ),
+                            ));
+                        }
                     } else {
-                        blocking = true;
-                        println!(
-                            "✗ {}: {bin} installed but not logged in (`{bin} login`)",
-                            instance.id
-                        );
+                        issue_lines.push((
+                            routed || !model_ok,
+                            format!(
+                                "✗ {}: {bin} installed but not logged in (`{bin} login`)",
+                                instance.id
+                            ),
+                        ));
                     }
                 }
                 provider::ProviderDriver::Unknown(driver) => {
-                    blocking = true;
-                    println!("✗ {}: unknown driver '{}'", instance.id, driver)
+                    issue_lines.push((
+                        routed || !model_ok,
+                        format!("✗ {}: unknown driver '{driver}'", instance.id),
+                    ));
                 }
             }
         }
-    }
 
-    if trust::auto_approve_enabled() {
-        warnings = true;
-        println!("⚠ auto-approve: COXN_AUTO_APPROVE=1 — human gate disabled");
-        println!("  note: intended for `coxn once` headless runs only");
+        if !issue_lines.is_empty() {
+            println!();
+            if verbose {
+                println!("providers:");
+            } else {
+                println!("config:");
+            }
+            for (counts_as_blocking, line) in issue_lines {
+                let is_error = line.starts_with('✗');
+                if counts_as_blocking && is_error {
+                    blocking = true;
+                    println!("{line}");
+                } else if is_error {
+                    warnings = true;
+                    let detail = line.trim_start_matches('✗').trim_start();
+                    if verbose {
+                        println!("{line}");
+                    } else {
+                        println!("⚠ {detail} (not active — safe to ignore or disable)");
+                    }
+                } else if verbose {
+                    println!("{line}");
+                }
+            }
+        }
     }
 
     // --- Sandbox ---
@@ -194,8 +278,10 @@ pub fn run(dir: &Path) -> i32 {
     let caps = aden::probe(dir);
     if caps.available {
         println!("✓ aden: on PATH");
-        if let (Some(url), Some(name)) = (&caps.model_base_url, &caps.model_name) {
-            println!("  config: {name} @ {url}");
+        if verbose {
+            if let (Some(url), Some(name)) = (&caps.model_base_url, &caps.model_name) {
+                println!("  config: {name} @ {url}");
+            }
         }
     } else {
         println!("○ aden: not on PATH (optional — standalone mode)");
@@ -220,25 +306,45 @@ pub fn run(dir: &Path) -> i32 {
         println!("○ task: none (ungated — human approval only)");
     }
 
-    // --- Setup presets (readiness at a glance) ---
+    // --- Presets: compact default, full list when verbose ---
+    let summary = discover::summarize_presets();
     println!();
-    println!("setup presets:");
-    for (category, group) in provider::presets_by_category() {
-        println!("  {}", category.title());
-        for p in *group {
-            let readiness = crate::discover::probe_preset(p);
-            let star = if p.recommended { " ★" } else { "" };
-            println!(
-                "  {} {:<18}{star} {} — {}",
-                readiness.badge(),
-                p.id,
-                p.label,
-                readiness.hint()
-            );
+    if summary.ready.is_empty() {
+        blocking = true;
+        println!("✗ ready now: none");
+    } else {
+        let mut ready = summary.ready.join(", ");
+        if let Some(p) = provider::presets_by_category()
+            .iter()
+            .flat_map(|(_, g)| g.iter())
+            .find(|p| p.recommended && summary.ready.contains(&p.id))
+        {
+            ready = ready.replace(p.id, &format!("{} ★", p.id));
+        }
+        println!("✓ ready now: {ready}");
+    }
+    if let Some(hint) = summary.setup_hint() {
+        println!("○ setup: {hint} — Ctrl-Space or `coxn auth setup <preset>`");
+    }
+    if verbose {
+        println!();
+        println!("setup presets:");
+        for (category, group) in provider::presets_by_category() {
+            println!("  {}", category.title());
+            for p in *group {
+                let readiness = discover::probe_preset(p);
+                let star = if p.recommended { " ★" } else { "" };
+                println!(
+                    "  {} {:<18}{star} {} — {}",
+                    readiness.badge(),
+                    p.id,
+                    p.label,
+                    readiness.hint()
+                );
+            }
         }
     }
 
-    // --- Sessions dir ---
     let sessions = session_dir();
     println!();
     println!("○ sessions: {}", sessions.display());
@@ -286,5 +392,14 @@ mod tests {
         // Exit code depends on environment; just ensure it returns 0/1/2.
         let code = run(&dir);
         assert!(code <= 2);
+    }
+
+    #[test]
+    fn summarize_presets_has_entries() {
+        let summary = discover::summarize_presets();
+        assert!(
+            !summary.ready.is_empty() || summary.setup_hint().is_some(),
+            "expected at least one ready or setup hint"
+        );
     }
 }

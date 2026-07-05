@@ -270,3 +270,26 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 **Tests:** 352 pass; `cargo install --path .` OK
 
 **Next:** push main; WS1 visual; live smokes; devex-review
+
+### Pass 20 — 2026-07-05 (WS5 doctor + devex + PLAN)
+
+**Shipped:**
+- `coxn doctor` compact one-screen default (~17 lines): `ready now` preset
+  summary, grouped `setup` hints, config issues demoted to warnings when not
+  routed; `COXN_DOCTOR_VERBOSE=1` restores full preset table
+- Non-active provider misconfig (e.g. openrouter without key) warns instead of
+  blocking when auto-detect model works
+- `discover::summarize_presets()` for doctor + tests
+- PLAN.adoc: Phase 5 marked done; O3 parallel ledger note synced; stale aden
+  branch note closed
+
+**Devex-review (CLI audit, no browser):**
+- P1: none
+- P2 fixed: doctor falsely NOT READY when unused cloud instance lacked key
+- P2 accepted: WS1 visual embed blocked (no asciinema/vhs); live partition/Ollama
+  smokes host-dependent
+- TTHW: `cargo install --path .` ~4s warm; doctor answers "ready now" in one screen
+
+**Validated:** 353 tests; smoke-gate green; `cargo package` OK
+
+**Next:** WS1 visual (needs recorder); live smokes; WS4 module split (deferred)
