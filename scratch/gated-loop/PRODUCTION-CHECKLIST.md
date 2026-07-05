@@ -66,10 +66,10 @@ after restart; `/execute` fully reconstructable.
 
 ## Workstream 3 — Loop hardening
 
-- [ ] Parse grok NDJSON usage → context meter
-- [ ] Unit test grok usage with fake binary
-- [ ] Cancel through `pump.run_turn_streaming` for normal turns
-- [ ] Unit test Ctrl-C mid-stream preserves partial text
+- [x] Parse grok NDJSON usage → context meter (when CLI emits `usage` on `end`)
+- [x] Unit test grok usage with fake binary
+- [x] Cancel through `pump.run_turn_streaming` for normal turns
+- [x] Unit test Ctrl-C mid-stream preserves partial text
 - [x] Throttle/diff-append `/execute` progress snapshots
 - [x] Cancel in-flight parallel workers on partition cancel
 - [x] Consolidate env test locking → shared `ENV_TEST_LOCK`
@@ -90,7 +90,7 @@ devex-review clear.
 - [ ] Unit test mid-session `aden_grep` discovery
 - [ ] Optional aden preamble nudge when aden on PATH
 - [ ] Sync `PLAN.adoc` (close stale items)
-- [ ] Sync README "Not yet" section
+- [x] Sync README "Not yet" section
 - [ ] Bump `VERSION` + `CHANGELOG` per workstream ship
 
 **Done when:** Small modules; deferred discovery works; docs match code.
@@ -109,7 +109,7 @@ devex-review clear.
 
 ### 5b — Distribution
 
-- [ ] Verify `cargo install --path .` on clean walkthrough
+- [x] Verify `cargo install --path .` on clean walkthrough
 - [ ] Verify crates.io release workflow
 - [x] `check-no-secrets.sh` in CI
 - [x] `smoke-gate.sh` in CI (skips without aden)
@@ -117,9 +117,9 @@ devex-review clear.
 
 ### 5c — Documentation lock
 
-- [ ] README matches bindings, gates, text-only CLI stance
-- [ ] INSTALL.md matches auth presets
-- [ ] Help overlay matches README
+- [x] README matches bindings, gates, text-only CLI stance (partial — Status/Not yet synced)
+- [x] INSTALL.md matches auth presets (+ `/execute`/`/runs`/jobs)
+- [x] Help overlay matches README (`:execute` threat note)
 - [x] Document `/execute` auto-approve threat model
 - [x] Document aden caveats (OO recall, prose `ask`) in README + doctor
 

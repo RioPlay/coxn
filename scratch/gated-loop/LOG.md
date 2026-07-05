@@ -257,3 +257,16 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 **Tests:** 350 pass; smoke-gate green
 
 **Next:** WS1 visual embed (needs asciinema/vhs); grok usage; INSTALL/help doc lock
+
+### Pass 19 — 2026-07-05 (WS3 cancel + grok usage + docs)
+
+**Shipped:**
+- `Model::stream` default respects `on_idle` cancel before emitting full text
+- `cancel_mid_stream_preserves_partial_text` pump test (ChunkedStreamModel)
+- Grok CLI: parse `usage` from `end` / `usage` NDJSON events + fake-binary test
+- README Status/Not yet synced with Phase 5 ship state
+- INSTALL: `/execute` threat boundary, `/runs`, `COXN_EXECUTE_JOBS`
+
+**Tests:** 352 pass; `cargo install --path .` OK
+
+**Next:** push main; WS1 visual; live smokes; devex-review

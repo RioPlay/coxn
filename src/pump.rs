@@ -953,6 +953,74 @@ mod tests {
         assert!(tool_msgs.iter().all(|c| !c.contains("edited")));
     }
 
+    /// Streams fixed text chunks with `on_idle` between each (like SSE/NDJSON backends).
+    struct ChunkedStreamModel {
+        chunks: Vec<&'static str>,
+    }
+
+    impl Model for ChunkedStreamModel {
+        async fn call(&self, _request: ModelRequest) -> Result<ModelResponse, ModelError> {
+            Ok(ModelResponse {
+                message: Message::new(Role::Assistant, self.chunks.concat()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: ModelRequest,
+            io: &mut dyn TurnIo,
+        ) -> Result<ModelResponse, ModelError> {
+            let mut text = String::new();
+            for chunk in &self.chunks {
+                if !io.on_idle() {
+                    break;
+                }
+                if !io.on_delta(chunk) {
+                    text.push_str(chunk);
+                    break;
+                }
+                text.push_str(chunk);
+            }
+            Ok(ModelResponse {
+                message: Message::new(Role::Assistant, text),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    /// Cancels on the second `on_idle` tick (after the first streamed chunk).
+    struct CancelOnSecondIdle {
+        idle_ticks: usize,
+    }
+
+    impl TurnIo for CancelOnSecondIdle {
+        fn on_delta(&mut self, _delta: &str) -> bool {
+            true
+        }
+        fn on_idle(&mut self) -> bool {
+            self.idle_ticks += 1;
+            self.idle_ticks < 2
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_stream_preserves_partial_text() {
+        let model = ChunkedStreamModel {
+            chunks: vec!["hel", "lo", " world"],
+        };
+        let mut pump = Pump::new(model, ToolRegistry::new());
+        pump.push_user("hi");
+        let mut io = CancelOnSecondIdle { idle_ticks: 0 };
+        let out = pump.run_turn_streaming(&mut io).await.expect("turn");
+        assert_eq!(out, "hel");
+        let last = pump.messages().last().expect("assistant msg");
+        assert_eq!(last.role, Role::Assistant);
+        assert_eq!(last.content, "hel");
+    }
+
     /// A mutating-but-not-revertible tool, like a shell command.
     struct CommandTool;
     impl Tool for CommandTool {

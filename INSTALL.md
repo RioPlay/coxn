@@ -86,7 +86,12 @@ coxn once -p "..."    # headless (requires COXN_AUTO_APPROVE=1)
 COXN_TASK_NAME=fix-parser COXN_TASK_SEEDS=parse_config coxn
 ```
 
-Inside the TUI: `/scope` shows the active task, `/execute` runs the aden partition.
+Inside the TUI: `/scope` shows the active task, `/execute` runs the aden partition
+(you confirm the preview first; sub-agents auto-approve tools inside each scope).
+`/runs` lists JSONL run ledgers; `/runs <slug>` summarizes approvals and gates.
+
+Parallel read-only scopes: `COXN_EXECUTE_JOBS=2` (max 8). Mutating scopes always
+serialize so the blast-radius gate stays correct.
 
 ## Environment variables
 

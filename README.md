@@ -399,6 +399,11 @@ read/edit workflow with per-tool approval, the bwrap sandbox, the optional aden
 scope gate (with revert on escape), auto-retry, the context meter, and JSONL
 session persistence (`/resume`).
 
-Not yet: multi-model sub-agents (`DESIGN.adoc` Phase 5); a native streaming
-profile for servers whose chat-completions layer drops tool calls under streaming;
-an optional direct-provider profile (native caching / exact billing).
+Shipped: aden task partitions via `/execute` (sequential + parallel read-only
+scopes), per-scope role routing, run ledger (`/runs`), and partition resume.
+
+Not yet: live partition smoke on every host (needs aden + model); scope-escape
+visual in README (record with `scripts/record-scope-escape.sh`); grok CLI usage
+in every build (when the CLI emits tokens); native streaming profile for servers
+whose chat-completions layer drops tool calls under streaming; optional
+direct-provider profile (native caching / exact billing).

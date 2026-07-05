@@ -249,8 +249,7 @@ pub trait Model {
         io: &mut dyn crate::pump::TurnIo,
     ) -> Result<ModelResponse, ModelError> {
         let response = self.call(request).await?;
-        if !response.message.content.is_empty() {
-            io.on_idle();
+        if !response.message.content.is_empty() && io.on_idle() {
             io.on_delta(&response.message.content);
         }
         Ok(response)

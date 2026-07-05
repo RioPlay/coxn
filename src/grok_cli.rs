@@ -5,6 +5,7 @@ use std::process::Command;
 
 use crate::cli_ndjson::{
     NdjsonTurnResult, StreamControl, apply_instance_env, flatten_request, run_ndjson_turn,
+    usage_from_object,
 };
 use crate::model::{Message, Model, ModelError, ModelRequest, ModelResponse, Role};
 use crate::pump::TurnIo;
@@ -150,7 +151,21 @@ fn on_grok_line(
                 }
             }
         }
-        Some("end") => return Ok(StreamControl::Done),
+        Some("end") => {
+            if let Some(usage) = value.get("usage").and_then(usage_from_object) {
+                result.usage = Some(usage);
+            }
+            return Ok(StreamControl::Done);
+        }
+        Some("usage") => {
+            if let Some(usage) = value
+                .get("usage")
+                .and_then(usage_from_object)
+                .or_else(|| value.pointer("/data/usage").and_then(usage_from_object))
+            {
+                result.usage = Some(usage);
+            }
+        }
         Some("error") => {
             let msg = value
                 .get("message")
@@ -172,6 +187,30 @@ mod tests {
     use crate::cli_ndjson::test_support::{
         fake_cli_test_lock, unique_temp_dir, write_executable_script,
     };
+
+    #[tokio::test]
+    async fn stream_turn_parses_usage_from_end_event() {
+        let _guard = fake_cli_test_lock();
+        let dir = unique_temp_dir("coxn-grok-usage");
+        let body = r#"echo '{"type":"text","data":"ok"}'
+echo '{"type":"end","usage":{"input_tokens":42,"output_tokens":7}}'"#;
+        let fake = write_executable_script(&dir, "fake-grok", body);
+        let model =
+            GrokCliPiggybackModel::new(fake.to_string_lossy(), "test-model", None, vec![], &dir);
+        let response = model
+            .call(ModelRequest {
+                system: String::new(),
+                messages: vec![Message::new(Role::User, "ping")],
+                tools: vec![],
+                thinking: None,
+            })
+            .await
+            .expect("call");
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.completion_tokens, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn stream_turn_from_fake_binary() {
