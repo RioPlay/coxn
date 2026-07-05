@@ -2014,6 +2014,9 @@ fn command_key(call: &ToolCall) -> Option<String> {
 /// The per-turn terminal I/O the pump drives: stream the reply live (with a
 /// Ctrl-C cancel check between fragments) and prompt for approval before a
 /// mutating tool runs. Owns the terminal borrows so the pump needs one handle.
+/// Minimum interval between streaming repaints (~30 fps).
+const STREAM_REPAINT_MIN: Duration = Duration::from_millis(33);
+
 struct DriveIo<'a> {
     dir: &'a Path,
     tui: &'a mut Tui,
@@ -2033,6 +2036,8 @@ struct DriveIo<'a> {
     /// Whether bwrap confinement is available, surfaced in the run_command
     /// approval prompt so the user knows the isolation level before approving.
     bwrap: bool,
+    last_repaint: Option<Instant>,
+    repaint_pending: bool,
 }
 
 impl DriveIo<'_> {
@@ -2078,7 +2083,7 @@ impl DriveIo<'_> {
 
     /// Repaint the output pane with the current assistant text and any live
     /// run_command output appended below it.
-    fn repaint(&mut self) {
+    fn repaint_now(&mut self) {
         if self.view.ui3_active() {
             self.view.set_live_turn(&self.buf, &self.run_buf);
         } else {
@@ -2091,6 +2096,27 @@ impl DriveIo<'_> {
             };
         }
         let _ = self.tui.draw(self.view);
+    }
+
+    fn repaint(&mut self, force: bool) {
+        let now = Instant::now();
+        if !force
+            && self
+                .last_repaint
+                .is_some_and(|last| now.duration_since(last) < STREAM_REPAINT_MIN)
+        {
+            self.repaint_pending = true;
+            return;
+        }
+        self.repaint_now();
+        self.last_repaint = Some(now);
+        self.repaint_pending = false;
+    }
+
+    fn flush_repaint(&mut self) {
+        if self.repaint_pending {
+            self.repaint(true);
+        }
     }
 }
 
@@ -2119,7 +2145,7 @@ impl TurnIo for DriveIo<'_> {
             return false;
         }
         self.buf.push_str(delta);
-        self.repaint();
+        self.repaint(false);
         true
     }
 
@@ -2130,7 +2156,7 @@ impl TurnIo for DriveIo<'_> {
         }
         self.run_buf.push_str(line);
         self.run_buf.push('\n');
-        self.repaint();
+        self.repaint(false);
         true
     }
 
@@ -3988,7 +4014,17 @@ async fn drive(
                                     view.snap_to_bottom();
                                     let _ = tui.draw(view);
                                 };
-                                let mut poll_cancel = || poll_user_quit_only();
+                                let execute_cancel =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let poll_flag = execute_cancel.clone();
+                                let mut poll_cancel = move || {
+                                    if poll_user_quit_only() {
+                                        poll_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
                                 let report = execute::execute_partition(
                                     dir,
                                     caps,
@@ -3998,6 +4034,7 @@ async fn drive(
                                     execute::ExecuteProgress::new(
                                         &mut on_execute_progress,
                                         Some(&mut poll_cancel),
+                                        Some(execute_cancel),
                                     ),
                                 )
                                 .await;
@@ -4092,6 +4129,8 @@ async fn drive(
                             approvals: &mut approvals,
                             approved_commands: &mut approved_commands,
                             bwrap,
+                            last_repaint: None,
+                            repaint_pending: false,
                         };
                         let mut io = run_ledger::LedgerTurnIo::new(
                             &mut drive_io,
@@ -4100,6 +4139,7 @@ async fn drive(
                             "main",
                         );
                         let r = pump.run_turn_streaming(&mut io).await;
+                        drive_io.flush_repaint();
                         cancelled = drive_io.cancelled || drive_io.cancel_turn;
                         assistant_chars = drive_io.buf.chars().count();
                         command_output_chars = drive_io.run_buf.chars().count();

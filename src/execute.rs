@@ -1,5 +1,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -7,8 +10,8 @@ use crate::app::{
     AGENT_PREAMBLE_ADEN, AGENT_PREAMBLE_BASE, ModelSel, openai_model, resolve_instance_from_config,
     resolve_role, task_config,
 };
-use crate::model::{AnyModel, Usage};
-use crate::pump::{BatchIo, Pump};
+use crate::model::{AnyModel, ToolCall, Usage};
+use crate::pump::{Approval, BatchIo, Pump, TurnIo};
 use crate::tools::register_aden_tools;
 use crate::tools::{EditTool, GlobTool, GrepTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
 use crate::{aden, agents, gate, provider, run_ledger};
@@ -71,31 +74,65 @@ fn registry_for_policy(
     tools
 }
 
-/// Optional sink for live `/execute` progress (full report snapshot per update).
+/// Minimum interval between live `/execute` progress repaints.
+const EXECUTE_EMIT_MIN: Duration = Duration::from_millis(100);
+
+/// Optional sink for live `/execute` progress (throttled full-report snapshots).
 pub(crate) struct ExecuteProgress<'a> {
     on_update: Option<&'a mut dyn FnMut(&str)>,
     should_cancel: Option<&'a mut dyn FnMut() -> bool>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    last_emit: Option<Instant>,
 }
 
 impl<'a> ExecuteProgress<'a> {
     pub(crate) fn new(
         on_update: &'a mut dyn FnMut(&str),
         should_cancel: Option<&'a mut dyn FnMut() -> bool>,
+        cancel_flag: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
             on_update: Some(on_update),
             should_cancel,
+            cancel_flag,
+            last_emit: None,
         }
     }
 
     fn emit(&mut self, report: &str) {
+        let now = Instant::now();
+        if self
+            .last_emit
+            .is_some_and(|last| now.duration_since(last) < EXECUTE_EMIT_MIN)
+        {
+            return;
+        }
         if let Some(cb) = &mut self.on_update {
             cb(report);
         }
+        self.last_emit = Some(now);
+    }
+
+    fn flush(&mut self, report: &str) {
+        if let Some(cb) = &mut self.on_update {
+            cb(report);
+        }
+        self.last_emit = Some(Instant::now());
     }
 
     fn cancelled(&mut self) -> bool {
-        self.should_cancel.as_mut().is_some_and(|f| f())
+        if self.should_cancel.as_mut().is_some_and(|f| f()) {
+            if let Some(flag) = &self.cancel_flag {
+                flag.store(true, Ordering::Relaxed);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.cancel_flag.clone()
     }
 }
 
@@ -104,8 +141,56 @@ fn append_report(report: &mut String, progress: &mut ExecuteProgress<'_>, chunk:
     progress.emit(report);
 }
 
+/// [`BatchIo`] that stops the pump when a shared cancel flag is set.
+struct CancelBatchIo {
+    inner: BatchIo,
+    cancel: Arc<AtomicBool>,
+}
+
+impl CancelBatchIo {
+    fn new(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: BatchIo::new(),
+            cancel,
+        }
+    }
+
+    fn result(&self) -> String {
+        self.inner.result()
+    }
+}
+
+impl TurnIo for CancelBatchIo {
+    fn on_delta(&mut self, delta: &str) -> bool {
+        if self.cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.inner.on_delta(delta)
+    }
+
+    fn on_idle(&mut self) -> bool {
+        !self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn approve(&mut self, call: &ToolCall) -> Approval {
+        self.inner.approve(call)
+    }
+
+    fn on_run_output(&mut self, line: &str) -> bool {
+        if self.cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.inner.on_run_output(line)
+    }
+
+    fn stream_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
 fn abort_report(report: &mut String, progress: &mut ExecuteProgress<'_>, msg: &str) -> String {
     append_report(report, progress, &format!("\n✗ {msg}\n"));
+    progress.flush(report);
     std::mem::take(report)
 }
 
@@ -419,6 +504,7 @@ async fn execute_partition_sequential(
     ledger.append("run_finished", None, None, json!({ "status": run_status }));
     append_report(&mut report, &mut progress, "\n=== merged upstream ===\n");
     append_report(&mut report, &mut progress, &upstream);
+    progress.flush(&report);
     report
 }
 // === Parallel wave scheduler (COXN_EXECUTE_JOBS > 1) ============================
@@ -444,6 +530,7 @@ struct ScopeInput {
     context: String,
     model: AnyModel,
     label: String,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 /// What one sub-scope produced, returned to the driving thread for ledger merge.
@@ -583,7 +670,35 @@ async fn run_one_scope(input: ScopeInput, parallel: bool) -> ScopeOutcome {
          Return a dense summary of actions and findings.",
         input.scope_id, input.role
     ));
-    let mut io = BatchIo::new();
+    let mut io = match &input.cancel {
+        Some(flag) => {
+            let mut cancel_io = CancelBatchIo::new(flag.clone());
+            let result = pump.run_turn_streaming(&mut cancel_io).await;
+            return match result {
+                Ok(_) => ScopeOutcome {
+                    ok: !cancel_io.stream_cancelled(),
+                    result: cancel_io.result(),
+                    error: if cancel_io.stream_cancelled() {
+                        "cancelled".to_string()
+                    } else {
+                        String::new()
+                    },
+                    usage: pump.last_usage(),
+                    label: input.label,
+                    policy_label: policy.label(),
+                    budget: input.budget,
+                    parallel,
+                },
+                Err(e) => ScopeOutcome::err(
+                    policy.label(),
+                    &input.label,
+                    &input.role,
+                    format!("error: {e}"),
+                ),
+            };
+        }
+        None => BatchIo::new(),
+    };
     match pump.run_turn_streaming(&mut io).await {
         Ok(_) => ScopeOutcome {
             ok: true,
@@ -638,6 +753,7 @@ fn prepare_scope(
         context,
         model,
         label,
+        cancel: None,
     })
 }
 
@@ -660,6 +776,7 @@ struct WaveCtx<'a> {
     budget: u64,
     upstream: &'a str,
     jobs: usize,
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Run a set of scopes concurrently on worker threads (capped at `jobs`), in
@@ -669,6 +786,13 @@ fn run_read_only_wave(ctx: &WaveCtx<'_>, indices: &[usize]) -> Vec<ScopeOutcome>
     let mut outcomes: Vec<Option<ScopeOutcome>> = (0..indices.len()).map(|_| None).collect();
     // Process in batches of `jobs` so the worker pool is bounded.
     for batch in indices.chunks(ctx.jobs.max(1)) {
+        if ctx
+            .cancel_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            break;
+        }
         let mut handles = Vec::new();
         for (slot, &idx) in batch.iter().enumerate() {
             let global_slot = indices.iter().position(|i| *i == idx).unwrap_or(slot);
@@ -681,7 +805,8 @@ fn run_read_only_wave(ctx: &WaveCtx<'_>, indices: &[usize]) -> Vec<ScopeOutcome>
                 ctx.budget,
                 ctx.upstream,
             ) {
-                Ok(input) => {
+                Ok(mut input) => {
+                    input.cancel = ctx.cancel_flag.clone();
                     let handle = std::thread::spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .build()
@@ -707,7 +832,21 @@ fn run_read_only_wave(ctx: &WaveCtx<'_>, indices: &[usize]) -> Vec<ScopeOutcome>
             }));
         }
     }
-    outcomes.into_iter().map(|o| o.expect("filled")).collect()
+    outcomes
+        .into_iter()
+        .enumerate()
+        .map(|(slot, o)| {
+            o.unwrap_or_else(|| {
+                let scope = ctx.ordered[indices[slot]];
+                ScopeOutcome::err(
+                    ToolPolicy::for_role(&scope.role).label(),
+                    &scope.role,
+                    &scope.role,
+                    "cancelled",
+                )
+            })
+        })
+        .collect()
 }
 
 /// The parallel wave runner. Emits the same coarse ledger events as the
@@ -771,6 +910,7 @@ async fn execute_partition_parallel(
     let mut reported = 0usize;
     let total = ordered.len();
 
+    let cancel_flag = progress.cancel_flag();
     let mut pending: Vec<usize> = (0..ordered.len()).collect();
     while !pending.is_empty() {
         if progress.cancelled() {
@@ -829,6 +969,7 @@ async fn execute_partition_parallel(
                 budget,
                 upstream: &upstream,
                 jobs,
+                cancel_flag: cancel_flag.clone(),
             };
             let ro_outcomes = run_read_only_wave(&ctx, &read_only);
             for (k, o) in ro_outcomes.into_iter().enumerate() {
@@ -838,7 +979,10 @@ async fn execute_partition_parallel(
             // Zero or one read-only scope: run it on the driving thread.
             for &i in &read_only {
                 match prepare_scope(dir, caps, sel, bwrap, ordered[i], budget, &upstream) {
-                    Ok(input) => outcomes.push((i, run_scope_on_main(input, false))),
+                    Ok(mut input) => {
+                        input.cancel = cancel_flag.clone();
+                        outcomes.push((i, run_scope_on_main(input, false)));
+                    }
                     Err(o) => outcomes.push((i, o)),
                 }
             }
@@ -846,7 +990,10 @@ async fn execute_partition_parallel(
         // Mutating scopes always run sequentially on the driving thread.
         for &i in &mutating {
             match prepare_scope(dir, caps, sel, bwrap, ordered[i], budget, &upstream) {
-                Ok(input) => outcomes.push((i, run_scope_on_main(input, false))),
+                Ok(mut input) => {
+                    input.cancel = cancel_flag.clone();
+                    outcomes.push((i, run_scope_on_main(input, false)));
+                }
                 Err(o) => outcomes.push((i, o)),
             }
         }
@@ -934,6 +1081,7 @@ async fn execute_partition_parallel(
     ledger.append("run_finished", None, None, json!({ "status": run_status }));
     append_report(&mut report, &mut progress, "\n=== merged upstream ===\n");
     append_report(&mut report, &mut progress, &upstream);
+    progress.flush(&report);
     report
 }
 #[cfg(test)]
@@ -978,26 +1126,31 @@ mod tests {
         let mut snapshots = Vec::new();
         let mut capture = |r: &str| snapshots.push(r.to_string());
         let mut cancel = || true;
-        let mut progress = ExecuteProgress::new(&mut capture, Some(&mut cancel));
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut progress =
+            ExecuteProgress::new(&mut capture, Some(&mut cancel), Some(flag.clone()));
         let mut report = "start\n".to_string();
         progress.emit(&report);
         assert!(progress.cancelled());
+        assert!(flag.load(Ordering::Relaxed));
         append_report(&mut report, &mut progress, "  ✗ — cancelled\n");
-        assert!(snapshots[1].contains("cancelled"));
+        progress.flush(&report);
+        assert!(snapshots.last().expect("snapshot").contains("cancelled"));
     }
 
     #[test]
     fn append_report_emits_on_every_append() {
         let mut snapshots = Vec::new();
         let mut capture = |r: &str| snapshots.push(r.to_string());
-        let mut progress = ExecuteProgress::new(&mut capture, None);
+        let mut progress = ExecuteProgress::new(&mut capture, None, None);
         let mut report = "executing partition 't' (2 scopes)…\n".to_string();
         progress.emit(&report);
         append_report(&mut report, &mut progress, "  ⟳ [1/2] scout — running…\n");
         append_report(&mut report, &mut progress, "  ✓ [1/2] scout — done\n");
-        assert_eq!(snapshots.len(), 3);
-        assert!(snapshots[2].contains("✓ [1/2] scout"));
-        assert_eq!(report, snapshots[2]);
+        progress.flush(&report);
+        assert!(snapshots.len() >= 1);
+        assert!(snapshots.last().expect("final").contains("✓ [1/2] scout"));
+        assert_eq!(&report, snapshots.last().expect("final"));
     }
 
     #[test]

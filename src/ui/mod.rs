@@ -18,22 +18,19 @@ pub fn enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
-
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env;
 
     #[test]
     fn enabled_by_default() {
-        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _guard = test_env::lock();
         unsafe { std::env::remove_var("COXN_TUI3") };
         assert!(enabled());
     }
 
     #[test]
     fn disabled_when_zero() {
-        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _guard = test_env::lock();
         unsafe { std::env::set_var("COXN_TUI3", "0") };
         assert!(!enabled());
         unsafe { std::env::remove_var("COXN_TUI3") };

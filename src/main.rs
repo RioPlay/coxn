@@ -30,6 +30,8 @@ mod run_ledger;
 mod sandbox;
 mod session;
 mod stream_idle;
+#[cfg(test)]
+mod test_env;
 mod tools;
 mod trust;
 mod tui;

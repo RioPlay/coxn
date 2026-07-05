@@ -72,13 +72,11 @@ impl Trust {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env;
 
     #[test]
     fn ladder_shows_auto_approve_when_env_set() {
-        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _guard = test_env::lock();
         unsafe { std::env::set_var("COXN_AUTO_APPROVE", "1") };
         assert_eq!(Trust::default().ladder_tag(false), "trust: AUTO-APPROVE");
         unsafe { std::env::remove_var("COXN_AUTO_APPROVE") };
@@ -86,7 +84,7 @@ mod tests {
 
     #[test]
     fn ladder_shows_scope_when_task_gated() {
-        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _guard = test_env::lock();
         unsafe { std::env::remove_var("COXN_AUTO_APPROVE") };
         assert_eq!(Trust::default().ladder_tag(true), "trust: supervised+scope");
     }

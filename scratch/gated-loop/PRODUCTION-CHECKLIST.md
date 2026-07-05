@@ -70,9 +70,9 @@ after restart; `/execute` fully reconstructable.
 - [ ] Unit test grok usage with fake binary
 - [ ] Cancel through `pump.run_turn_streaming` for normal turns
 - [ ] Unit test Ctrl-C mid-stream preserves partial text
-- [ ] Throttle/diff-append `/execute` progress snapshots
-- [ ] Cancel in-flight parallel workers on partition cancel
-- [ ] Consolidate env test locking → shared `ENV_TEST_LOCK`
+- [x] Throttle/diff-append `/execute` progress snapshots
+- [x] Cancel in-flight parallel workers on partition cancel
+- [x] Consolidate env test locking → shared `ENV_TEST_LOCK`
 - [ ] Idle perf: zero `aden` spawns in `drive()` idle loop
 - [ ] Run `devex-review`; fix or accept P1/P2 in `LOG.md`
 
@@ -104,7 +104,7 @@ devex-review clear.
 - [x] Multi-backend hot-swap
 - [x] Preset readiness probes + categorized pickers
 - [x] Preset readiness badges in `coxn doctor`
-- [ ] `probe_preset` tests per driver (fake binaries)
+- [x] `probe_preset` tests per driver (fake binaries)
 - [ ] `coxn doctor` answers "what can I use right now?" in one screen
 
 ### 5b — Distribution
@@ -113,7 +113,7 @@ devex-review clear.
 - [ ] Verify crates.io release workflow
 - [x] `check-no-secrets.sh` in CI
 - [x] `smoke-gate.sh` in CI (skips without aden)
-- [ ] `pty-smoke.sh` in CI
+- [x] `pty-smoke.sh` in CI
 
 ### 5c — Documentation lock
 
@@ -121,7 +121,7 @@ devex-review clear.
 - [ ] INSTALL.md matches auth presets
 - [ ] Help overlay matches README
 - [ ] Document `/execute` auto-approve threat model
-- [ ] Document aden caveats (OO recall, prose `ask`) in README + doctor
+- [x] Document aden caveats (OO recall, prose `ask`) in README + doctor
 
 **Done when:** Fresh install → doctor → first gated edit without reading DESIGN.adoc.
 
@@ -192,4 +192,4 @@ See also `CHECKLIST.md` for per-pass trust/TUI gates.
 - [x] Ctrl-Space palette: no `probe_preset` storm, no embedded full model list
 - [x] Tab commands menu: no `aden list` subprocess on every open
 - [x] Backend discovery cache (20s TTL) + invalidate on switch/setup
-- [ ] Throttle TUI repaint during streaming (optional follow-up)
+- [x] Throttle TUI repaint during streaming (~33ms min interval)

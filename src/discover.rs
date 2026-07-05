@@ -623,6 +623,82 @@ mod tests {
     }
 
     #[test]
+    fn probe_preset_grok_cli_ready_with_fake_binary() {
+        use crate::cli_ndjson::test_support::{
+            fake_cli_test_lock, unique_temp_dir, write_executable_script,
+        };
+
+        let _env = crate::test_env::lock();
+        let _cli = fake_cli_test_lock();
+        let dir = unique_temp_dir("coxn-probe-grok");
+        let fake = write_executable_script(&dir, "grok", "exit 0");
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{}", dir.display(), old_path));
+        }
+        let preset = provider::preset_by_id("grok-cli").unwrap();
+        assert_eq!(probe_preset(preset), PresetReadiness::Ready);
+        unsafe {
+            std::env::set_var("PATH", old_path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(fake);
+    }
+
+    #[test]
+    fn probe_preset_grok_cli_needs_login_when_models_fails() {
+        use crate::cli_ndjson::test_support::{
+            fake_cli_test_lock, unique_temp_dir, write_executable_script,
+        };
+
+        let _env = crate::test_env::lock();
+        let _cli = fake_cli_test_lock();
+        let dir = unique_temp_dir("coxn-probe-grok-login");
+        let fake = write_executable_script(
+            &dir,
+            "grok",
+            r#"case "$1" in
+  --version) exit 0 ;;
+  *) exit 1 ;;
+esac"#,
+        );
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{}", dir.display(), old_path));
+        }
+        let preset = provider::preset_by_id("grok-cli").unwrap();
+        assert_eq!(probe_preset(preset), PresetReadiness::NeedsLogin("grok"));
+        unsafe {
+            std::env::set_var("PATH", old_path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(fake);
+    }
+
+    #[test]
+    fn probe_preset_claude_cli_ready_with_fake_binary() {
+        use crate::cli_ndjson::test_support::{
+            fake_cli_test_lock, unique_temp_dir, write_executable_script,
+        };
+
+        let _env = crate::test_env::lock();
+        let _cli = fake_cli_test_lock();
+        let dir = unique_temp_dir("coxn-probe-claude");
+        let fake = write_executable_script(&dir, "claude", "exit 0");
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{}", dir.display(), old_path));
+        }
+        let preset = provider::preset_by_id("claude-cli").unwrap();
+        assert_eq!(probe_preset(preset), PresetReadiness::Ready);
+        unsafe {
+            std::env::set_var("PATH", old_path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(fake);
+    }
+
+    #[test]
     fn selection_is_text_only_for_cli_drivers() {
         let mut cfg = provider::ProviderConfig::default();
         cfg.instances.push(ProviderInstance::for_probe(

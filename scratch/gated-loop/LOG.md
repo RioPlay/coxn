@@ -229,3 +229,18 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 - `list_ready_backends` 20s cache + invalidate on switch/setup
 
 **Tests:** 347 pass
+
+### Pass 17 — 2026-07-05 (WS3 hardening + WS5 distribution)
+
+**Shipped:**
+- DriveIo stream repaint throttle (~33ms) + flush at turn end
+- ExecuteProgress emit throttle (100ms) + flush on completion/abort
+- Parallel `/execute`: shared cancel flag propagates to worker threads via `CancelBatchIo`
+- `src/test_env.rs` — consolidated `ENV_TEST_LOCK` for env-mutating tests
+- `probe_preset` hermetic tests (grok/claude fake binaries)
+- `coxn doctor` + README aden caveats (OO recall, prose `ask`)
+- CI: `pty-smoke.sh` after `smoke-gate.sh`
+
+**Tests:** 350 pass; smoke-gate green; pty-smoke skip (headless capture)
+
+**Next:** grok usage → context meter (blocked on CLI); WS1 visual embed; WS2d parallel ledger

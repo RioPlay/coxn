@@ -55,6 +55,16 @@ against `HEAD`, not just the file being edited. Uncommitted changes outside the
 task's file mandate can block every scoped edit until you commit or stash them.
 `coxn doctor` and `/scope` warn when a scope is active on a dirty tree.
 
+### aden caveats (when scoped)
+
+aden's blast-radius gate is strong on free-function Rust (~0.99 recall) but weaker on
+object-oriented / method-dispatch code (~0.61 recall on OO fixtures). Treat scoped edits
+in OO codebases conservatively until method-call resolution improves upstream.
+
+On prose-heavy repos, index vs graph anchor namespaces can degrade `aden ask`; prefer
+`grep`, `asm`, or `understand` for structural context. `coxn doctor` prints these notes
+when `COXN_TASK_NAME` is set and aden is on PATH.
+
 ## Prerequisites
 
 1. **A model** — Ollama/LM Studio running locally, or `COXN_MODEL_BASE_URL` + `COXN_MODEL_KEY`

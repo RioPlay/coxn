@@ -2650,13 +2650,9 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::sync::Mutex;
-
     /// Serialize tests that mutate process-global `COXN_VIM`.
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     fn with_coxn_vim(enabled: bool, f: impl FnOnce()) {
-        let _guard = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _guard = crate::test_env::lock();
         if enabled {
             unsafe { std::env::set_var("COXN_VIM", "1") };
         } else {

@@ -468,13 +468,11 @@ pub(crate) fn summarize(slug: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env;
 
     #[test]
     fn ledger_appends_and_summarizes_events() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = test_env::lock();
         let tmp = std::env::temp_dir().join(format!("coxn-runs-{}", std::process::id()));
         unsafe { std::env::set_var("COXN_RUNS_DIR", &tmp) };
         let mut ledger = RunLedger::create("Fix Parser");
@@ -518,7 +516,7 @@ mod tests {
 
     #[test]
     fn ledger_turn_io_records_approval_and_gate_block() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = test_env::lock();
         let tmp = std::env::temp_dir().join(format!("coxn-ledger-io-{}", std::process::id()));
         unsafe { std::env::set_var("COXN_RUNS_DIR", &tmp) };
         let mut ledger = RunLedger::create("ledger-io-test");

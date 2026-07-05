@@ -207,6 +207,10 @@ pub fn run(dir: &Path) -> i32 {
         .filter(|s| !s.trim().is_empty());
     if let Some(name) = task {
         println!("○ task: {name} (blast-radius gate active when aden + seeds set)");
+        if caps.available {
+            println!("  note: OO/method-dispatch recall ~0.61 — gate may miss callee edges");
+            println!("  note: prose-heavy repos — prefer grep/asm over aden ask");
+        }
         if git_dirty(dir) {
             warnings = true;
             println!("  warn: dirty git tree — impact-diff judges whole diff vs HEAD");
