@@ -57,7 +57,7 @@ dirty-tree failure is actionable.
 
 ### 2d — Parallel path parity
 
-- [ ] Granular per-tool events on parallel `/execute` path
+- [x] Granular per-tool events on parallel `/execute` path
 
 **Done when:** Gated edit → approval + edit + gate_verdict in JSONL; `/runs` works
 after restart; `/execute` fully reconstructable.
@@ -73,7 +73,7 @@ after restart; `/execute` fully reconstructable.
 - [x] Throttle/diff-append `/execute` progress snapshots
 - [x] Cancel in-flight parallel workers on partition cancel
 - [x] Consolidate env test locking → shared `ENV_TEST_LOCK`
-- [ ] Idle perf: zero `aden` spawns in `drive()` idle loop
+- [x] Idle perf: zero `aden` spawns in `drive()` idle loop
 - [ ] Run `devex-review`; fix or accept P1/P2 in `LOG.md`
 
 **Done when:** Streaming cancellable; usage honest; idle dogfood clean;
@@ -120,7 +120,7 @@ devex-review clear.
 - [ ] README matches bindings, gates, text-only CLI stance
 - [ ] INSTALL.md matches auth presets
 - [ ] Help overlay matches README
-- [ ] Document `/execute` auto-approve threat model
+- [x] Document `/execute` auto-approve threat model
 - [x] Document aden caveats (OO recall, prose `ask`) in README + doctor
 
 **Done when:** Fresh install → doctor → first gated edit without reading DESIGN.adoc.

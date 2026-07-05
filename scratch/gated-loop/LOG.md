@@ -244,3 +244,16 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 **Tests:** 350 pass; smoke-gate green; pty-smoke skip (headless capture)
 
 **Next:** grok usage → context meter (blocked on CLI); WS1 visual embed; WS2d parallel ledger
+
+### Pass 18 — 2026-07-05 (WS2d + WS5 docs)
+
+**Shipped:**
+- Parallel `/execute`: `SharedLedgerTurnIo` — per-tool ledger events without
+  holding mutex across await (safe for worker threads)
+- `scope_started`/`model_selected` emitted before each scope runs (parity with sequential)
+- README `/execute` auto-approve threat model; help overlay `:execute` note
+- Idle loop documented: chrome uses `ScopeCaches` file reads only
+
+**Tests:** 350 pass; smoke-gate green
+
+**Next:** WS1 visual embed (needs asciinema/vhs); grok usage; INSTALL/help doc lock

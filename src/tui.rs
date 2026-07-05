@@ -2303,6 +2303,10 @@ pub fn render(frame: &mut Frame, view: &View) {
             (":model", Some("switch model")),
             (":tools", Some("list active tools")),
             (":clear", Some("new conversation")),
+            (
+                ":execute",
+                Some("aden partition (auto-approve inside scopes; you confirm first)"),
+            ),
             (":understand {sym}", Some("aden: explain a symbol")),
             (":grep {pat}", Some("aden: search codebase")),
             (":ask {q}", Some("aden: architectural query")),

@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -79,6 +80,20 @@ fn redact_value(value: Value) -> Value {
                 .collect(),
         ),
         other => other,
+    }
+}
+
+pub(crate) type SharedRunLedger = Arc<Mutex<RunLedger>>;
+
+pub(crate) fn append_event(
+    ledger: &SharedRunLedger,
+    kind: &str,
+    scope: Option<&str>,
+    role: Option<&str>,
+    data: Value,
+) {
+    if let Ok(mut guard) = ledger.lock() {
+        guard.append(kind, scope, role, data);
     }
 }
 
@@ -252,6 +267,94 @@ impl<I: TurnIo + ?Sized> TurnIo for LedgerTurnIo<'_, I> {
 
     fn on_usage(&mut self, usage: Usage) {
         self.ledger.append(
+            "usage",
+            Some(self.scope),
+            Some(self.role),
+            json!({
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            }),
+        );
+        self.inner.on_usage(usage);
+    }
+
+    fn on_idle(&mut self) -> bool {
+        self.inner.on_idle()
+    }
+
+    fn stream_cancelled(&self) -> bool {
+        self.inner.stream_cancelled()
+    }
+}
+
+/// Thread-safe [`TurnIo`] wrapper for parallel `/execute` workers. Locks the
+/// ledger only per event append — never across an await point.
+pub(crate) struct SharedLedgerTurnIo<'a, I: ?Sized> {
+    inner: &'a mut I,
+    ledger: SharedRunLedger,
+    scope: &'a str,
+    role: &'a str,
+}
+
+impl<'a, I: ?Sized> SharedLedgerTurnIo<'a, I> {
+    pub(crate) fn new(
+        inner: &'a mut I,
+        ledger: SharedRunLedger,
+        scope: &'a str,
+        role: &'a str,
+    ) -> Self {
+        Self {
+            inner,
+            ledger,
+            scope,
+            role,
+        }
+    }
+}
+
+impl<I: TurnIo + ?Sized> TurnIo for SharedLedgerTurnIo<'_, I> {
+    fn on_delta(&mut self, delta: &str) -> bool {
+        self.inner.on_delta(delta)
+    }
+
+    fn approve(&mut self, call: &ToolCall) -> Approval {
+        let decision = self.inner.approve(call);
+        append_event(
+            &self.ledger,
+            "approval",
+            Some(self.scope),
+            Some(self.role),
+            json!({ "tool": call.name, "decision": approval_label(decision) }),
+        );
+        decision
+    }
+
+    fn on_run_output(&mut self, line: &str) -> bool {
+        self.inner.on_run_output(line)
+    }
+
+    fn on_tool_call(&mut self, call: &ToolCall) {
+        append_event(
+            &self.ledger,
+            "tool_call",
+            Some(self.scope),
+            Some(self.role),
+            json!({ "tool": call.name }),
+        );
+        self.inner.on_tool_call(call);
+    }
+
+    fn on_tool_result(&mut self, call: &ToolCall, result: &str) {
+        if let Ok(mut guard) = self.ledger.lock() {
+            record_tool_result(&mut guard, self.scope, self.role, call, result);
+        }
+        self.inner.on_tool_result(call, result);
+    }
+
+    fn on_usage(&mut self, usage: Usage) {
+        append_event(
+            &self.ledger,
             "usage",
             Some(self.scope),
             Some(self.role),

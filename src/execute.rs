@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -15,6 +15,34 @@ use crate::pump::{Approval, BatchIo, Pump, TurnIo};
 use crate::tools::register_aden_tools;
 use crate::tools::{EditTool, GlobTool, GrepTool, ReadFileTool, RunTool, ToolRegistry, WriteTool};
 use crate::{aden, agents, gate, provider, run_ledger};
+
+fn record_scope_started(
+    ledger: &run_ledger::SharedRunLedger,
+    scope: &agents::SubScope,
+    policy_label: &str,
+    model_label: &str,
+    parallel: bool,
+) {
+    run_ledger::append_event(
+        ledger,
+        "scope_started",
+        Some(&scope.id),
+        Some(&scope.role),
+        json!({
+            "manifest": scope.manifest,
+            "policy": policy_label,
+            "depends_on": scope.depends_on,
+            "parallel": parallel,
+        }),
+    );
+    run_ledger::append_event(
+        ledger,
+        "model_selected",
+        Some(&scope.id),
+        Some(&scope.role),
+        json!({ "label": model_label }),
+    );
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolPolicy {
@@ -531,6 +559,7 @@ struct ScopeInput {
     model: AnyModel,
     label: String,
     cancel: Option<Arc<AtomicBool>>,
+    ledger: Option<run_ledger::SharedRunLedger>,
 }
 
 /// What one sub-scope produced, returned to the driving thread for ledger merge.
@@ -542,6 +571,7 @@ struct ScopeOutcome {
     label: String,
     policy_label: &'static str,
     budget: u64,
+    #[allow(dead_code)]
     parallel: bool,
 }
 
@@ -670,6 +700,87 @@ async fn run_one_scope(input: ScopeInput, parallel: bool) -> ScopeOutcome {
          Return a dense summary of actions and findings.",
         input.scope_id, input.role
     ));
+
+    if let Some(ledger) = &input.ledger {
+        run_ledger::append_event(
+            ledger,
+            "turn_started",
+            Some(&input.scope_id),
+            Some(&input.role),
+            json!({}),
+        );
+        let (pump_result, result_text, cancelled) = if let Some(flag) = &input.cancel {
+            let mut cancel_io = CancelBatchIo::new(flag.clone());
+            let mut io = run_ledger::SharedLedgerTurnIo::new(
+                &mut cancel_io,
+                ledger.clone(),
+                &input.scope_id,
+                &input.role,
+            );
+            let r = pump.run_turn_streaming(&mut io).await;
+            (r, cancel_io.result(), cancel_io.stream_cancelled())
+        } else {
+            let mut batch = BatchIo::new();
+            let mut io = run_ledger::SharedLedgerTurnIo::new(
+                &mut batch,
+                ledger.clone(),
+                &input.scope_id,
+                &input.role,
+            );
+            let r = pump.run_turn_streaming(&mut io).await;
+            (r, batch.result(), false)
+        };
+        let assistant_chars = result_text.chars().count();
+        let turn_status = if cancelled {
+            "cancelled"
+        } else if pump_result.is_err() {
+            "error"
+        } else {
+            "success"
+        };
+        run_ledger::append_event(
+            ledger,
+            "turn_finished",
+            Some(&input.scope_id),
+            Some(&input.role),
+            json!({
+                "status": turn_status,
+                "assistant_chars": assistant_chars,
+            }),
+        );
+        if let Ok(mut guard) = ledger.lock() {
+            guard.flush();
+        }
+        return match pump_result {
+            Ok(_) if !cancelled => ScopeOutcome {
+                ok: true,
+                result: result_text,
+                error: String::new(),
+                usage: pump.last_usage(),
+                label: input.label,
+                policy_label: policy.label(),
+                budget: input.budget,
+                parallel,
+            },
+            Ok(_) => ScopeOutcome {
+                ok: false,
+                result: result_text,
+                error: "cancelled".to_string(),
+                usage: pump.last_usage(),
+                label: input.label,
+                policy_label: policy.label(),
+                budget: input.budget,
+                parallel,
+            },
+            Err(e) => ScopeOutcome::err(
+                policy.label(),
+                &input.label,
+                &input.role,
+                format!("error: {e}"),
+            ),
+        };
+    }
+
     let mut io = match &input.cancel {
         Some(flag) => {
             let mut cancel_io = CancelBatchIo::new(flag.clone());
@@ -754,6 +865,7 @@ fn prepare_scope(
         model,
         label,
         cancel: None,
+        ledger: None,
     })
 }
 
@@ -777,6 +889,7 @@ struct WaveCtx<'a> {
     upstream: &'a str,
     jobs: usize,
     cancel_flag: Option<Arc<AtomicBool>>,
+    ledger: run_ledger::SharedRunLedger,
 }
 
 /// Run a set of scopes concurrently on worker threads (capped at `jobs`), in
@@ -806,7 +919,16 @@ fn run_read_only_wave(ctx: &WaveCtx<'_>, indices: &[usize]) -> Vec<ScopeOutcome>
                 ctx.upstream,
             ) {
                 Ok(mut input) => {
+                    let scope = ctx.ordered[idx];
+                    record_scope_started(
+                        &ctx.ledger,
+                        scope,
+                        ToolPolicy::for_role(&scope.role).label(),
+                        &input.label,
+                        true,
+                    );
                     input.cancel = ctx.cancel_flag.clone();
+                    input.ledger = Some(ctx.ledger.clone());
                     let handle = std::thread::spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .build()
@@ -849,10 +971,8 @@ fn run_read_only_wave(ctx: &WaveCtx<'_>, indices: &[usize]) -> Vec<ScopeOutcome>
         .collect()
 }
 
-/// The parallel wave runner. Emits the same coarse ledger events as the
-/// sequential path (run_started/scope_started/model_selected/scope_finished/
-/// run_finished); granular per-tool events are omitted for the opt-in parallel
-/// mode (the tradeoff documented in PLAN and routing docs).
+/// The parallel wave runner. Emits the same ledger events as the sequential path,
+/// including per-tool events via [`LedgerTurnIo`] inside each worker scope.
 #[allow(clippy::too_many_lines)]
 async fn execute_partition_parallel(
     dir: &Path,
@@ -883,23 +1003,29 @@ async fn execute_partition_parallel(
     if let Some(msg) = execute_route_guard(dir, caps, sel, &ordered) {
         return msg;
     }
-    let mut ledger = run_ledger::RunLedger::create(&name);
+    let ledger = Arc::new(Mutex::new(run_ledger::RunLedger::create(&name)));
+    let ledger: run_ledger::SharedRunLedger = ledger;
     // Record whether every read-only scope wave can run disjoint by mandate.
     // Read-only scopes never mutate, so this is informational, not a gate.
     let all_ro: Vec<usize> = (0..ordered.len())
         .filter(|&i| ToolPolicy::for_role(&ordered[i].role) == ToolPolicy::ReadOnly)
         .collect();
     let disjoint = mandates_disjoint(dir, &ordered, &all_ro);
-    ledger.append(
+    run_ledger::append_event(
+        &ledger,
         "run_started",
         None,
         None,
         json!({ "task": name, "scope_count": ordered.len(), "jobs": jobs, "read_only_disjoint": disjoint }),
     );
+    let run_slug = ledger
+        .lock()
+        .map(|g| g.run().to_string())
+        .unwrap_or_default();
     let mut report = format!(
         "executing partition '{name}' ({} scopes, run {}, jobs {})…\n",
         ordered.len(),
-        ledger.run(),
+        run_slug,
         jobs
     );
     progress.emit(&report);
@@ -970,6 +1096,7 @@ async fn execute_partition_parallel(
                 upstream: &upstream,
                 jobs,
                 cancel_flag: cancel_flag.clone(),
+                ledger: ledger.clone(),
             };
             let ro_outcomes = run_read_only_wave(&ctx, &read_only);
             for (k, o) in ro_outcomes.into_iter().enumerate() {
@@ -980,7 +1107,16 @@ async fn execute_partition_parallel(
             for &i in &read_only {
                 match prepare_scope(dir, caps, sel, bwrap, ordered[i], budget, &upstream) {
                     Ok(mut input) => {
+                        let scope = ordered[i];
+                        record_scope_started(
+                            &ledger,
+                            scope,
+                            ToolPolicy::for_role(&scope.role).label(),
+                            &input.label,
+                            false,
+                        );
                         input.cancel = cancel_flag.clone();
+                        input.ledger = Some(ledger.clone());
                         outcomes.push((i, run_scope_on_main(input, false)));
                     }
                     Err(o) => outcomes.push((i, o)),
@@ -991,7 +1127,16 @@ async fn execute_partition_parallel(
         for &i in &mutating {
             match prepare_scope(dir, caps, sel, bwrap, ordered[i], budget, &upstream) {
                 Ok(mut input) => {
+                    let scope = ordered[i];
+                    record_scope_started(
+                        &ledger,
+                        scope,
+                        ToolPolicy::for_role(&scope.role).label(),
+                        &input.label,
+                        false,
+                    );
                     input.cancel = cancel_flag.clone();
+                    input.ledger = Some(ledger.clone());
                     outcomes.push((i, run_scope_on_main(input, false)));
                 }
                 Err(o) => outcomes.push((i, o)),
@@ -1003,23 +1148,6 @@ async fn execute_partition_parallel(
         for (idx, outcome) in outcomes {
             let scope = &ordered[idx];
             reported += 1;
-            ledger.append(
-                "scope_started",
-                Some(&scope.id),
-                Some(&scope.role),
-                json!({
-                    "manifest": scope.manifest,
-                    "policy": outcome.policy_label,
-                    "depends_on": scope.depends_on,
-                    "parallel": outcome.parallel,
-                }),
-            );
-            ledger.append(
-                "model_selected",
-                Some(&scope.id),
-                Some(&scope.role),
-                json!({ "label": outcome.label }),
-            );
             if outcome.ok {
                 let usage = outcome
                     .usage
@@ -1040,7 +1168,8 @@ async fn execute_partition_parallel(
                 );
                 upstream.push_str(&format!("\n--- {} ---\n{}\n", scope.id, outcome.result));
                 completed.insert(scope.id.clone());
-                ledger.append(
+                run_ledger::append_event(
+                    &ledger,
                     "scope_finished",
                     Some(&scope.id),
                     Some(&scope.role),
@@ -1062,7 +1191,8 @@ async fn execute_partition_parallel(
                         err = outcome.error
                     ),
                 );
-                ledger.append(
+                run_ledger::append_event(
+                    &ledger,
                     "scope_finished",
                     Some(&scope.id),
                     Some(&scope.role),
@@ -1078,7 +1208,16 @@ async fn execute_partition_parallel(
         });
     }
 
-    ledger.append("run_finished", None, None, json!({ "status": run_status }));
+    run_ledger::append_event(
+        &ledger,
+        "run_finished",
+        None,
+        None,
+        json!({ "status": run_status }),
+    );
+    if let Ok(mut guard) = ledger.lock() {
+        guard.flush();
+    }
     append_report(&mut report, &mut progress, "\n=== merged upstream ===\n");
     append_report(&mut report, &mut progress, &upstream);
     progress.flush(&report);

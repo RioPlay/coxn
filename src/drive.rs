@@ -2707,7 +2707,8 @@ async fn drive(
     let task_gated = !task.is_empty() && task.contains("gated");
     let mut scope_cache = ScopeCaches::default();
     loop {
-        // Keep the aden badge on the status line in sync with caps each frame.
+        // Idle redraw: chrome/status use ScopeCaches file reads only — no aden
+        // subprocess spawns on this path (see ScopeCaches::refresh).
         view.aden_active = caps.available;
         view.set_chrome(chrome_state(
             sel,

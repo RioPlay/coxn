@@ -237,6 +237,27 @@ COXN_TASK_NAME=refactor-cache \
 Without a task, or without aden, edits are gated by your approval only. The
 status line is honest about which mode is active.
 
+### `/execute` partition threat model
+
+`/execute` runs one pump turn per aden sub-scope in dependency order. Each
+sub-agent uses `BatchIo`, which **auto-approves every mutating tool** inside that
+scope — there is no per-tool human prompt during the partition.
+
+Safety boundaries:
+
+- **Task scope** — `COXN_TASK_NAME` + seeds define the aden blast-radius gate;
+  out-of-scope file edits are reverted per scope (same as interactive mode).
+- **Role policy** — scout scopes are read-only; synth/orchestrate roles get
+  tighter tool sets (`/agents` shows policy per scope).
+- **Serialization** — mutating scopes never run in parallel; only read-only
+  scopes may overlap (`COXN_EXECUTE_JOBS`).
+- **Human gate at the door** — you confirm the partition preview before `/execute`
+  starts; Ctrl-C cancels in-flight scopes.
+
+`coxn once` with `COXN_AUTO_APPROVE=1` is a separate, stronger bypass: it
+disables the human gate for **all** tools in a single headless turn. Do not conflate
+that with `/execute`, which only auto-approves inside an already-confirmed partition.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -279,6 +300,7 @@ status line is honest about which mode is active.
 /auth list       list provider presets
 /auth login <id> print native login or key setup command
 /execute         run aden task partition (live progress; transcript preserved)
+/execute --resume resume the latest partition run for the active task
 /runs            list execution run ledgers (JSONL under ~/.local/share/coxn/runs/)
 /runs <slug>     summarize a run (approvals, gate blocks, usage)
 ```
