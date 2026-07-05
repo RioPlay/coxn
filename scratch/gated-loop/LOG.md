@@ -302,3 +302,8 @@ spawned multiple provider probes + `aden list` per open; `status_line` spawned
 - CI: `smoke-execute-partition.sh` after `smoke-gate.sh`
 
 **Validated:** smoke pass locally (aden + indexed store)
+
+### Pass 22 — 2026-07-05 (WS1 visual embed)
+
+**Shipped:** README wedge section — static demo transcript under
+`demo-scope-escape.sh` (interim until asciinema/vhs on host)

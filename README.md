@@ -42,7 +42,23 @@ bash scripts/demo-scope-escape.sh
 It builds a throwaway repo, shows an in-scope edit allowed, an out-of-scope edit
 blocked and reverted, and the sandbox state. No cloud keys required.
 
-Record for docs (requires [asciinema](https://asciinema.org/) or [vhs](https://github.com/charmbracelet/vhs)):
+Sample output (deterministic; your model line may differ):
+
+```
+=== 1. in-scope edit (src/app.rs is in the mandate) ===
+  gate: ALLOWED  (exit 0, in-scope)
+
+=== 2. out-of-scope edit (README.md is NOT in the mandate) ===
+  gate: BLOCKED  (exit 1, scope-escape)
+
+=== 3. the blocked file is reverted to HEAD ===
+  README.md restored to baseline
+
+=== 4. sandbox state (coxn doctor) ===
+  status: READY · sandbox: bwrap
+```
+
+Record an animated cast (requires [asciinema](https://asciinema.org/) or [vhs](https://github.com/charmbracelet/vhs)):
 
 ```sh
 bash scripts/record-scope-escape.sh
@@ -402,8 +418,8 @@ session persistence (`/resume`).
 Shipped: aden task partitions via `/execute` (sequential + parallel read-only
 scopes), per-scope role routing, run ledger (`/runs`), and partition resume.
 
-Not yet: live partition smoke on every host (needs aden + model); scope-escape
-visual in README (record with `scripts/record-scope-escape.sh`); grok CLI usage
+Not yet: live partition smoke on every host (needs aden + model); animated
+scope-escape cast (record with `scripts/record-scope-escape.sh`); grok CLI usage
 in every build (when the CLI emits tokens); native streaming profile for servers
 whose chat-completions layer drops tool calls under streaming; optional
 direct-provider profile (native caching / exact billing).

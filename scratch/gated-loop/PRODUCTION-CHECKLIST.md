@@ -16,7 +16,7 @@ distribution real; limits honest.
 
 - [ ] Record `scripts/demo-scope-escape.sh` as README visual (asciinema or vhs)
 - [x] `scripts/record-scope-escape.sh` helper (asciinema/vhs/manual fallback)
-- [ ] Embed visual in README "Why coxn is different"
+- [x] Embed visual in README "Why coxn is different" (static transcript; animated cast optional)
 - [x] Document dirty-tree + active-scope behavior in README
 - [x] Document dirty-tree behavior in `/scope` help
 - [x] Boot warning when scope active + dirty tree (`drive.rs`)
